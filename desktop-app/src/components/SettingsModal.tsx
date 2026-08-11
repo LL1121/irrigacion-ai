@@ -64,14 +64,15 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsModalProps) {
             <input
               value={url}
               onChange={(e) => setUrl(e.target.value)}
-              placeholder="http://172.30.12.101:8000"
+              placeholder="http://100.68.57.77:8000"
               className="w-full rounded-lg border border-border bg-panel-2 px-3 py-2 font-mono text-sm text-text outline-none focus:border-accent/50"
             />
           </label>
           <p className="text-[11px] leading-relaxed text-muted">
-            Por defecto apunta al servidor de la oficina{" "}
+            Default vía Tailscale:{" "}
+            <span className="font-mono text-accent">http://100.68.57.77:8000</span>.
+            En la LAN de oficina también sirve{" "}
             <span className="font-mono text-accent">http://172.30.12.101:8000</span>.
-            Solo cambiá esto si el backend se mueve de host.
           </p>
           {message && (
             <p className="rounded-lg border border-border bg-panel-2 px-3 py-2 text-xs text-text">

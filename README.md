@@ -32,9 +32,19 @@ chmod +x scripts/*.sh
 
 Construye `skill-sandbox-image`, levanta `db` + `api` (`docker-compose.prod.yml`) y deja el API en `http://<IP-SERVIDOR>:8000`.
 
-### 3. Firewall (imprescindible)
+### 3. Firewall + Tailscale
 
-Permitir **solo la red LAN** hacia el puerto API. **No** publicar Postgres (queda en red Docker interna).
+El API escucha en `0.0.0.0:8000` (LAN **y** Tailscale).
+
+- **LAN oficina:** `http://172.30.12.101:8000`
+- **Remoto (Tailscale):** `http://100.68.57.77:8000`
+
+Asegurate de que:
+1. Tailscale esté activo en el servidor y en tu notebook.
+2. El firewall del host permita TCP `8000` al menos desde la interfaz Tailscale (`tailscale0`) / ACL del tailnet.
+3. **No** publiques Postgres (sigue interno a Docker).
+
+La app de escritorio usa por defecto la IP Tailscale; en Configuración podés cambiar a la LAN.
 
 ### 4. Clientes de escritorio
 
@@ -43,11 +53,13 @@ Permitir **solo la red LAN** hacia el puerto API. **No** publicar Postgres (qued
 # instalar el paquete en desktop-app/src-tauri/target/release/bundle/
 ```
 
-En la app: **Configuración** (engranaje) → URL del servidor:
+En la app: **Configuración** (engranaje). Default:
 
 ```text
-http://<IP-O-HOSTNAME-DEL-SERVIDOR>:8000
+http://100.68.57.77:8000
 ```
+
+LAN oficina (opcional): `http://172.30.12.101:8000`
 
 ### 5. Backups
 
