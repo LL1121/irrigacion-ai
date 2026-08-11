@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-ENV_FILE="${ENV_FILE:-.env.production}"
+ENV_FILE="${ENV_FILE:-.env}"
 COMPOSE=(docker compose --env-file "$ENV_FILE" -f docker-compose.prod.yml)
 OUT_DIR="${BACKUP_DIR:-$ROOT/backups}"
 mkdir -p "$OUT_DIR"

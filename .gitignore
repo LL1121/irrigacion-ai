@@ -8,9 +8,7 @@
 .env
 .env.*
 !.env.example
-!.env.production.example
 !**/.env.example
-!**/.env.production.example
 backend/.env
 desktop-app/.env
 desktop-app/.env.production

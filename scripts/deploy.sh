@@ -5,12 +5,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-ENV_FILE="${ENV_FILE:-.env.production}"
+ENV_FILE="${ENV_FILE:-.env}"
 COMPOSE=(docker compose --env-file "$ENV_FILE" -f docker-compose.prod.yml)
 
 if [[ ! -f "$ENV_FILE" ]]; then
   echo "Falta $ENV_FILE"
-  echo "  cp .env.production.example .env.production"
+  echo "  cp .env.example .env"
   echo "  # editar secretos y volver a correr"
   exit 1
 fi
@@ -50,6 +50,7 @@ API_PORT="${API_PORT:-8000}"
 echo
 echo "Listo. Healthcheck:"
 echo "  curl http://127.0.0.1:${API_PORT}/health"
+echo "  curl http://100.68.57.77:${API_PORT}/health"
 echo
-echo "En las PCs de escritorio, configurá la URL del servidor (Settings):"
-echo "  http://<IP-DEL-SERVIDOR>:${API_PORT}"
+echo "En las PCs de escritorio, URL default (Tailscale):"
+echo "  http://100.68.57.77:${API_PORT}"

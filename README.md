@@ -11,7 +11,7 @@ Pensado para un **servidor de la oficina** (sin exposición a Internet).
 ### 1. Preparar secretos
 
 ```bash
-cp .env.production.example .env.production
+cp .env.example .env
 # Editar: POSTGRES_PASSWORD, GROQ_API_KEY, GEMINI_API_KEY, CORS_ORIGINS
 ```
 
@@ -70,7 +70,7 @@ LAN oficina (opcional): `http://172.30.12.101:8000`
 
 ### Checklist de salida
 
-- [ ] `.env.production` con secretos reales (no placeholders)
+- [ ] `.env` con secretos reales (no placeholders)
 - [ ] `curl http://127.0.0.1:8000/health` → ok
 - [ ] Firewall LAN-only en `:8000`
 - [ ] App Tauri apunta a la IP del servidor
@@ -82,9 +82,9 @@ LAN oficina (opcional): `http://172.30.12.101:8000`
 | Uso | Proveedor | Modelo default |
 |-----|-----------|----------------|
 | Chat / agente RAG | Groq | `llama-3.3-70b-versatile` |
-| OCR (PDF escaneado / imágenes) | Gemini | `gemini-2.5-flash` |
+| OCR (PDF escaneado / imágenes) | Gemini | `gemini-flash-latest` |
 | Embeddings RAG + caché | Gemini | `text-embedding-004` (768 dims) |
-| Centinela de skills | Gemini | `gemini-2.5-flash` |
+| Centinela de skills | Gemini | `gemini-flash-latest` |
 
 > **Migración:** el schema usa `VECTOR(768)`. Si tenías una DB vieja con `VECTOR(1536)`, recreá el volumen (`docker compose down -v` / prod equivalente) antes de reindexar documentos.
 

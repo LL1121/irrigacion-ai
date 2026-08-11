@@ -1,9 +1,9 @@
-# Producción on-prem (LAN / oficina de Irrigación)
+# Producción on-prem (LAN / Tailscale)
 # Uso:
-#   cp .env.production.example .env.production
+#   cp .env.example .env
 #   ./scripts/deploy.sh
 #
-# Compose lee variables con: docker compose --env-file .env.production -f docker-compose.prod.yml ...
+# Compose lee variables con: docker compose --env-file .env -f docker-compose.prod.yml ...
 
 services:
   db:
@@ -12,7 +12,7 @@ services:
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-irrigacion_db}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Definí POSTGRES_PASSWORD en .env.production}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Definí POSTGRES_PASSWORD en .env}
     expose:
       - "5432"
     volumes:
@@ -41,8 +41,8 @@ services:
       GROQ_BASE_URL: ${GROQ_BASE_URL:-https://api.groq.com/openai/v1}
       CHAT_MODEL: ${CHAT_MODEL:-llama-3.3-70b-versatile}
       GEMINI_API_KEY: ${GEMINI_API_KEY}
-      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
-      OCR_MODEL: ${OCR_MODEL:-gemini-2.5-flash}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-flash-latest}
+      OCR_MODEL: ${OCR_MODEL:-gemini-flash-latest}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-004}
       CORS_ORIGINS: ${CORS_ORIGINS}
       SKILL_WORKSPACE_DIR: /var/lib/irrigacion/skills

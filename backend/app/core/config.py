@@ -27,8 +27,8 @@ class Settings(BaseSettings):
 
     # Gemini (OCR, embeddings y centinela de skills)
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.5-flash"
-    ocr_model: str = "gemini-2.5-flash"
+    gemini_model: str = "gemini-flash-latest"
+    ocr_model: str = "gemini-flash-latest"
     embedding_model: str = "text-embedding-004"
     embedding_dimensions: int = 768
 
@@ -50,7 +50,7 @@ class Settings(BaseSettings):
         if self.is_production and (not raw or raw == ["*"]):
             raise ValueError(
                 "CORS_ORIGINS='*' no está permitido en production. "
-                "Definí orígenes explícitos en .env.production."
+                "Definí orígenes explícitos en .env."
             )
         return raw or ["*"]
 
