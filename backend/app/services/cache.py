@@ -2,19 +2,10 @@
 
 from __future__ import annotations
 
-from openai import OpenAI
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.core.config import get_settings
-
-
-def _openai_client() -> OpenAI:
-    settings = get_settings()
-    return OpenAI(
-        api_key=settings.openai_api_key,
-        base_url=settings.openai_base_url,
-    )
+from app.services.ingest import generate_embeddings
 
 
 def _embedding_to_literal(embedding: list[float]) -> str:
@@ -22,13 +13,10 @@ def _embedding_to_literal(embedding: list[float]) -> str:
 
 
 def embed_query(user_query: str) -> list[float]:
-    settings = get_settings()
-    client = _openai_client()
-    response = client.embeddings.create(
-        model=settings.embedding_model,
-        input=[user_query],
-    )
-    return response.data[0].embedding
+    vectors = generate_embeddings([user_query])
+    if not vectors:
+        raise RuntimeError("No se pudo generar embedding de la consulta")
+    return vectors[0]
 
 
 def check_semantic_cache(

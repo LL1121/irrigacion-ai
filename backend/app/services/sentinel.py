@@ -7,10 +7,10 @@ import logging
 import re
 from typing import Any
 
-from google import genai
 from google.genai import types
 
 from app.core.config import get_settings
+from app.core.gemini import gemini_client
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +113,7 @@ async def audit_skill_code(code_str: str) -> dict[str, Any]:
             "reason": "GEMINI_API_KEY no configurada. Auditoría denegada por defecto.",
         }
 
-    client = genai.Client(api_key=settings.gemini_api_key)
+    client = gemini_client()
 
     response = await client.aio.models.generate_content(
         model=settings.gemini_model,

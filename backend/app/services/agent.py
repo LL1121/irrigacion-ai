@@ -94,8 +94,8 @@ def _generate_node(state: AgentState) -> dict:
     settings = get_settings()
     llm = ChatOpenAI(
         model=settings.chat_model,
-        api_key=settings.openai_api_key,
-        base_url=settings.openai_base_url,
+        api_key=settings.groq_api_key,
+        base_url=settings.groq_base_url,
         temperature=0.2,
     )
 

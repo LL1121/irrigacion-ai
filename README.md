@@ -2,7 +2,7 @@
 
 Sistema de IA institucional para la oficina de Irrigación de Malargüe.
 
-Arquitectura híbrida: backend local en Python (FastAPI) + PostgreSQL con `pgvector` + APIs externas (OpenClaw/OpenAI) + desktop Tauri.
+Arquitectura híbrida: backend local en Python (FastAPI) + PostgreSQL con `pgvector` + **Groq** (chat) + **Gemini** (OCR/embeddings/centinela) + desktop Tauri.
 
 ## Deploy de producción (on-prem / LAN)
 
@@ -12,7 +12,7 @@ Pensado para un **servidor de la oficina** (sin exposición a Internet).
 
 ```bash
 cp .env.production.example .env.production
-# Editar: POSTGRES_PASSWORD, OPENAI_API_KEY, GEMINI_API_KEY, CORS_ORIGINS
+# Editar: POSTGRES_PASSWORD, GROQ_API_KEY, GEMINI_API_KEY, CORS_ORIGINS
 ```
 
 Generar password fuerte:
@@ -64,6 +64,17 @@ http://<IP-O-HOSTNAME-DEL-SERVIDOR>:8000
 - [ ] App Tauri apunta a la IP del servidor
 - [ ] Backup programado (cron diario de `backup_db.sh`)
 - [ ] Probar upload + chat + skill maliciosa (rejected)
+
+### Proveedores de IA
+
+| Uso | Proveedor | Modelo default |
+|-----|-----------|----------------|
+| Chat / agente RAG | Groq | `llama-3.3-70b-versatile` |
+| OCR (PDF escaneado / imágenes) | Gemini | `gemini-2.5-flash` |
+| Embeddings RAG + caché | Gemini | `text-embedding-004` (768 dims) |
+| Centinela de skills | Gemini | `gemini-2.5-flash` |
+
+> **Migración:** el schema usa `VECTOR(768)`. Si tenías una DB vieja con `VECTOR(1536)`, recreá el volumen (`docker compose down -v` / prod equivalente) antes de reindexar documentos.
 
 ---
 

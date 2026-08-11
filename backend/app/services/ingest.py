@@ -2,18 +2,18 @@
 
 from __future__ import annotations
 
-import base64
 import logging
 import tempfile
 from pathlib import Path
 
 import pymupdf as fitz
 from docx import Document
-from openai import OpenAI
+from google.genai import types
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.core.gemini import gemini_client
 
 logger = logging.getLogger(__name__)
 
@@ -25,14 +25,6 @@ OCR_SYSTEM_PROMPT = (
     "listas y datos numéricos. No inventes contenido. No agregues comentarios "
     "ni explicaciones: solo el texto transcripto."
 )
-
-
-def _openai_client() -> OpenAI:
-    settings = get_settings()
-    return OpenAI(
-        api_key=settings.openai_api_key,
-        base_url=settings.openai_base_url,
-    )
 
 
 def detect_file_type(filename: str) -> str:
@@ -74,47 +66,61 @@ def split_text(text_content: str, chunk_size: int | None = None, overlap: int | 
 
 
 def generate_embeddings(texts: list[str]) -> list[list[float]]:
+    """Embeddings con Gemini (text-embedding-004 → 768 dims)."""
     if not texts:
         return []
 
     settings = get_settings()
-    client = _openai_client()
-    response = client.embeddings.create(
-        model=settings.embedding_model,
-        input=texts,
-    )
-    # Mantener orden por index
-    sorted_data = sorted(response.data, key=lambda item: item.index)
-    return [item.embedding for item in sorted_data]
+    client = gemini_client()
+    vectors: list[list[float]] = []
+
+    # Gemini embed_content acepta un contenido por llamada; batched simple.
+    for piece in texts:
+        response = client.models.embed_content(
+            model=settings.embedding_model,
+            contents=piece,
+        )
+        # google-genai: response.embeddings[0].values ó response.embedding.values
+        embedding = _extract_embedding_values(response)
+        if len(embedding) != settings.embedding_dimensions:
+            logger.warning(
+                "Dimensión de embedding inesperada: %s (esperado %s)",
+                len(embedding),
+                settings.embedding_dimensions,
+            )
+        vectors.append(embedding)
+
+    return vectors
+
+
+def _extract_embedding_values(response: object) -> list[float]:
+    embeddings = getattr(response, "embeddings", None)
+    if embeddings:
+        first = embeddings[0]
+        values = getattr(first, "values", None)
+        if values is not None:
+            return [float(v) for v in values]
+    single = getattr(response, "embedding", None)
+    if single is not None:
+        values = getattr(single, "values", None)
+        if values is not None:
+            return [float(v) for v in values]
+    raise RuntimeError("Respuesta de embedding Gemini sin values")
 
 
 def _ocr_image_bytes(image_bytes: bytes, mime: str = "image/png") -> str:
+    """OCR multimodal con Gemini (gratis / flash)."""
     settings = get_settings()
-    client = _openai_client()
-    b64 = base64.b64encode(image_bytes).decode("utf-8")
-    data_url = f"data:{mime};base64,{b64}"
-
-    response = client.chat.completions.create(
+    client = gemini_client()
+    response = client.models.generate_content(
         model=settings.ocr_model,
-        messages=[
-            {"role": "system", "content": OCR_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "Transcribe esta imagen a Markdown.",
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": data_url},
-                    },
-                ],
-            },
+        contents=[
+            types.Part.from_bytes(data=image_bytes, mime_type=mime),
+            f"{OCR_SYSTEM_PROMPT}\n\nTranscribe esta imagen a Markdown.",
         ],
-        temperature=0,
+        config=types.GenerateContentConfig(temperature=0),
     )
-    return (response.choices[0].message.content or "").strip()
+    return (response.text or "").strip()
 
 
 def _extract_text_from_pdf(path: Path) -> str:
@@ -130,13 +136,12 @@ def _extract_text_from_pdf(path: Path) -> str:
             return native_text
 
         logger.info(
-            "PDF escaneado o con poco texto (%s chars). Usando OCR con %s.",
+            "PDF escaneado o con poco texto (%s chars). Usando OCR Gemini (%s).",
             len(native_text),
             settings.ocr_model,
         )
         ocr_parts: list[str] = []
         for page_index, page in enumerate(doc):
-            # Render a ~150 DPI para balance calidad/tamaño
             pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
             image_bytes = pix.tobytes("png")
             page_text = _ocr_image_bytes(image_bytes, mime="image/png")
@@ -151,7 +156,6 @@ def _extract_text_from_docx(path: Path) -> str:
     document = Document(path)
     paragraphs = [p.text.strip() for p in document.paragraphs if p.text.strip()]
 
-    # Incluir texto de tablas
     table_blocks: list[str] = []
     for table in document.tables:
         rows: list[str] = []
@@ -168,8 +172,7 @@ def _extract_text_from_docx(path: Path) -> str:
 def _extract_text_from_image(path: Path) -> str:
     ext = path.suffix.lower()
     mime = "image/jpeg" if ext in {".jpg", ".jpeg"} else "image/png"
-    image_bytes = path.read_bytes()
-    return _ocr_image_bytes(image_bytes, mime=mime)
+    return _ocr_image_bytes(path.read_bytes(), mime=mime)
 
 
 def extract_text(path: Path, filename: str) -> str:

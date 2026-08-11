@@ -19,21 +19,25 @@ class Settings(BaseSettings):
     database_url: str = (
         "postgresql://postgres:postgres_local_pass@localhost:5434/irrigacion_db"
     )
-    openai_api_key: str = ""
-    openai_base_url: str = "https://api.openai.com/v1"
-    gemini_api_key: str = ""
 
-    embedding_model: str = "text-embedding-3-small"
-    ocr_model: str = "gpt-4o-mini"
-    chat_model: str = "gpt-4o-mini"
+    # Groq (chat principal — API compatible con OpenAI SDK)
+    groq_api_key: str = ""
+    groq_base_url: str = "https://api.groq.com/openai/v1"
+    chat_model: str = "llama-3.3-70b-versatile"
+
+    # Gemini (OCR, embeddings y centinela de skills)
+    gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
+    ocr_model: str = "gemini-2.5-flash"
+    embedding_model: str = "text-embedding-004"
+    embedding_dimensions: int = 768
+
     chunk_size: int = 1000
     chunk_overlap: int = 150
     scanned_pdf_char_threshold: int = 50
     skill_sandbox_image: str = "skill-sandbox-image"
     skill_workspace_dir: str = "/var/lib/irrigacion/skills"
 
-    # CSV de orígenes permitidos. "*" solo permitido fuera de production.
     cors_origins: str = "*"
 
     @property
@@ -51,21 +55,20 @@ class Settings(BaseSettings):
         return raw or ["*"]
 
     def assert_production_ready(self) -> None:
-        """Falla rápido si faltan secretos críticos en producción."""
         if not self.is_production:
             return
         placeholders = {
             "",
-            "sk-your-api-key-here",
-            "sk-xxx",
+            "gsk-your-api-key-here",
             "tu_api_key_de_gemini",
             "CAMBIAR_PASSWORD_FUERTE",
         }
         problems: list[str] = []
-        if self.openai_api_key.strip() in placeholders or self.openai_api_key.startswith(
-            "sk-your"
+        if (
+            self.groq_api_key.strip() in placeholders
+            or self.groq_api_key.startswith("gsk-your")
         ):
-            problems.append("OPENAI_API_KEY")
+            problems.append("GROQ_API_KEY")
         if self.gemini_api_key.strip() in placeholders or self.gemini_api_key.startswith(
             "tu_api_key"
         ):
