@@ -1,0 +1,126 @@
+# =============================================================================
+# irrigacion-bot — lo que NO va al repositorio
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Secretos / entorno
+# -----------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+!.env.production.example
+!**/.env.example
+!**/.env.production.example
+backend/.env
+desktop-app/.env
+desktop-app/.env.production
+*.pem
+*.key
+credentials.json
+secrets/
+
+# -----------------------------------------------------------------------------
+# Python
+# -----------------------------------------------------------------------------
+venv/
+.venv/
+env/
+ENV/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+pip-wheel-metadata/
+
+# -----------------------------------------------------------------------------
+# Node / frontend
+# -----------------------------------------------------------------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+.pnpm-store/
+.npm/
+.yarn/
+*.local
+
+# Vite / build frontend
+desktop-app/dist/
+desktop-app/dist-ssr/
+*.tsbuildinfo
+
+# -----------------------------------------------------------------------------
+# Tauri / Rust
+# -----------------------------------------------------------------------------
+desktop-app/src-tauri/target/
+desktop-app/src-tauri/gen/
+desktop-app/src-tauri/WixTools/
+desktop-app/src-tauri/*.log
+# Bundles generados (deb/AppImage/msi/nsis)
+desktop-app/src-tauri/target/release/bundle/
+
+# -----------------------------------------------------------------------------
+# Docker / datos locales
+# -----------------------------------------------------------------------------
+postgres_data/
+backups/
+*.sql.gz
+docker-data/
+
+# -----------------------------------------------------------------------------
+# IDE / editores
+# -----------------------------------------------------------------------------
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+.cursor/
+
+# -----------------------------------------------------------------------------
+# OS
+# -----------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# -----------------------------------------------------------------------------
+# Logs / temporales
+# -----------------------------------------------------------------------------
+*.log
+*.tmp
+*.temp
+tmp/
+temp/
+.cache/
+logs/
+
+# -----------------------------------------------------------------------------
+# Misc
+# -----------------------------------------------------------------------------
+*.bak
+*.orig
+*.rej
+.ipynb_checkpoints/
+.direnv/
+.venv-bak/

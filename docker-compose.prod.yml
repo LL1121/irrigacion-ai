@@ -1,0 +1,75 @@
+# Producción on-prem (LAN / oficina de Irrigación)
+# Uso:
+#   cp .env.production.example .env.production
+#   ./scripts/deploy.sh
+#
+# Compose lee variables con: docker compose --env-file .env.production -f docker-compose.prod.yml ...
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: irrigacion_db_prod
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-irrigacion_db}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Definí POSTGRES_PASSWORD en .env.production}
+    expose:
+      - "5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/app/database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - irrigacion_internal
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: irrigacion-api:prod
+    container_name: irrigacion_api_prod
+    environment:
+      APP_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-irrigacion_db}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
+      OCR_MODEL: ${OCR_MODEL:-gpt-4o-mini}
+      CHAT_MODEL: ${CHAT_MODEL:-gpt-4o-mini}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+      CORS_ORIGINS: ${CORS_ORIGINS}
+      SKILL_WORKSPACE_DIR: /var/lib/irrigacion/skills
+      SKILL_SANDBOX_IMAGE: ${SKILL_SANDBOX_IMAGE:-skill-sandbox-image}
+    ports:
+      - "${API_HOST_BIND:-0.0.0.0}:${API_PORT:-8000}:8000"
+    volumes:
+      - ${SKILL_HOST_DIR:-/var/lib/irrigacion/skills}:/var/lib/irrigacion/skills
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 25s
+    networks:
+      - irrigacion_internal
+    restart: unless-stopped
+    group_add:
+      - "${DOCKER_GID:-0}"
+
+volumes:
+  postgres_data:
+
+networks:
+  irrigacion_internal:
+    driver: bridge

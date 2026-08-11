@@ -1,0 +1,24 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: irrigacion_db
+    environment:
+      POSTGRES_DB: irrigacion_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres_local_pass
+    ports:
+      # 5434 en el host evita conflicto con Postgres locales / otros contenedores
+      - "5434:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/app/database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d irrigacion_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
