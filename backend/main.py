@@ -6,7 +6,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import chat, files, skills
+from app.core.checkpointer import close_checkpointer, init_checkpointer
 from app.core.config import get_settings
+from app.core.database import ensure_runtime_schema
 
 
 @asynccontextmanager
@@ -14,7 +16,10 @@ async def lifespan(_app: FastAPI):
     settings = get_settings()
     if settings.is_production:
         settings.assert_production_ready()
+    ensure_runtime_schema()
+    init_checkpointer()
     yield
+    close_checkpointer()
 
 
 app = FastAPI(

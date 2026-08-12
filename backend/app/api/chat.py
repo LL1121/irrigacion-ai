@@ -1,7 +1,9 @@
-"""Endpoint de chat: caché semántico + motor LangGraph (RAG)."""
+"""Endpoint de chat: caché semántico + motor LangGraph (RAG + HITL skills)."""
 
 from __future__ import annotations
 
+import json
+from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -10,8 +12,13 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.services.agent import run_agent
+from app.services.agent import (
+    STATUS_APPROVAL,
+    get_pending_approval,
+    run_agent,
+)
 from app.services.cache import check_semantic_cache
+from app.services.skill_marketplace import looks_like_skill_intent
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
@@ -26,6 +33,8 @@ class ChatResponse(BaseModel):
     reply: str
     from_cache: bool
     status: str
+    skill_name: str | None = None
+    skill_description: str | None = None
 
 
 def _persist_chat_message(
@@ -33,26 +42,60 @@ def _persist_chat_message(
     session_id: UUID,
     role: str,
     message: str,
+    metadata: dict[str, Any] | None = None,
 ) -> None:
     db.execute(
         text(
             """
-            INSERT INTO chat_messages (session_id, role, message)
-            VALUES (:session_id, :role, :message)
+            INSERT INTO chat_messages (session_id, role, message, metadata)
+            VALUES (:session_id, :role, :message, CAST(:metadata AS jsonb))
             """
         ),
         {
             "session_id": str(session_id),
             "role": role,
             "message": message,
+            "metadata": json.dumps(metadata, ensure_ascii=False) if metadata else None,
         },
     )
     db.commit()
 
 
+def _metadata_dict(raw: Any) -> dict[str, Any]:
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
 @router.post("/chat", response_model=ChatResponse)
 def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
-    cached = check_semantic_cache(db, payload.message)
+    pending = get_pending_approval(db, payload.session_id)
+    if pending:
+        name = pending.get("skill_name") or "desconocida"
+        description = pending.get("skill_description")
+        return ChatResponse(
+            session_id=payload.session_id,
+            reply=(
+                f"No tengo esta habilidad. Se encontró la skill '{name}'. "
+                "¿Autorizas a Gemini a auditarla y ejecutarla en el Sandbox?"
+            ),
+            from_cache=False,
+            status=STATUS_APPROVAL,
+            skill_name=name,
+            skill_description=description,
+        )
+
+    cached = None
+    if not looks_like_skill_intent(payload.message):
+        cached = check_semantic_cache(db, payload.message)
     if cached is not None:
         _persist_chat_message(db, payload.session_id, "user", payload.message)
         _persist_chat_message(db, payload.session_id, "assistant", cached)
@@ -64,15 +107,17 @@ def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
         )
 
     try:
-        reply = run_agent(db, payload.session_id, payload.message)
+        outcome = run_agent(db, payload.session_id, payload.message)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"Error del agente: {exc}") from exc
 
     return ChatResponse(
         session_id=payload.session_id,
-        reply=reply,
+        reply=outcome.reply,
         from_cache=False,
-        status="agent",
+        status=outcome.status,
+        skill_name=outcome.skill_name,
+        skill_description=outcome.skill_description,
     )
 
 
@@ -117,7 +162,7 @@ def session_messages(session_id: UUID, db: Session = Depends(get_db)) -> dict:
     rows = db.execute(
         text(
             """
-            SELECT role, message, created_at
+            SELECT role, message, created_at, metadata
             FROM chat_messages
             WHERE session_id = :session_id
             ORDER BY created_at ASC
@@ -126,14 +171,45 @@ def session_messages(session_id: UUID, db: Session = Depends(get_db)) -> dict:
         {"session_id": str(session_id)},
     ).mappings().all()
 
+    messages: list[dict[str, Any]] = []
+    for row in rows:
+        meta = _metadata_dict(row.get("metadata"))
+        item: dict[str, Any] = {
+            "role": row["role"],
+            "message": row["message"],
+            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        }
+        if meta.get("status"):
+            item["status"] = meta["status"]
+        if meta.get("skill_name"):
+            item["skill_name"] = meta["skill_name"]
+        if meta.get("skill_description"):
+            item["skill_description"] = meta["skill_description"]
+        if meta.get("kind") == "requires_approval":
+            item["status"] = STATUS_APPROVAL
+        messages.append(item)
+
+    pending = get_pending_approval(db, session_id)
+    if pending:
+        already = any(m.get("status") == STATUS_APPROVAL for m in messages)
+        if not already:
+            name = pending.get("skill_name") or "desconocida"
+            messages.append(
+                {
+                    "role": "assistant",
+                    "message": (
+                        f"No tengo esta habilidad. Se encontró la skill '{name}'. "
+                        "¿Autorizas a Gemini a auditarla y ejecutarla en el Sandbox?"
+                    ),
+                    "created_at": None,
+                    "status": STATUS_APPROVAL,
+                    "skill_name": name,
+                    "skill_description": pending.get("skill_description"),
+                }
+            )
+
     return {
         "session_id": str(session_id),
-        "messages": [
-            {
-                "role": row["role"],
-                "message": row["message"],
-                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
-            }
-            for row in rows
-        ],
+        "messages": messages,
+        "pending_approval": pending,
     }

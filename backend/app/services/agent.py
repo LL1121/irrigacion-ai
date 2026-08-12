@@ -1,25 +1,53 @@
-"""Motor del agente LangGraph: retrieve → history → generate (+ persistencia/caché)."""
+"""Motor del agente LangGraph: RAG + búsqueda de skills + HITL + sandbox."""
 
 from __future__ import annotations
 
-from typing import TypedDict
+import json
+import logging
+from dataclasses import dataclass
+from typing import Any, Literal, NotRequired, TypedDict
 from uuid import UUID
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command, interrupt
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.core.checkpointer import get_checkpointer
 from app.core.config import get_settings
 from app.services.cache import embed_query, save_to_semantic_cache
+from app.services.sandbox import execute_skill_in_sandbox_sync
+from app.services.skill_marketplace import (
+    looks_like_skill_intent,
+    search_catalog,
+    search_skill_marketplace,
+)
+
+logger = logging.getLogger(__name__)
+
+STATUS_OK = "agent"
+STATUS_APPROVAL = "REQUIRES_APPROVAL"
 
 SYSTEM_PROMPT = (
     "Sos el asistente técnico oficial de la oficina de Irrigación de Malargüe. "
-    "Respondé únicamente basándote en el contexto proporcionado y el historial. "
+    "Respondé basándote en el contexto documental y el historial. "
     "Sé directo, técnico y profesional. "
     "Si el contexto no alcanza para responder con certeza, indicalo claramente "
-    "sin inventar datos, normas ni caudales."
+    "sin inventar datos, normas ni caudales.\n\n"
+    "Herramientas: no tenés calculadoras locales bindeadas. Si el usuario pide un "
+    "cálculo, conversión de unidades, prorrateo de turno, lámina o tiempo de riego "
+    "(u otra automatización que no esté resuelta por los documentos), DEBÉS llamar "
+    "a la tool search_skill_marketplace. No inventes resultados numéricos: primero "
+    "buscá la skill. Extraé los números del mensaje en arguments_json. "
+    "Si podés responder solo con el contexto RAG, respondé en texto sin tools."
+)
+
+CATALOG_HINT = (
+    "Catálogo de skills (buscar con search_skill_marketplace): "
+    "Cálculo de caudal (Q = A·v); Conversión de unidades de caudal; "
+    "Prorrateo de turno de riego; Lámina de riego; Tiempo de riego."
 )
 
 
@@ -30,10 +58,59 @@ class AgentState(TypedDict):
     retrieved_docs: list[str]
     query_embedding: list[float]
     reply: str
+    pending_skill: NotRequired[dict[str, Any] | None]
+    needs_approval: NotRequired[bool]
+    skill_approved: NotRequired[bool | None]
+    skill_result: NotRequired[dict[str, Any] | None]
+
+
+@dataclass
+class AgentOutcome:
+    status: str
+    reply: str
+    skill_name: str | None = None
+    skill_description: str | None = None
+    from_cache: bool = False
+    audit: dict[str, Any] | None = None
+
+
+def _thread_config(session_id: str) -> dict:
+    return {"configurable": {"thread_id": str(session_id)}}
 
 
 def _embedding_literal(embedding: list[float]) -> str:
     return "[" + ",".join(str(float(v)) for v in embedding) + "]"
+
+
+def _llm(*, tools: bool = False) -> ChatOpenAI:
+    settings = get_settings()
+    llm = ChatOpenAI(
+        model=settings.chat_model,
+        api_key=settings.groq_api_key,
+        base_url=settings.groq_base_url,
+        temperature=0.2,
+    )
+    if tools:
+        return llm.bind_tools([search_skill_marketplace])
+    return llm
+
+
+def _context_block(docs: list[str]) -> str:
+    if docs:
+        return "\n\n---\n\n".join(docs)
+    return "(Sin documentos recuperados en la base vectorial.)"
+
+
+def _history_messages(history: list[dict]) -> list:
+    messages: list = []
+    for item in history:
+        role = (item.get("role") or "").lower()
+        content = item.get("message") or ""
+        if role == "user":
+            messages.append(HumanMessage(content=content))
+        elif role in {"assistant", "ai", "system"}:
+            messages.append(AIMessage(content=content))
+    return messages
 
 
 def _retrieve_node(state: AgentState, db: Session) -> dict:
@@ -82,7 +159,6 @@ def _fetch_history_node(state: AgentState, db: Session) -> dict:
         {"session_id": state["session_id"]},
     ).mappings().all()
 
-    # Orden cronológico ASC para el LLM
     history = [
         {"role": row["role"], "message": row["message"]}
         for row in reversed(list(rows))
@@ -90,80 +166,225 @@ def _fetch_history_node(state: AgentState, db: Session) -> dict:
     return {"history": history}
 
 
-def _generate_node(state: AgentState) -> dict:
-    settings = get_settings()
-    llm = ChatOpenAI(
-        model=settings.chat_model,
-        api_key=settings.groq_api_key,
-        base_url=settings.groq_base_url,
-        temperature=0.2,
-    )
+def _parse_tool_arguments(raw_args: dict[str, Any], user_message: str) -> tuple[str, dict]:
+    task = str(raw_args.get("task") or user_message)
+    arguments = raw_args.get("arguments") or raw_args.get("arguments_json") or {}
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+            arguments = parsed if isinstance(parsed, dict) else {"valor": parsed}
+        except json.JSONDecodeError:
+            arguments = {"raw": arguments}
+    if not isinstance(arguments, dict):
+        arguments = {"valor": arguments}
+    if not arguments:
+        arguments = {"query": user_message}
+    return task, arguments
 
-    context_block = (
-        "\n\n---\n\n".join(state["retrieved_docs"])
-        if state["retrieved_docs"]
-        else "(Sin documentos recuperados en la base vectorial.)"
-    )
 
+def _plan_node(state: AgentState) -> dict:
+    llm = _llm(tools=True)
     messages: list = [
         SystemMessage(content=SYSTEM_PROMPT),
+        SystemMessage(content=CATALOG_HINT),
         SystemMessage(
-            content=(
-                "Contexto documental recuperado (RAG):\n\n"
-                f"{context_block}"
-            )
+            content="Contexto documental recuperado (RAG):\n\n"
+            + _context_block(state.get("retrieved_docs") or [])
         ),
+        *_history_messages(state.get("history") or []),
+        HumanMessage(content=state["user_message"]),
     ]
-
-    for item in state["history"]:
-        role = (item.get("role") or "").lower()
-        content = item.get("message") or ""
-        if role == "user":
-            messages.append(HumanMessage(content=content))
-        elif role in {"assistant", "ai", "system"}:
-            messages.append(AIMessage(content=content))
-
-    messages.append(HumanMessage(content=state["user_message"]))
-
     response = llm.invoke(messages)
-    reply = (response.content or "").strip()
+    tool_calls = getattr(response, "tool_calls", None) or []
+
+    for call in tool_calls:
+        name = call.get("name") if isinstance(call, dict) else getattr(call, "name", "")
+        if name != "search_skill_marketplace":
+            continue
+        raw_args = call.get("args") if isinstance(call, dict) else getattr(call, "args", {})
+        task, arguments = _parse_tool_arguments(raw_args or {}, state["user_message"])
+        found = search_catalog(task, arguments)
+        if found.get("found"):
+            return {
+                "pending_skill": found,
+                "needs_approval": True,
+                "reply": "",
+            }
+        available = ", ".join(s["name"] for s in found.get("available") or [])
+        return {
+            "pending_skill": None,
+            "needs_approval": False,
+            "reply": (
+                "No encontré una skill en el catálogo para esa tarea. "
+                f"Disponibles: {available or '(ninguna)'}."
+            ),
+        }
+
+    reply = (getattr(response, "content", None) or "").strip()
+    if looks_like_skill_intent(state["user_message"]):
+        found = search_catalog(state["user_message"], {"query": state["user_message"]})
+        if found.get("found"):
+            return {
+                "pending_skill": found,
+                "needs_approval": True,
+                "reply": "",
+            }
     if not reply:
         reply = (
             "No pude generar una respuesta a partir del contexto disponible. "
             "Verificá que haya documentos indexados o reformulá la consulta."
         )
+    return {
+        "pending_skill": None,
+        "needs_approval": False,
+        "reply": reply,
+    }
+
+
+def _route_after_plan(state: AgentState) -> Literal["human_gate", "end_ok"]:
+    if state.get("needs_approval") and state.get("pending_skill"):
+        return "human_gate"
+    return "end_ok"
+
+
+def _approval_prompt(skill: dict[str, Any]) -> str:
+    name = skill.get("name") or "desconocida"
+    return (
+        f"No tengo esta habilidad. Se encontró la skill '{name}'. "
+        "¿Autorizas a Gemini a auditarla y ejecutarla en el Sandbox?"
+    )
+
+
+def _human_gate_node(state: AgentState) -> dict:
+    skill = state.get("pending_skill") or {}
+    decision = interrupt(
+        {
+            "intent": "solicitud_permiso",
+            "skill_id": skill.get("id"),
+            "skill_name": skill.get("name"),
+            "skill_description": skill.get("description"),
+        }
+    )
+    if isinstance(decision, dict):
+        approved = bool(decision.get("approved"))
+    else:
+        approved = bool(decision)
+    return {"skill_approved": approved}
+
+
+def _run_skill_node(state: AgentState) -> dict:
+    if not state.get("skill_approved"):
+        return {
+            "skill_result": None,
+            "reply": (
+                "Entendido. No instalé ni ejecuté la skill porque cancelaste "
+                "la autorización."
+            ),
+        }
+
+    skill = state.get("pending_skill") or {}
+    code = skill.get("code") or ""
+    arguments = skill.get("arguments") or {}
+    result = execute_skill_in_sandbox_sync(code, arguments)
+    return {"skill_result": result, "reply": ""}
+
+
+def _compose_skill_reply_node(state: AgentState) -> dict:
+    if state.get("reply"):
+        return {}
+
+    result = state.get("skill_result") or {}
+    skill = state.get("pending_skill") or {}
+    name = skill.get("name") or "skill"
+
+    if result.get("status") == "rejected":
+        audit = result.get("audit") or {}
+        reason = audit.get("reason") or "riesgo detectado"
+        return {
+            "reply": (
+                f"Gemini rechazó la skill '{name}' (auditoría de seguridad): {reason}"
+            )
+        }
+
+    execution = result.get("execution") or {}
+    parsed = execution.get("parsed")
+    payload = json.dumps(parsed if parsed is not None else execution, ensure_ascii=False, indent=2)
+
+    llm = _llm(tools=False)
+    response = llm.invoke(
+        [
+            SystemMessage(
+                content=(
+                    "Sos el asistente técnico de Irrigación de Malargüe. "
+                    "Presentá el resultado de la skill de forma clara y profesional. "
+                    "No inventes valores que no estén en el JSON."
+                )
+            ),
+            HumanMessage(
+                content=(
+                    f"El usuario pidió: {state['user_message']}\n"
+                    f"Skill ejecutada: {name}\n"
+                    f"Argumentos: {json.dumps(skill.get('arguments') or {}, ensure_ascii=False)}\n"
+                    f"Resultado del sandbox:\n{payload}"
+                )
+            ),
+        ]
+    )
+    reply = (getattr(response, "content", None) or "").strip()
+    if not reply:
+        reply = f"Resultado de '{name}':\n{payload}"
     return {"reply": reply}
 
 
-def _persist_turn(
+def _persist_message(
     db: Session,
     session_id: str,
-    user_message: str,
-    reply: str,
-    query_embedding: list[float],
+    role: str,
+    message: str,
+    metadata: dict[str, Any] | None = None,
 ) -> None:
     db.execute(
         text(
             """
-            INSERT INTO chat_messages (session_id, role, message)
-            VALUES (:session_id, :role, :message)
+            INSERT INTO chat_messages (session_id, role, message, metadata)
+            VALUES (:session_id, :role, :message, CAST(:metadata AS jsonb))
             """
         ),
-        {"session_id": session_id, "role": "user", "message": user_message},
-    )
-    db.execute(
-        text(
-            """
-            INSERT INTO chat_messages (session_id, role, message)
-            VALUES (:session_id, :role, :message)
-            """
-        ),
-        {"session_id": session_id, "role": "assistant", "message": reply},
+        {
+            "session_id": session_id,
+            "role": role,
+            "message": message,
+            "metadata": json.dumps(metadata, ensure_ascii=False) if metadata else None,
+        },
     )
     db.commit()
 
-    if query_embedding:
-        save_to_semantic_cache(db, user_message, query_embedding, reply)
+
+def extract_interrupt_payload(snapshot: Any) -> dict[str, Any] | None:
+    if snapshot is None:
+        return None
+    interrupts = getattr(snapshot, "interrupts", None) or ()
+    if interrupts:
+        first = interrupts[0]
+        value = getattr(first, "value", first)
+        return value if isinstance(value, dict) else None
+    tasks = getattr(snapshot, "tasks", None) or ()
+    for task in tasks:
+        task_interrupts = getattr(task, "interrupts", None) or ()
+        if task_interrupts:
+            value = getattr(task_interrupts[0], "value", None)
+            if isinstance(value, dict):
+                return value
+    values = getattr(snapshot, "values", None) or {}
+    if values.get("needs_approval") and values.get("pending_skill"):
+        skill = values["pending_skill"]
+        return {
+            "intent": "solicitud_permiso",
+            "skill_id": skill.get("id"),
+            "skill_name": skill.get("name"),
+            "skill_description": skill.get("description"),
+        }
+    return None
 
 
 def build_agent_graph(db: Session):
@@ -175,43 +396,157 @@ def build_agent_graph(db: Session):
     def fetch_history(state: AgentState) -> dict:
         return _fetch_history_node(state, db)
 
-    def generate(state: AgentState) -> dict:
-        return _generate_node(state)
-
     graph.add_node("retrieve", retrieve)
     graph.add_node("fetch_history", fetch_history)
-    graph.add_node("generate", generate)
+    graph.add_node("plan", _plan_node)
+    graph.add_node("human_gate", _human_gate_node)
+    graph.add_node("run_skill", _run_skill_node)
+    graph.add_node("compose_skill_reply", _compose_skill_reply_node)
 
     graph.add_edge(START, "retrieve")
     graph.add_edge("retrieve", "fetch_history")
-    graph.add_edge("fetch_history", "generate")
-    graph.add_edge("generate", END)
+    graph.add_edge("fetch_history", "plan")
+    graph.add_conditional_edges(
+        "plan",
+        _route_after_plan,
+        {"human_gate": "human_gate", "end_ok": END},
+    )
+    graph.add_edge("human_gate", "run_skill")
+    graph.add_edge("run_skill", "compose_skill_reply")
+    graph.add_edge("compose_skill_reply", END)
 
-    return graph.compile()
+    return graph.compile(checkpointer=get_checkpointer())
 
 
-def run_agent(db: Session, session_id: UUID | str, user_message: str) -> str:
-    """Ejecuta el grafo RAG y persiste turno + caché semántico."""
+def get_pending_approval(db: Session, session_id: UUID | str) -> dict[str, Any] | None:
+    compiled = build_agent_graph(db)
+    snapshot = compiled.get_state(_thread_config(str(session_id)))
+    return extract_interrupt_payload(snapshot)
+
+
+def run_agent(db: Session, session_id: UUID | str, user_message: str) -> AgentOutcome:
+    """Ejecuta el grafo. Puede devolver REQUIRES_APPROVAL si hay HITL."""
     compiled = build_agent_graph(db)
     sid = str(session_id)
+    config = _thread_config(sid)
 
-    final_state = compiled.invoke(
-        {
-            "session_id": sid,
-            "user_message": user_message,
-            "history": [],
-            "retrieved_docs": [],
-            "query_embedding": [],
-            "reply": "",
-        }
-    )
+    pending = extract_interrupt_payload(compiled.get_state(config))
+    if pending:
+        name = pending.get("skill_name") or "desconocida"
+        return AgentOutcome(
+            status=STATUS_APPROVAL,
+            reply=_approval_prompt(
+                {
+                    "name": name,
+                    "description": pending.get("skill_description"),
+                }
+            ),
+            skill_name=name,
+            skill_description=pending.get("skill_description"),
+        )
 
-    reply = final_state.get("reply") or ""
-    _persist_turn(
+    try:
+        compiled.invoke(
+            {
+                "session_id": sid,
+                "user_message": user_message,
+                "history": [],
+                "retrieved_docs": [],
+                "query_embedding": [],
+                "reply": "",
+                "pending_skill": None,
+                "needs_approval": False,
+                "skill_approved": None,
+                "skill_result": None,
+            },
+            config,
+        )
+    except Exception as exc:
+        if type(exc).__name__ not in {"GraphInterrupt", "NodeInterrupt"}:
+            raise
+        logger.debug("Grafo interrumpido para HITL: %s", exc)
+
+    snapshot = compiled.get_state(config)
+    interrupt_payload = extract_interrupt_payload(snapshot)
+    values = getattr(snapshot, "values", None) or {}
+
+    if interrupt_payload:
+        skill = values.get("pending_skill") or {}
+        name = interrupt_payload.get("skill_name") or skill.get("name") or "desconocida"
+        description = (
+            interrupt_payload.get("skill_description") or skill.get("description")
+        )
+        prompt = _approval_prompt({"name": name})
+        _persist_message(db, sid, "user", user_message)
+        _persist_message(
+            db,
+            sid,
+            "assistant",
+            prompt,
+            {
+                "kind": "requires_approval",
+                "status": STATUS_APPROVAL,
+                "skill_name": name,
+                "skill_description": description,
+            },
+        )
+        return AgentOutcome(
+            status=STATUS_APPROVAL,
+            reply=prompt,
+            skill_name=name,
+            skill_description=description,
+        )
+
+    reply = values.get("reply") or ""
+    embedding = values.get("query_embedding") or []
+    _persist_message(db, sid, "user", user_message)
+    _persist_message(db, sid, "assistant", reply)
+    if embedding:
+        save_to_semantic_cache(db, user_message, embedding, reply)
+    return AgentOutcome(status=STATUS_OK, reply=reply)
+
+
+def resume_agent(db: Session, session_id: UUID | str, approved: bool) -> AgentOutcome:
+    """Reanuda el grafo tras Autorizar / Cancelar."""
+    compiled = build_agent_graph(db)
+    sid = str(session_id)
+    config = _thread_config(sid)
+
+    pending = extract_interrupt_payload(compiled.get_state(config))
+    if not pending:
+        raise RuntimeError("No hay una skill pendiente de autorización en esta sesión.")
+
+    try:
+        compiled.invoke(Command(resume={"approved": approved}), config)
+    except Exception as exc:
+        if type(exc).__name__ not in {"GraphInterrupt", "NodeInterrupt"}:
+            raise
+    snapshot = compiled.get_state(config)
+    values = getattr(snapshot, "values", None) or {}
+    reply = values.get("reply") or ""
+    skill_result = values.get("skill_result") or {}
+    audit = (skill_result or {}).get("audit") if isinstance(skill_result, dict) else None
+    user_message = values.get("user_message") or ""
+    embedding = values.get("query_embedding") or []
+
+    _persist_message(
         db,
         sid,
-        user_message,
+        "assistant",
         reply,
-        final_state.get("query_embedding") or [],
+        {
+            "kind": "skill_result" if approved else "skill_denied",
+            "approved": approved,
+            "audit": audit,
+        },
     )
-    return reply
+    if approved and embedding and reply:
+        save_to_semantic_cache(db, user_message, embedding, reply)
+
+    return AgentOutcome(
+        status="executed" if approved else "denied",
+        reply=reply,
+        skill_name=pending.get("skill_name"),
+        skill_description=pending.get("skill_description"),
+        audit=audit,
+    )

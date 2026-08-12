@@ -4,6 +4,7 @@ import { ChatWindow } from "./components/ChatWindow";
 import { FileUploadModal } from "./components/FileUploadModal";
 import { SettingsModal } from "./components/SettingsModal";
 import {
+  approveSkill,
   getSessionMessages,
   healthCheck,
   listSessions,
@@ -21,6 +22,7 @@ function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [loading, setLoading] = useState(false);
+  const [approving, setApproving] = useState(false);
   const [uploadOpen, setUploadOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [apiOnline, setApiOnline] = useState(false);
@@ -52,6 +54,7 @@ function App() {
   async function handleNewChat() {
     setSessionId(newSessionId());
     setMessages([]);
+    setApproving(false);
   }
 
   async function handleSelectSession(id: string) {
@@ -87,6 +90,9 @@ function App() {
           role: "assistant",
           message: result.reply,
           from_cache: result.from_cache,
+          status: result.status,
+          skill_name: result.skill_name,
+          skill_description: result.skill_description,
         },
       ]);
       await refreshSessions();
@@ -106,6 +112,34 @@ function App() {
     }
   }
 
+  async function handleApproveSkill(approved: boolean) {
+    setApproving(true);
+    try {
+      const result = await approveSkill(sessionId, approved);
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          message: result.reply,
+        },
+      ]);
+      await refreshSessions();
+    } catch (err) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          message:
+            err instanceof Error
+              ? `Error al resolver la skill: ${err.message}`
+              : "Error al resolver la skill.",
+        },
+      ]);
+    } finally {
+      setApproving(false);
+    }
+  }
+
   return (
     <div className="flex h-full overflow-hidden">
       <Sidebar
@@ -120,7 +154,9 @@ function App() {
       <ChatWindow
         messages={messages}
         loading={loading}
+        approving={approving}
         onSend={handleSend}
+        onApproveSkill={(approved) => void handleApproveSkill(approved)}
       />
       <FileUploadModal open={uploadOpen} onClose={() => setUploadOpen(false)} />
       <SettingsModal

@@ -5,6 +5,30 @@ export type ChatMessage = {
   message: string;
   created_at?: string | null;
   from_cache?: boolean;
+  status?: string;
+  skill_name?: string | null;
+  skill_description?: string | null;
+};
+
+export type ChatResponse = {
+  reply: string;
+  from_cache: boolean;
+  status: string;
+  skill_name?: string | null;
+  skill_description?: string | null;
+};
+
+export type SkillApproveResponse = {
+  reply: string;
+  status: string;
+  skill_name?: string | null;
+  skill_description?: string | null;
+  approved: boolean;
+  audit?: {
+    is_safe?: boolean;
+    risk_score?: number;
+    reason?: string;
+  } | null;
 };
 
 export type SessionSummary = {
@@ -33,11 +57,24 @@ async function parseError(res: Response): Promise<string> {
 export async function sendChat(
   sessionId: string,
   message: string,
-): Promise<{ reply: string; from_cache: boolean; status: string }> {
+): Promise<ChatResponse> {
   const res = await fetch(`${getApiBaseUrl()}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ session_id: sessionId, message }),
+  });
+  if (!res.ok) throw new Error(await parseError(res));
+  return res.json();
+}
+
+export async function approveSkill(
+  sessionId: string,
+  approved: boolean,
+): Promise<SkillApproveResponse> {
+  const res = await fetch(`${getApiBaseUrl()}/api/skills/approve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session_id: sessionId, approved }),
   });
   if (!res.ok) throw new Error(await parseError(res));
   return res.json();

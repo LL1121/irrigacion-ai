@@ -167,6 +167,21 @@ def _try_parse_json(text: str) -> dict[str, Any] | None:
         return None
 
 
+def execute_skill_in_sandbox_sync(code_str: str, input_data: dict) -> dict[str, Any]:
+    """Wrapper síncrono para nodos LangGraph (el endpoint de chat corre en threadpool)."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(execute_skill_in_sandbox(code_str, input_data))
+
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(
+            lambda: asyncio.run(execute_skill_in_sandbox(code_str, input_data))
+        ).result()
+
+
 async def execute_skill_in_sandbox(code_str: str, input_data: dict) -> dict[str, Any]:
     """
     Audita con Gemini y, si es segura, ejecuta la skill en un contenedor efímero.

@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     session_id UUID NOT NULL,
     role VARCHAR(50) NOT NULL,
     message TEXT NOT NULL,
+    metadata JSONB,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
