@@ -516,6 +516,57 @@ def _persist_skill_attachments(skill_data: dict[str, Any] | None) -> list[dict[s
     return attachments
 
 
+def _sanitize_for_llm(value: Any, *, depth: int = 0) -> Any:
+    """Quita base64 / blobs enormes antes de mandar el resultado al LLM (límite TPM Groq)."""
+    if depth > 6:
+        return "…"
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            key_l = str(key).lower()
+            if key_l in {"content_base64", "file_base64", "data_base64", "bytes_base64"}:
+                size = len(str(item)) if item is not None else 0
+                out[key] = f"[omitido: {size} chars base64]"
+                continue
+            if key_l in {"stdout", "stderr"} and isinstance(item, str) and len(item) > 2000:
+                out[key] = item[:2000] + "…[truncado]"
+                continue
+            out[key] = _sanitize_for_llm(item, depth=depth + 1)
+        return out
+    if isinstance(value, list):
+        return [_sanitize_for_llm(item, depth=depth + 1) for item in value[:40]]
+    if isinstance(value, str) and len(value) > 4000:
+        return value[:4000] + "…[truncado]"
+    return value
+
+
+def _fallback_skill_reply(
+    *,
+    name: str,
+    user_message: str,
+    skill_data: dict[str, Any] | None,
+    sanitized_payload: Any,
+    attachments: list[dict[str, Any]],
+) -> str:
+    if attachments:
+        names = ", ".join(a["filename"] for a in attachments)
+        title = ""
+        if skill_data:
+            title = str(skill_data.get("titulo") or skill_data.get("title") or "")
+        extra = f" ({title})" if title else ""
+        return (
+            f"Listo: ejecuté '{name}'{extra} y generé el archivo: {names}. "
+            "Podés abrirlo desde el visor debajo."
+        )
+    summary = json.dumps(sanitized_payload, ensure_ascii=False, indent=2)
+    if len(summary) > 3500:
+        summary = summary[:3500] + "\n…[truncado]"
+    return (
+        f"Ejecuté '{name}' para: {user_message.strip()[:200]}\n\n"
+        f"Resultado:\n{summary}"
+    )
+
+
 def _compose_skill_reply_node(state: AgentState) -> dict:
     if state.get("reply"):
         return {}
@@ -545,37 +596,62 @@ def _compose_skill_reply_node(state: AgentState) -> dict:
         }
 
     execution = result.get("execution") or {}
-    parsed = execution.get("parsed")
-    payload = json.dumps(parsed if parsed is not None else execution, ensure_ascii=False, indent=2)
-
-    llm = _llm(tools=False)
-    response = llm.invoke(
-        [
-            SystemMessage(
-                content=(
-                    "Sos el asistente técnico de Irrigación de Malargüe. "
-                    "Presentá el resultado de la skill de forma clara y profesional. "
-                    "No inventes valores que no estén en el JSON."
-                )
-            ),
-            HumanMessage(
-                content=(
-                    f"El usuario pidió: {state['user_message']}\n"
-                    f"Skill ejecutada: {name}\n"
-                    f"Argumentos: {json.dumps(skill.get('arguments') or {}, ensure_ascii=False)}\n"
-                    f"Resultado del sandbox:\n{payload}"
-                )
-            ),
-        ]
-    )
-    reply = (getattr(response, "content", None) or "").strip()
-    if not reply:
-        reply = f"Resultado de '{name}':\n{payload}"
     skill_data = _skill_result_payload(execution)
     attachments = _persist_skill_attachments(skill_data)
+
+    parsed = execution.get("parsed")
+    raw_payload = parsed if parsed is not None else execution
+    sanitized = _sanitize_for_llm(raw_payload)
+    payload = json.dumps(sanitized, ensure_ascii=False, indent=2)
+    if len(payload) > 6000:
+        payload = payload[:6000] + "\n…[truncado]"
+
+    # Si ya hay archivo generado, no hace falta mandar el JSON al LLM.
     if attachments:
-        names = ", ".join(a["filename"] for a in attachments)
-        reply = f"{reply}\n\nGeneré el archivo: {names}. Podés abrirlo desde el visor debajo."
+        reply = _fallback_skill_reply(
+            name=name,
+            user_message=state["user_message"],
+            skill_data=skill_data,
+            sanitized_payload=sanitized,
+            attachments=attachments,
+        )
+        return {"reply": reply, "attachments": attachments}
+
+    reply = ""
+    try:
+        llm = _llm(tools=False)
+        response = llm.invoke(
+            [
+                SystemMessage(
+                    content=(
+                        "Sos el asistente técnico de Irrigación de Malargüe. "
+                        "Presentá el resultado de la skill de forma clara y profesional. "
+                        "No inventes valores que no estén en el JSON. "
+                        "Sé breve (máximo 12 líneas)."
+                    )
+                ),
+                HumanMessage(
+                    content=(
+                        f"El usuario pidió: {state['user_message'][:500]}\n"
+                        f"Skill ejecutada: {name}\n"
+                        f"Argumentos: {json.dumps(_sanitize_for_llm(skill.get('arguments') or {}), ensure_ascii=False)}\n"
+                        f"Resultado del sandbox:\n{payload}"
+                    )
+                ),
+            ]
+        )
+        reply = (getattr(response, "content", None) or "").strip()
+    except Exception:
+        logger.exception("Fallo al narrar resultado de skill con LLM; uso fallback")
+
+    if not reply:
+        reply = _fallback_skill_reply(
+            name=name,
+            user_message=state["user_message"],
+            skill_data=skill_data,
+            sanitized_payload=sanitized,
+            attachments=attachments,
+        )
     return {"reply": reply, "attachments": attachments}
 
 
