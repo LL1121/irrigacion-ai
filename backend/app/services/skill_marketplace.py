@@ -465,7 +465,64 @@ _UNCERTAINTY_MARKERS = (
     "faltan datos",
     "no encontré una skill",
     "reformulá con números",
+    # Negativas de capacidad: deben disparar búsqueda/descarga de skill.
+    "no puedo acceder",
+    "no puedo entrar",
+    "no puedo visitar",
+    "páginas web externas",
+    "paginas web externas",
+    "en tiempo real",
+    "mi capacidad para acceder",
+    "no tengo acceso a internet",
+    "no puedo navegar",
+    "no puedo consultar sitios",
+    "fuera de mi alcance",
+    "no estoy habilitado",
+    "no puedo realizar esa acción",
+    "no puedo hacer eso",
 )
+
+_WEB_OR_EXTERNAL_HINTS = (
+    "http://",
+    "https://",
+    "www.",
+    "entrar a",
+    "acceder a",
+    "abrí la",
+    "abri la",
+    "abrir la página",
+    "abrir la pagina",
+    "consultar la web",
+    "consultar la página",
+    "consultar la pagina",
+    "scrap",
+    "telemetr",
+    "serviciosweb",
+    "desde internet",
+    "en la web",
+    "en la pagina",
+    "en la página",
+)
+
+
+def contains_url(text: str) -> bool:
+    return bool(re.search(r"https?://", text or "", re.I))
+
+
+def looks_like_web_or_external_request(text: str) -> bool:
+    lowered = (text or "").lower()
+    if not lowered.strip():
+        return False
+    if contains_url(lowered):
+        return True
+    return any(hint in lowered for hint in _WEB_OR_EXTERNAL_HINTS)
+
+
+def reply_is_capability_refusal(reply: str | None) -> bool:
+    if not reply:
+        return False
+    lowered = reply.lower()
+    return any(marker in lowered for marker in _UNCERTAINTY_MARKERS)
 
 
 def should_try_skill_marketplace(text: str, assistant_reply: str | None = None) -> bool:
@@ -474,6 +531,8 @@ def should_try_skill_marketplace(text: str, assistant_reply: str | None = None) 
     if not lowered.strip():
         return False
 
+    if looks_like_web_or_external_request(text):
+        return True
     if any(kw in lowered for keywords in _SKILL_KEYWORDS.values() for kw in keywords):
         return True
     if any(verb in lowered for verb in _CALC_VERBS):
@@ -484,19 +543,19 @@ def should_try_skill_marketplace(text: str, assistant_reply: str | None = None) 
     ):
         return True
 
-    if assistant_reply:
-        reply_lower = assistant_reply.lower()
-        if any(marker in reply_lower for marker in _UNCERTAINTY_MARKERS):
-            return True
+    if assistant_reply and reply_is_capability_refusal(assistant_reply):
+        return True
     return False
 
 
 _ACTION_REQUEST_PATTERNS = tuple(
     re.compile(pattern)
     for pattern in (
+        r"\bpodr[ií]as?\b",
         r"\bpod[eé]s\b",
         r"\bpodes\b",
-        r"\bpuede[s]?\s+hacer",
+        r"\bpuede[s]?\b",
+        r"\bsabr[ií]as?\b",
         r"\bsabr[eé]s\b",
         r"\bsabes\b",
         r"\bhac[eé]lo\b",
@@ -506,17 +565,23 @@ _ACTION_REQUEST_PATTERNS = tuple(
         r"\bnecesito que\b",
         r"\bme pod[eé]s\b",
         r"\bme podes\b",
+        r"\bme podr[ií]as?\b",
         r"\btien[eé]s\s+(?:alguna|una)\s+(?:skill|habilidad|herramienta)",
-        r"\bpod[eé]s\s+(?:calcular|convertir|generar|exportar|redactar|armar)",
+        r"\bpod[eé]s\s+(?:calcular|convertir|generar|exportar|redactar|armar|entrar|acceder|consultar)",
+        r"\bentr(ar|á|a)\s+a\b",
+        r"\bacced(er|é|e)\s+a\b",
+        r"\bconsult(á|a|ar)\b",
     )
 )
 
 
 def is_action_request(text: str) -> bool:
-    """Detecta pedidos del tipo 'hacé esto' o '¿podés hacer esto?'."""
+    """Detecta pedidos del tipo 'hacé esto', web externa o '¿podés hacer esto?'."""
     lowered = (text or "").lower().strip()
     if not lowered:
         return False
+    if looks_like_web_or_external_request(text):
+        return True
     if should_try_skill_marketplace(text):
         return True
     return any(pattern.search(lowered) for pattern in _ACTION_REQUEST_PATTERNS)
@@ -563,8 +628,9 @@ def find_local_skill(task: str, arguments: dict[str, Any] | None = None) -> dict
 
 def download_remote_prompt() -> str:
     return (
-        "No puedo hacer eso que me pediste. "
-        "¿Querés que descargue la habilidad desde internet?"
+        "No tengo una habilidad instalada para hacer eso todavía. "
+        "¿Querés que descargue/genere la skill desde internet y la ejecute "
+        "(con auditoría de Gemini)?"
     )
 
 

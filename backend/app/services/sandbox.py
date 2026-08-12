@@ -171,7 +171,22 @@ def _run_inline(code_str: str, input_data: dict) -> dict[str, Any]:
     """Ejecuta la skill en el mismo proceso del API (sin contenedor)."""
     import traceback
 
-    namespace: dict[str, Any] = {"__name__": "__skill__"}
+    from app.services.skill_http import build_fetch_url, extract_urls
+
+    extra_urls = extract_urls(json.dumps(input_data or {}, ensure_ascii=False))
+    for key in ("url", "urls", "query", "pedido"):
+        val = (input_data or {}).get(key)
+        if isinstance(val, str):
+            extra_urls.extend(extract_urls(val))
+        elif isinstance(val, list):
+            for item in val:
+                if isinstance(item, str):
+                    extra_urls.extend(extract_urls(item))
+
+    namespace: dict[str, Any] = {
+        "__name__": "__skill__",
+        "fetch_url": build_fetch_url(extra_allowed_urls=extra_urls),
+    }
     try:
         exec(compile(code_str, "<skill>", "exec"), namespace)  # noqa: S102
         run_fn = namespace.get("run")
@@ -291,6 +306,9 @@ async def execute_skill(
     settings = get_settings()
     mode = (settings.skill_execution_mode or "inline").strip().lower()
     if mode not in {"inline", "sandbox"}:
+        mode = "inline"
+    # fetch_url necesita red del host: forzar inline (el sandbox Docker va sin red).
+    if "fetch_url" in (code_str or ""):
         mode = "inline"
 
     if mode == "inline":

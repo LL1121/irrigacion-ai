@@ -30,7 +30,9 @@ from app.services.skill_marketplace import (
     download_remote_prompt,
     find_local_skill,
     is_action_request,
+    looks_like_web_or_external_request,
     prepare_skill_arguments,
+    reply_is_capability_refusal,
     search_catalog,
     search_skill_marketplace,
     should_try_skill_marketplace,
@@ -82,14 +84,13 @@ Tu objetivo es ayudar al personal de la oficina a resolver dudas sobre normativa
 
 SKILL_TOOLING_HINT = (
     "Herramientas: no tenés calculadoras locales bindeadas. Si el usuario pide un "
-    "cálculo, conversión de unidades, prorrateo de turno, lámina o tiempo de riego, "
-    "generación de documentos Word (con formato: títulos, viñetas, tablas, negritas), "
-    "o cualquier automatización que no puedas resolver "
-    "solo con los documentos, DEBÉS llamar a search_skill_marketplace. No inventes "
-    "resultados numéricos ni archivos: primero buscá la skill. Extraé números, unidades "
-    "y estructura pedida en arguments_json (ej. partes del prorrateo, ha vs m², L/s). "
-    "Si pide un formato de respuesta (tabla, breve, formal), respetalo al narrar. "
-    "Si podés responder solo con el contexto RAG, respondé en texto sin tools."
+    "cálculo, conversión, prorrateo, lámina, tiempo de riego, documento Word, "
+    "consultar una página/URL, telemetría u otra automatización que no puedas resolver "
+    "solo con los documentos, DEBÉS llamar a search_skill_marketplace. "
+    "NUNCA digas que no podés acceder a internet o a una web: si no hay skill local, "
+    "igual llamá a search_skill_marketplace (el sistema ofrecerá descargar una). "
+    "No inventes números ni archivos. Extraé URLs, puntos, unidades y datos en "
+    "arguments_json. Si podés responder solo con RAG, respondé en texto sin tools."
 )
 
 # Alias retrocompatible: el resto del módulo referenciaba SYSTEM_PROMPT.
@@ -264,6 +265,21 @@ def _auto_execute_skill_state(skill: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _force_skill_or_download(user_message: str) -> dict[str, Any]:
+    """Si no hay skill local, pedir descarga remota (nunca rendirse con 'no puedo')."""
+    resolved = _resolve_skill_plan(
+        user_message, {"query": user_message}, user_message
+    )
+    if resolved:
+        return resolved
+    return {
+        "pending_skill": None,
+        "approval_kind": APPROVAL_KIND_DOWNLOAD,
+        "needs_approval": True,
+        "reply": "",
+    }
+
+
 def _resolve_skill_plan(task: str, arguments: dict[str, Any], user_message: str) -> dict[str, Any] | None:
     """Evalúa skills locales; si no hay match y es un pedido de acción, pide descarga."""
     if not (is_action_request(user_message) or should_try_skill_marketplace(user_message)):
@@ -366,29 +382,21 @@ def _plan_node(state: AgentState) -> dict:
         }
 
     reply = (getattr(response, "content", None) or "").strip()
+
+    # Web/externo o negativa de capacidad → buscar skill / ofrecer descarga.
+    # (No forzar ante cualquier "podés…": podría ser solo una pregunta RAG.)
+    if looks_like_web_or_external_request(state["user_message"]) or reply_is_capability_refusal(
+        reply
+    ):
+        return _force_skill_or_download(state["user_message"])
+
     resolved = _resolve_skill_plan(
         state["user_message"], {"query": state["user_message"]}, state["user_message"]
     )
     if resolved:
         return resolved
     if should_try_skill_marketplace(state["user_message"], reply):
-        fallback = find_local_skill(state["user_message"], {"query": state["user_message"]})
-        if fallback.get("found"):
-            if is_whitelisted(str(fallback.get("id") or ""), str(fallback.get("code") or "")):
-                return _auto_execute_skill_state(fallback)
-            return {
-                "pending_skill": fallback,
-                "approval_kind": APPROVAL_KIND_EXECUTE,
-                "needs_approval": True,
-                "reply": "",
-            }
-        if is_action_request(state["user_message"]):
-            return {
-                "pending_skill": None,
-                "approval_kind": APPROVAL_KIND_DOWNLOAD,
-                "needs_approval": True,
-                "reply": "",
-            }
+        return _force_skill_or_download(state["user_message"])
     if not reply:
         reply = (
             "No pude generar una respuesta a partir del contexto disponible. "

@@ -39,6 +39,8 @@ class Settings(BaseSettings):
     skill_workspace_dir: str = "/var/lib/irrigacion/skills"
     # "inline" = mismo proceso del API (sin Docker). "sandbox" = contenedor efímero.
     skill_execution_mode: str = "inline"
+    # Sufijos de host permitidos para fetch_url en skills (coma-separados).
+    skill_http_allow_suffixes: str = "irrigacion.gov.ar,cloud.irrigacion.gov.ar"
     updates_dir: str = ""
 
     # Presupuestos de tokens (aproximados) para no reventar límites Groq TPM.

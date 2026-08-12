@@ -55,6 +55,7 @@ services:
       SKILL_SANDBOX_IMAGE: ${SKILL_SANDBOX_IMAGE:-skill-sandbox-image}
       # inline = mismo proceso API (sin Docker). sandbox = contenedor efímero.
       SKILL_EXECUTION_MODE: ${SKILL_EXECUTION_MODE:-inline}
+      SKILL_HTTP_ALLOW_SUFFIXES: ${SKILL_HTTP_ALLOW_SUFFIXES:-irrigacion.gov.ar,cloud.irrigacion.gov.ar}
       # Build de la PWA (desktop-app/dist) montado como volumen de solo lectura.
       # Generalo antes del deploy con: cd desktop-app && npm run build
       FRONTEND_DIST_DIR: /app/static/dist

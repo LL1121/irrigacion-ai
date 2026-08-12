@@ -11,6 +11,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from app.core.config import get_settings
+from app.services.skill_http import extract_urls
 from app.services.skill_marketplace import infer_arguments
 from app.services.token_guard import fit_remote_context, fit_user_message
 
@@ -22,11 +23,20 @@ Generá una skill Python segura que resuelva la tarea pedida.
 
 Reglas estrictas:
 - Exponé SOLO la función `run(input_data)` que recibe un dict y devuelve un dict JSON-serializable.
-- Permitido: stdlib de Python, math, json, base64, io, datetime.
+- Permitido: stdlib de Python, math, json, base64, io, datetime, re.
 - Para Word (.docx) podés usar `from docx import Document` si hace falta.
-- PROHIBIDO: red (requests, urllib, socket), subprocess, os.system, eval, exec, open de rutas
-  arbitrarias fuera de memoria, acceso a variables de entorno sensibles.
-- Si la tarea requiere datos numéricos, leelos de input_data con defaults razonables.
+- HTTP: usá ÚNICAMENTE la función global inyectada `fetch_url(url)` (ya existe en el runtime).
+  Ejemplo:
+    resp = fetch_url(input_data.get("url") or "https://...")
+    if not resp.get("ok"):
+        return {"error": resp.get("error")}
+    data = resp.get("json")  # si es JSON
+    text = resp.get("text")  # HTML/texto
+- PROHIBIDO: importar requests/urllib/httpx/socket, subprocess, os.system, eval, exec,
+  open de rutas arbitrarias, acceso a variables de entorno sensibles.
+- Si la tarea es consultar una web/API (telemetría, altura de un punto, etc.), la skill
+  DEBE llamar a fetch_url, parsear la respuesta y devolver el dato pedido.
+- Leé URLs, códigos de punto e identificadores desde input_data (url, urls, punto, query).
 - Si generás un archivo, devolvé content_base64, filename y mime en el resultado.
 
 Respondé ÚNICAMENTE con un JSON válido (sin markdown) con esta forma:
@@ -75,14 +85,17 @@ def generate_remote_skill(task: str, *, rag_context: str = "") -> dict[str, Any]
         rag_context.strip() or "(sin contexto documental adicional)"
     )
     task_text = fit_user_message(task)
+    urls = extract_urls(task)
     response = llm.invoke(
         [
             SystemMessage(content=_GENERATION_PROMPT),
             HumanMessage(
                 content=(
                     f"Tarea del usuario:\n{task_text}\n\n"
+                    f"URLs detectadas: {json.dumps(urls, ensure_ascii=False)}\n\n"
                     f"Contexto documental opcional:\n{context_block}\n\n"
-                    "Generá la skill. Respondé solo JSON compacto."
+                    "Generá la skill. Si hay URL o hay que consultar datos online, "
+                    "usá fetch_url. Respondé solo JSON compacto."
                 )
             ),
         ]
@@ -109,6 +122,18 @@ def generate_remote_skill(task: str, *, rag_context: str = "") -> dict[str, Any]
     description = str(payload.get("description") or f"Habilidad generada para: {task[:120]}").strip()
     arguments = infer_arguments(skill_id, task)
     arguments["query"] = task
+    if urls:
+        arguments["urls"] = urls
+        arguments["url"] = urls[0]
+    punto = re.search(
+        r"(?:punto|estación|estacion|código|codigo|id)\s*[:#-]?\s*(\d{3,8})",
+        task,
+        re.I,
+    )
+    if punto:
+        arguments["punto"] = punto.group(1)
+    elif re.search(r"\b\d{4,6}\b", task):
+        arguments["punto"] = re.search(r"\b(\d{4,6})\b", task).group(1)
 
     return {
         "found": True,
