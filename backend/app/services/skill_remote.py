@@ -12,6 +12,7 @@ from langchain_openai import ChatOpenAI
 
 from app.core.config import get_settings
 from app.services.skill_marketplace import infer_arguments
+from app.services.token_guard import fit_remote_context, fit_user_message
 
 logger = logging.getLogger(__name__)
 
@@ -70,15 +71,18 @@ def generate_remote_skill(task: str, *, rag_context: str = "") -> dict[str, Any]
     Devuelve un registro compatible con pending_skill del agente.
     """
     llm = _llm()
-    context_block = rag_context.strip() or "(sin contexto documental adicional)"
+    context_block = fit_remote_context(
+        rag_context.strip() or "(sin contexto documental adicional)"
+    )
+    task_text = fit_user_message(task)
     response = llm.invoke(
         [
             SystemMessage(content=_GENERATION_PROMPT),
             HumanMessage(
                 content=(
-                    f"Tarea del usuario:\n{task}\n\n"
+                    f"Tarea del usuario:\n{task_text}\n\n"
                     f"Contexto documental opcional:\n{context_block}\n\n"
-                    "Generá la skill."
+                    "Generá la skill. Respondé solo JSON compacto."
                 )
             ),
         ]

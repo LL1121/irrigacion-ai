@@ -39,6 +39,19 @@ class Settings(BaseSettings):
     skill_workspace_dir: str = "/var/lib/irrigacion/skills"
     updates_dir: str = ""
 
+    # Presupuestos de tokens (aproximados) para no reventar límites Groq TPM.
+    # llama-3.3-70b-versatile free/on_demand suele tener ~12k TPM: dejamos margen.
+    llm_request_max_tokens: int = 9000
+    llm_system_max_tokens: int = 1800
+    llm_rag_max_tokens: int = 3500
+    llm_history_max_tokens: int = 1800
+    llm_user_max_tokens: int = 1500
+    llm_skill_result_max_tokens: int = 1200
+    llm_remote_skill_context_max_tokens: int = 2500
+    llm_audit_code_max_tokens: int = 4000
+    llm_history_message_max_tokens: int = 400
+    llm_rag_doc_max_tokens: int = 900
+
     cors_origins: str = "*"
 
     # Override opcional del directorio con el build de la PWA (desktop-app/dist).

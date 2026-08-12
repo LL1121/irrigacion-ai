@@ -35,6 +35,16 @@ from app.services.skill_marketplace import (
     should_try_skill_marketplace,
 )
 from app.services.skill_remote import generate_remote_skill
+from app.services.token_guard import (
+    dumps_capped,
+    enforce_request_budget,
+    fit_history,
+    fit_rag_docs,
+    fit_system_prompt,
+    fit_user_message,
+    sanitize_json_for_llm,
+    token_budget,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -144,14 +154,15 @@ def _llm(*, tools: bool = False) -> ChatOpenAI:
 
 
 def _context_block(docs: list[str]) -> str:
-    if docs:
-        return "\n\n---\n\n".join(docs)
+    fitted = fit_rag_docs(docs)
+    if fitted:
+        return "\n\n---\n\n".join(fitted)
     return "(Sin documentos recuperados en la base vectorial.)"
 
 
 def _history_messages(history: list[dict]) -> list:
     messages: list = []
-    for item in history:
+    for item in fit_history(history):
         role = (item.get("role") or "").lower()
         content = item.get("message") or ""
         if role == "user":
@@ -253,18 +264,47 @@ def _resolve_skill_plan(task: str, arguments: dict[str, Any], user_message: str)
 
 def _plan_node(state: AgentState) -> dict:
     llm = _llm(tools=True)
+    system = fit_system_prompt(SYSTEM_PROMPT_IRRIGACION)
+    tooling = fit_system_prompt(SKILL_TOOLING_HINT + "\n" + CATALOG_HINT)
+    rag = "Contexto documental recuperado (RAG):\n\n" + _context_block(
+        state.get("retrieved_docs") or []
+    )
+    user_text = fit_user_message(state["user_message"])
+    history_msgs = _history_messages(state.get("history") or [])
+
+    system, tooling, rag, user_text = enforce_request_budget(
+        [
+            ("system", system),
+            ("tooling", tooling),
+            ("rag", rag),
+            ("user", user_text),
+        ]
+    )
+
     messages: list = [
-        SystemMessage(content=SYSTEM_PROMPT_IRRIGACION),
-        SystemMessage(content=SKILL_TOOLING_HINT),
-        SystemMessage(content=CATALOG_HINT),
-        SystemMessage(
-            content="Contexto documental recuperado (RAG):\n\n"
-            + _context_block(state.get("retrieved_docs") or [])
-        ),
-        *_history_messages(state.get("history") or []),
-        HumanMessage(content=state["user_message"]),
+        SystemMessage(content=system),
+        SystemMessage(content=tooling),
+        SystemMessage(content=rag),
+        *history_msgs,
+        HumanMessage(content=user_text),
     ]
-    response = llm.invoke(messages)
+    try:
+        response = llm.invoke(messages)
+    except Exception as exc:
+        logger.exception("Fallo el plan LLM (posible límite de tokens)")
+        resolved = _resolve_skill_plan(
+            state["user_message"], {"query": state["user_message"]}, state["user_message"]
+        )
+        if resolved:
+            return resolved
+        return {
+            "pending_skill": None,
+            "needs_approval": False,
+            "reply": (
+                "No pude consultar al modelo ahora (límite de tokens o error de API). "
+                f"Detalle: {exc}. Probá una consulta más corta o modo Rápido."
+            ),
+        }
     tool_calls = getattr(response, "tool_calls", None) or []
 
     for call in tool_calls:
@@ -517,27 +557,7 @@ def _persist_skill_attachments(skill_data: dict[str, Any] | None) -> list[dict[s
 
 
 def _sanitize_for_llm(value: Any, *, depth: int = 0) -> Any:
-    """Quita base64 / blobs enormes antes de mandar el resultado al LLM (límite TPM Groq)."""
-    if depth > 6:
-        return "…"
-    if isinstance(value, dict):
-        out: dict[str, Any] = {}
-        for key, item in value.items():
-            key_l = str(key).lower()
-            if key_l in {"content_base64", "file_base64", "data_base64", "bytes_base64"}:
-                size = len(str(item)) if item is not None else 0
-                out[key] = f"[omitido: {size} chars base64]"
-                continue
-            if key_l in {"stdout", "stderr"} and isinstance(item, str) and len(item) > 2000:
-                out[key] = item[:2000] + "…[truncado]"
-                continue
-            out[key] = _sanitize_for_llm(item, depth=depth + 1)
-        return out
-    if isinstance(value, list):
-        return [_sanitize_for_llm(item, depth=depth + 1) for item in value[:40]]
-    if isinstance(value, str) and len(value) > 4000:
-        return value[:4000] + "…[truncado]"
-    return value
+    return sanitize_json_for_llm(value, depth=depth)
 
 
 def _fallback_skill_reply(
@@ -601,10 +621,8 @@ def _compose_skill_reply_node(state: AgentState) -> dict:
 
     parsed = execution.get("parsed")
     raw_payload = parsed if parsed is not None else execution
-    sanitized = _sanitize_for_llm(raw_payload)
-    payload = json.dumps(sanitized, ensure_ascii=False, indent=2)
-    if len(payload) > 6000:
-        payload = payload[:6000] + "\n…[truncado]"
+    sanitized = sanitize_json_for_llm(raw_payload)
+    payload = dumps_capped(sanitized, max_tokens=token_budget()["skill_result_max"])
 
     # Si ya hay archivo generado, no hace falta mandar el JSON al LLM.
     if attachments:
@@ -620,6 +638,12 @@ def _compose_skill_reply_node(state: AgentState) -> dict:
     reply = ""
     try:
         llm = _llm(tools=False)
+        user_prompt = (
+            f"El usuario pidió: {fit_user_message(state['user_message'])}\n"
+            f"Skill ejecutada: {name}\n"
+            f"Argumentos: {dumps_capped(skill.get('arguments') or {}, max_tokens=300)}\n"
+            f"Resultado del sandbox:\n{payload}"
+        )
         response = llm.invoke(
             [
                 SystemMessage(
@@ -630,14 +654,7 @@ def _compose_skill_reply_node(state: AgentState) -> dict:
                         "Sé breve (máximo 12 líneas)."
                     )
                 ),
-                HumanMessage(
-                    content=(
-                        f"El usuario pidió: {state['user_message'][:500]}\n"
-                        f"Skill ejecutada: {name}\n"
-                        f"Argumentos: {json.dumps(_sanitize_for_llm(skill.get('arguments') or {}), ensure_ascii=False)}\n"
-                        f"Resultado del sandbox:\n{payload}"
-                    )
-                ),
+                HumanMessage(content=user_prompt),
             ]
         )
         reply = (getattr(response, "content", None) or "").strip()

@@ -11,6 +11,7 @@ from google.genai import types
 
 from app.core.config import get_settings
 from app.core.gemini import gemini_client
+from app.services.token_guard import fit_audit_code
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +115,7 @@ async def audit_skill_code(code_str: str) -> dict[str, Any]:
         }
 
     client = gemini_client()
+    code_for_audit = fit_audit_code(code_str)
 
     try:
         response = await client.aio.models.generate_content(
@@ -121,7 +123,7 @@ async def audit_skill_code(code_str: str) -> dict[str, Any]:
             contents=(
                 "Audita el siguiente código Python de skill. "
                 "Respondé solo JSON.\n\n"
-                f"```python\n{code_str}\n```"
+                f"```python\n{code_for_audit}\n```"
             ),
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
