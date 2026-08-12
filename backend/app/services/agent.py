@@ -475,7 +475,11 @@ def _human_gate_execute_node(state: AgentState) -> dict:
         approved = bool(decision.get("approved"))
     else:
         approved = bool(decision)
-    return {"skill_approved": approved}
+    return {
+        "skill_approved": approved,
+        "needs_approval": False,
+        "approval_kind": None,
+    }
 
 
 def _run_skill_node(state: AgentState) -> dict:
@@ -704,6 +708,12 @@ def _persist_message(
 
 
 def extract_interrupt_payload(snapshot: Any) -> dict[str, Any] | None:
+    """Solo interrupciones reales de LangGraph.
+
+    No inferir HITL desde values (needs_approval/pending_skill): esos flags
+    quedan en el checkpoint tras autorizar/cancelar y provocaban un bucle
+    eterno de cards de Autorizar/Cancelar.
+    """
     if snapshot is None:
         return None
     interrupts = getattr(snapshot, "interrupts", None) or ()
@@ -718,22 +728,6 @@ def extract_interrupt_payload(snapshot: Any) -> dict[str, Any] | None:
             value = getattr(task_interrupts[0], "value", None)
             if isinstance(value, dict):
                 return value
-    values = getattr(snapshot, "values", None) or {}
-    if values.get("approval_kind") == APPROVAL_KIND_DOWNLOAD:
-        return {
-            "intent": APPROVAL_KIND_DOWNLOAD,
-            "approval_kind": APPROVAL_KIND_DOWNLOAD,
-            "task": values.get("user_message"),
-        }
-    if values.get("needs_approval") and values.get("pending_skill"):
-        skill = values["pending_skill"]
-        return {
-            "intent": APPROVAL_KIND_EXECUTE,
-            "approval_kind": APPROVAL_KIND_EXECUTE,
-            "skill_id": skill.get("id"),
-            "skill_name": skill.get("name"),
-            "skill_description": skill.get("description"),
-        }
     return None
 
 
@@ -981,5 +975,5 @@ def resume_agent(db: Session, session_id: UUID | str, approved: bool) -> AgentOu
         skill_description=pending.get("skill_description"),
         audit=audit,
         attachments=attachments or None,
-        approval_kind=pending.get("approval_kind"),
+        approval_kind=None,
     )

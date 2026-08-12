@@ -328,30 +328,33 @@ export function ChatWindow({
             {messages.map((msg, index) => {
               const isUser = msg.role === "user";
               const isLast = index === messages.length - 1;
-              const showCard = msg.status === "REQUIRES_APPROVAL" && !isUser;
+              const showCard = isPendingApproval(msg, isLast);
               const msgKey = msg.id ?? `${msg.role}-${index}-${msg.created_at ?? index}`;
 
               if (showCard) {
                 const isDownloadApproval = msg.approval_kind === "download_remote";
+                const pending = isPendingApproval(msg, isLast);
                 return (
                   <div key={msgKey} className="mb-4 flex items-start gap-3">
                     <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-2xl bg-primary/15">
                       <Sparkles size={14} className="text-primary" />
                     </div>
                     <div className="max-w-[min(92%,56rem)] lg:max-w-[min(88%,72rem)] xl:max-w-[min(85%,80rem)] rounded-3xl rounded-tl-sm border border-primary/30 bg-card px-4 py-3 shadow-sm">
-                      <div className="mb-2 inline-flex items-center gap-1 rounded-md bg-primary/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider text-primary">
-                        {isDownloadApproval ? "Descarga de skill" : "Autorización de ejecución"}
-                      </div>
+                      {pending && (
+                        <div className="mb-2 inline-flex items-center gap-1 rounded-md bg-primary/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider text-primary">
+                          {isDownloadApproval ? "Descarga de skill" : "Autorización de ejecución"}
+                        </div>
+                      )}
                       <p className="text-sm leading-relaxed text-foreground">
                         {msg.message ||
                           (isDownloadApproval
                             ? "No tengo esta habilidad instalada. ¿Querés que la busque/descargue?"
                             : `Encontré la skill '${msg.skill_name || "desconocida"}'. ¿Autorizás a ejecutarla?`)}
                       </p>
-                      {!isDownloadApproval && msg.skill_description && (
+                      {!isDownloadApproval && pending && msg.skill_description && (
                         <p className="mt-2 text-xs text-muted-foreground">{msg.skill_description}</p>
                       )}
-                      {isPendingApproval(msg, isLast) && onApproveSkill && (
+                      {pending && onApproveSkill && (
                         <div className="mt-3 flex flex-wrap gap-2">
                           <button
                             type="button"

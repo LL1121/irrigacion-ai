@@ -304,6 +304,20 @@ def session_messages(session_id: UUID, db: Session = Depends(get_db)) -> dict:
                     "approval_kind": pending.get("approval_kind") or pending.get("intent"),
                 }
             )
+        # Solo la última card de aprobación queda actionable.
+        last_idx = max(
+            (i for i, m in enumerate(messages) if m.get("status") == STATUS_APPROVAL),
+            default=None,
+        )
+        if last_idx is not None:
+            for i, m in enumerate(messages):
+                if m.get("status") == STATUS_APPROVAL and i != last_idx:
+                    m["status"] = "resolved_approval"
+    else:
+        # Checkpoint ya no está en HITL: no reabrir cards viejas del historial.
+        for m in messages:
+            if m.get("status") == STATUS_APPROVAL:
+                m["status"] = "resolved_approval"
 
     return {
         "session_id": str(session_id),

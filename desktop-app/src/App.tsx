@@ -352,21 +352,28 @@ function AppShell() {
     setApproving(true);
     try {
       const result = await approveSkill(sessionId, approved);
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: newUuid(),
-          role: "assistant",
-          message: result.reply,
-          status: result.status,
-          skill_name: result.skill_name,
-          skill_description: result.skill_description,
-          created_at: new Date().toISOString(),
-          animate: result.status !== "REQUIRES_APPROVAL",
-          attachments: result.attachments ?? undefined,
-          approval_kind: result.approval_kind ?? undefined,
-        },
-      ]);
+      setMessages((prev) => {
+        const cleared = prev.map((m) =>
+          m.status === "REQUIRES_APPROVAL"
+            ? { ...m, status: "resolved_approval" }
+            : m,
+        );
+        return [
+          ...cleared,
+          {
+            id: newUuid(),
+            role: "assistant" as const,
+            message: result.reply,
+            status: result.status,
+            skill_name: result.skill_name,
+            skill_description: result.skill_description,
+            created_at: new Date().toISOString(),
+            animate: result.status !== "REQUIRES_APPROVAL",
+            attachments: result.attachments ?? undefined,
+            approval_kind: result.approval_kind ?? undefined,
+          },
+        ];
+      });
       notifyIfNeeded(result.reply);
       await refreshSessions();
     } catch (err) {
