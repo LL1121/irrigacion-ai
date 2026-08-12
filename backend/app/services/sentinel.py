@@ -115,19 +115,27 @@ async def audit_skill_code(code_str: str) -> dict[str, Any]:
 
     client = gemini_client()
 
-    response = await client.aio.models.generate_content(
-        model=settings.gemini_model,
-        contents=(
-            "Audita el siguiente código Python de skill. "
-            "Respondé solo JSON.\n\n"
-            f"```python\n{code_str}\n```"
-        ),
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            temperature=0,
-            response_mime_type="application/json",
-        ),
-    )
+    try:
+        response = await client.aio.models.generate_content(
+            model=settings.gemini_model,
+            contents=(
+                "Audita el siguiente código Python de skill. "
+                "Respondé solo JSON.\n\n"
+                f"```python\n{code_str}\n```"
+            ),
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                temperature=0,
+                response_mime_type="application/json",
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - fail-closed ante fallos de red/API
+        logger.exception("Fallo la auditoría Gemini de la skill")
+        return {
+            "is_safe": False,
+            "risk_score": 10,
+            "reason": f"No se pudo auditar con Gemini ({exc}). Ejecución denegada.",
+        }
 
     raw = (response.text or "").strip()
     if not raw:

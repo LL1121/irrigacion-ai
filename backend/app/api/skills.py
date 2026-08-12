@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 from uuid import UUID
 
@@ -12,6 +13,8 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.services.agent import resume_agent
 from app.services.sandbox import execute_skill_in_sandbox
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/skills", tags=["skills"])
 
@@ -54,6 +57,11 @@ def approve_skill(
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "Error en /api/skills/approve session=%s approved=%s",
+            payload.session_id,
+            payload.approved,
+        )
         raise HTTPException(
             status_code=502,
             detail=f"Error al reanudar el agente: {exc}",

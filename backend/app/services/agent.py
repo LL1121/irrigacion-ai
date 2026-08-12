@@ -448,7 +448,24 @@ def _run_skill_node(state: AgentState) -> dict:
     skill["arguments"] = enrich_skill_arguments(skill, state["user_message"])
     code = skill.get("code") or ""
     arguments = skill.get("arguments") or {}
-    result = execute_skill_in_sandbox_sync(code, arguments)
+    try:
+        result = execute_skill_in_sandbox_sync(code, arguments)
+    except Exception as exc:
+        logger.exception("Fallo al ejecutar skill en sandbox")
+        name = skill.get("name") or "skill"
+        return {
+            "skill_result": {
+                "status": "error",
+                "audit": None,
+                "execution": {"error": str(exc)},
+            },
+            "reply": (
+                f"No pude ejecutar la skill '{name}': {exc}. "
+                "Si falta la imagen del sandbox, en el servidor corré: "
+                "docker build -t skill-sandbox-image backend/sandbox_env"
+            ),
+            "pending_skill": skill,
+        }
     return {"skill_result": result, "reply": "", "pending_skill": skill}
 
 
@@ -513,6 +530,17 @@ def _compose_skill_reply_node(state: AgentState) -> dict:
         return {
             "reply": (
                 f"Gemini rechazó la skill '{name}' (auditoría de seguridad): {reason}"
+            )
+        }
+
+    if result.get("status") == "error":
+        execution = result.get("execution") or {}
+        err = execution.get("error") or "error desconocido"
+        return {
+            "reply": (
+                f"No pude ejecutar la skill '{name}': {err}. "
+                "Si falta la imagen del sandbox, en el servidor corré: "
+                "docker build -t skill-sandbox-image backend/sandbox_env"
             )
         }
 
@@ -764,6 +792,15 @@ def run_agent(
     return AgentOutcome(status=STATUS_OK, reply=reply, attachments=attachments or None)
 
 
+def _is_graph_interrupt(exc: BaseException) -> bool:
+    name = type(exc).__name__
+    if name in {"GraphInterrupt", "NodeInterrupt"}:
+        return True
+    # Algunas versiones envuelven el interrupt en ExceptionGroup / RuntimeError.
+    text = str(exc)
+    return "Interrupt" in name or "Interrupt" in text
+
+
 def resume_agent(db: Session, session_id: UUID | str, approved: bool) -> AgentOutcome:
     """Reanuda el grafo tras Autorizar / Cancelar."""
     compiled = build_agent_graph(db)
@@ -777,8 +814,10 @@ def resume_agent(db: Session, session_id: UUID | str, approved: bool) -> AgentOu
     try:
         compiled.invoke(Command(resume={"approved": approved}), config)
     except Exception as exc:
-        if type(exc).__name__ not in {"GraphInterrupt", "NodeInterrupt"}:
+        if not _is_graph_interrupt(exc):
+            logger.exception("Error al reanudar el grafo de skills (approved=%s)", approved)
             raise
+        logger.debug("Grafo interrumpido tras resume HITL: %s", exc)
     snapshot = compiled.get_state(config)
     values = getattr(snapshot, "values", None) or {}
     interrupt_payload = extract_interrupt_payload(snapshot)
