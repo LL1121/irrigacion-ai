@@ -65,8 +65,12 @@ def split_text(text_content: str, chunk_size: int | None = None, overlap: int | 
     return chunks
 
 
-def generate_embeddings(texts: list[str]) -> list[list[float]]:
-    """Embeddings con Gemini (text-embedding-004 → 768 dims)."""
+def generate_embeddings(
+    texts: list[str],
+    *,
+    task_type: str = "RETRIEVAL_DOCUMENT",
+) -> list[list[float]]:
+    """Embeddings con Gemini (gemini-embedding-001 → 768 dims)."""
     if not texts:
         return []
 
@@ -79,6 +83,10 @@ def generate_embeddings(texts: list[str]) -> list[list[float]]:
         response = client.models.embed_content(
             model=settings.embedding_model,
             contents=piece,
+            config={
+                "output_dimensionality": settings.embedding_dimensions,
+                "task_type": task_type,
+            },
         )
         # google-genai: response.embeddings[0].values ó response.embedding.values
         embedding = _extract_embedding_values(response)

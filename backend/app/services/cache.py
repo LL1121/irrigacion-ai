@@ -13,7 +13,7 @@ def _embedding_to_literal(embedding: list[float]) -> str:
 
 
 def embed_query(user_query: str) -> list[float]:
-    vectors = generate_embeddings([user_query])
+    vectors = generate_embeddings([user_query], task_type="RETRIEVAL_QUERY")
     if not vectors:
         raise RuntimeError("No se pudo generar embedding de la consulta")
     return vectors[0]

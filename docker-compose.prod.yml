@@ -43,7 +43,7 @@ services:
       GEMINI_API_KEY: ${GEMINI_API_KEY}
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-flash-latest}
       OCR_MODEL: ${OCR_MODEL:-gemini-flash-latest}
-      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-004}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-gemini-embedding-001}
       CORS_ORIGINS: ${CORS_ORIGINS}
       SKILL_WORKSPACE_DIR: /var/lib/irrigacion/skills
       SKILL_SANDBOX_IMAGE: ${SKILL_SANDBOX_IMAGE:-skill-sandbox-image}
@@ -61,6 +61,10 @@ services:
       timeout: 5s
       retries: 8
       start_period: 25s
+    # Tailscale MagicDNS a veces no resuelve registries/APIs externas desde el contenedor.
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     networks:
       - irrigacion_internal
     restart: unless-stopped

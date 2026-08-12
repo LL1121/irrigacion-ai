@@ -83,7 +83,7 @@ LAN oficina (opcional): `http://172.30.12.101:8000`
 |-----|-----------|----------------|
 | Chat / agente RAG | Groq | `llama-3.3-70b-versatile` |
 | OCR (PDF escaneado / imágenes) | Gemini | `gemini-flash-latest` |
-| Embeddings RAG + caché | Gemini | `text-embedding-004` (768 dims) |
+| Embeddings RAG + caché | Gemini | `gemini-embedding-001` (768 dims) |
 | Centinela de skills | Gemini | `gemini-flash-latest` |
 
 > **Migración:** el schema usa `VECTOR(768)`. Si tenías una DB vieja con `VECTOR(1536)`, recreá el volumen (`docker compose down -v` / prod equivalente) antes de reindexar documentos.

@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     gemini_model: str = "gemini-flash-latest"
     ocr_model: str = "gemini-flash-latest"
-    embedding_model: str = "text-embedding-004"
+    embedding_model: str = "gemini-embedding-001"
     embedding_dimensions: int = 768
 
     chunk_size: int = 1000
@@ -73,16 +73,22 @@ class Settings(BaseSettings):
             "tu_api_key"
         ):
             problems.append("GEMINI_API_KEY")
-        if (
-            "postgres_local_pass" in self.database_url
-            or "CAMBIAR_PASSWORD" in self.database_url
-        ):
-            problems.append("DATABASE_URL/POSTGRES_PASSWORD")
+        if "postgres_local_pass" in self.database_url:
+            problems.append(
+                "POSTGRES_PASSWORD (DATABASE_URL todavía usa postgres_local_pass de lab; "
+                "definí POSTGRES_PASSWORD en .env)"
+            )
+        elif "CAMBIAR_PASSWORD" in self.database_url:
+            problems.append(
+                "POSTGRES_PASSWORD (sigue el placeholder CAMBIAR_PASSWORD_FUERTE; "
+                "poné una clave real en .env y, si la DB ya se inicializó con el placeholder, "
+                "recreá el volumen: docker compose --env-file .env -f docker-compose.prod.yml down -v)"
+            )
         if self.cors_origins.strip() in {"", "*"}:
             problems.append("CORS_ORIGINS")
         if problems:
             raise RuntimeError(
-                "Configuración de producción incompleta: " + ", ".join(problems)
+                "Configuración de producción incompleta: " + " | ".join(problems)
             )
 
 
