@@ -20,6 +20,7 @@ import {
   type SessionSummary,
   type SpeedMode,
 } from "./services/api";
+import { newUuid } from "./utils/uuid";
 
 const SOUND_STORAGE_KEY = "irrigacion.sound";
 const NOTIFICATIONS_STORAGE_KEY = "irrigacion.notifications";
@@ -35,7 +36,7 @@ function readSpeedMode(): SpeedMode {
 }
 
 function newSessionId(): string {
-  return crypto.randomUUID();
+  return newUuid();
 }
 
 function readBoolPreference(key: string, fallback: boolean): boolean {
