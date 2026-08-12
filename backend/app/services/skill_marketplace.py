@@ -502,6 +502,11 @@ _WEB_OR_EXTERNAL_HINTS = (
     "en la web",
     "en la pagina",
     "en la página",
+    "altura en el punto",
+    "altura del punto",
+    "dato del punto",
+    "estación",
+    "estacion",
 )
 
 
@@ -615,15 +620,29 @@ def match_catalog_by_keywords(text: str) -> dict[str, Any] | None:
 
 def find_local_skill(task: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     """Busca una skill instalada que pueda resolver la tarea."""
+    # Pedidos web no deben mapear a skills de cálculo/Word del catálogo.
+    if looks_like_web_or_external_request(task):
+        return {
+            "found": False,
+            "query": task,
+            "available": [
+                {"id": s["id"], "name": s["name"], "description": s["description"]}
+                for s in CATALOG
+            ],
+        }
+
     keyword_hit = match_catalog_by_keywords(task)
     if keyword_hit and keyword_hit.get("found"):
+        # Exigir señal real de keywords (score de match_catalog >= 2 ya filtrado).
         return keyword_hit
+
     result = search_catalog(task, arguments or {"query": task})
     if result.get("found"):
         score = int(result.get("score") or 0)
-        if score >= 2 or is_action_request(task):
+        # Nunca promover un match débil solo porque el mensaje es un "pedido de acción".
+        if score >= 3:
             return result
-    return {**result, "found": False}
+    return {**(result if isinstance(result, dict) else {}), "found": False, "query": task}
 
 
 def download_remote_prompt() -> str:

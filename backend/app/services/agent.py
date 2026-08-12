@@ -266,7 +266,15 @@ def _auto_execute_skill_state(skill: dict[str, Any]) -> dict[str, Any]:
 
 
 def _force_skill_or_download(user_message: str) -> dict[str, Any]:
-    """Si no hay skill local, pedir descarga remota (nunca rendirse con 'no puedo')."""
+    """Si no hay skill local adecuada, pedir descarga remota (nunca rendirse)."""
+    # Pedidos web/URL: el catálogo local (cálculos/Word) no aplica → descarga.
+    if looks_like_web_or_external_request(user_message):
+        return {
+            "pending_skill": None,
+            "approval_kind": APPROVAL_KIND_DOWNLOAD,
+            "needs_approval": True,
+            "reply": "",
+        }
     resolved = _resolve_skill_plan(
         user_message, {"query": user_message}, user_message
     )
@@ -284,6 +292,14 @@ def _resolve_skill_plan(task: str, arguments: dict[str, Any], user_message: str)
     """Evalúa skills locales; si no hay match y es un pedido de acción, pide descarga."""
     if not (is_action_request(user_message) or should_try_skill_marketplace(user_message)):
         return None
+    # No forzar una skill de cálculo/Word ante un pedido de web/telemetría.
+    if looks_like_web_or_external_request(user_message):
+        return {
+            "pending_skill": None,
+            "approval_kind": APPROVAL_KIND_DOWNLOAD,
+            "needs_approval": True,
+            "reply": "",
+        }
     found = find_local_skill(task, arguments)
     if found.get("found"):
         if is_whitelisted(str(found.get("id") or ""), str(found.get("code") or "")):
