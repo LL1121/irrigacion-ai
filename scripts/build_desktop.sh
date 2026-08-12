@@ -29,12 +29,26 @@ else
 fi
 
 npm ci
-npm run tauri build -- --bundles deb,appimage
+
+# AppImage (linuxdeploy) suele fallar en algunos hosts (FUSE/AppArmor).
+# El .deb siempre es el instalador de oficina; AppImage es opcional para OTA.
+echo "==> Bundling .deb"
+npm run tauri build -- --bundles deb
+
+if npm run tauri build -- --bundles appimage; then
+  echo "==> AppImage OK (listo para publish_update.sh)"
+else
+  echo
+  echo "==> AVISO: AppImage falló (linuxdeploy). El .deb y el binario igual están listos."
+  echo "    Para OTA más adelante: arreglá linuxdeploy/FUSE o compilá AppImage en otra máquina."
+  echo "    Mientras tanto instalá/reemplazá con el .deb en las PCs."
+fi
 
 echo
 echo "Instaladores en desktop-app/src-tauri/target/release/bundle/"
 ls -la src-tauri/target/release/bundle/*/ 2>/dev/null || ls -la src-tauri/target/release/bundle/
 echo
+echo "Binario: src-tauri/target/release/desktop-app"
 echo "Distribuí el .deb a las PCs de la oficina."
-echo "Para publicar update OTA: API_PUBLIC_URL=${VITE_API_BASE_URL} ../scripts/publish_update.sh"
+echo "Para publicar update OTA (si hay AppImage): API_PUBLIC_URL=${VITE_API_BASE_URL} ./scripts/publish_update.sh"
 echo "Ver UPDATES.md para el flujo completo."

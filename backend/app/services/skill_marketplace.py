@@ -367,21 +367,24 @@ def should_try_skill_marketplace(text: str, assistant_reply: str | None = None) 
     return False
 
 
-_ACTION_REQUEST_PATTERNS = (
-    r"\bpod[eé]s\b",
-    r"\bpodes\b",
-    r"\bpuede[s]?\s+hacer",
-    r"\bsabr[eé]s\b",
-    r"\bsabes\b",
-    r"\bhac[eé]\lo\b",
-    r"\bhac[eé]\s",
-    r"\bhace\s",
-    r"\bquiero que\b",
-    r"\bnecesito que\b",
-    r"\bme pod[eé]s\b",
-    r"\bme podes\b",
-    r"\btien[eé]s\s+(?:alguna|una)\s+(?:skill|habilidad|herramienta)",
-    r"\bpod[eé]s\s+(?:calcular|convertir|generar|exportar|redactar|armar)",
+_ACTION_REQUEST_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"\bpod[eé]s\b",
+        r"\bpodes\b",
+        r"\bpuede[s]?\s+hacer",
+        r"\bsabr[eé]s\b",
+        r"\bsabes\b",
+        r"\bhac[eé]lo\b",
+        r"\bhac[eé]\s",
+        r"\bhace\s",
+        r"\bquiero que\b",
+        r"\bnecesito que\b",
+        r"\bme pod[eé]s\b",
+        r"\bme podes\b",
+        r"\btien[eé]s\s+(?:alguna|una)\s+(?:skill|habilidad|herramienta)",
+        r"\bpod[eé]s\s+(?:calcular|convertir|generar|exportar|redactar|armar)",
+    )
 )
 
 
@@ -392,7 +395,7 @@ def is_action_request(text: str) -> bool:
         return False
     if should_try_skill_marketplace(text):
         return True
-    return any(re.search(pattern, lowered) for pattern in _ACTION_REQUEST_PATTERNS)
+    return any(pattern.search(lowered) for pattern in _ACTION_REQUEST_PATTERNS)
 
 
 def looks_like_skill_intent(text: str) -> bool:
