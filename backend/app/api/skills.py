@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.services.agent import resume_agent
-from app.services.sandbox import execute_skill_in_sandbox
+from app.services.sandbox import execute_skill
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +35,7 @@ class SkillApproveRequest(BaseModel):
 @router.post("/execute")
 async def execute_skill(payload: SkillExecuteRequest) -> dict[str, Any]:
     try:
-        result = await execute_skill_in_sandbox(payload.code, payload.input_data)
+        result = await execute_skill(payload.code, payload.input_data)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001

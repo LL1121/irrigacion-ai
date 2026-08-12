@@ -340,20 +340,13 @@ export function ChatWindow({
                     </div>
                     <div className="max-w-[min(92%,56rem)] lg:max-w-[min(88%,72rem)] xl:max-w-[min(85%,80rem)] rounded-3xl rounded-tl-sm border border-primary/30 bg-card px-4 py-3 shadow-sm">
                       <div className="mb-2 inline-flex items-center gap-1 rounded-md bg-primary/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider text-primary">
-                        {isDownloadApproval ? "Habilidad no disponible" : "Autorización de skill"}
+                        {isDownloadApproval ? "Descarga de skill" : "Autorización de ejecución"}
                       </div>
                       <p className="text-sm leading-relaxed text-foreground">
-                        {isDownloadApproval ? (
-                          msg.message
-                        ) : (
-                          <>
-                            No tengo esta habilidad instalada. Se encontró la skill{" "}
-                            <span className="font-semibold text-primary">
-                              '{msg.skill_name || "desconocida"}'
-                            </span>
-                            . ¿Autorizás a Gemini a auditarla y ejecutarla en el sandbox?
-                          </>
-                        )}
+                        {msg.message ||
+                          (isDownloadApproval
+                            ? "No tengo esta habilidad instalada. ¿Querés que la busque/descargue?"
+                            : `Encontré la skill '${msg.skill_name || "desconocida"}'. ¿Autorizás a ejecutarla?`)}
                       </p>
                       {!isDownloadApproval && msg.skill_description && (
                         <p className="mt-2 text-xs text-muted-foreground">{msg.skill_description}</p>

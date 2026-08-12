@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { MessageSquare, MessageSquarePlus, Search, Waves, X } from "lucide-react";
+import { MessageSquare, MessageSquarePlus, Search, Trash2, Waves, X } from "lucide-react";
 import type { SessionSummary } from "../services/api";
 import { getApiBaseUrl } from "../services/config";
 
@@ -11,6 +11,7 @@ type SidebarProps = {
   onClose: () => void;
   onNewChat: () => void;
   onSelectSession: (sessionId: string) => void;
+  onDeleteSession: (sessionId: string) => void;
 };
 
 function preview(text: string | null): string {
@@ -48,8 +49,10 @@ export function Sidebar({
   onClose,
   onNewChat,
   onSelectSession,
+  onDeleteSession,
 }: SidebarProps) {
   const [search, setSearch] = useState("");
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   const filtered = useMemo(
     () =>
@@ -71,38 +74,69 @@ export function Sidebar({
         <div className="flex flex-col gap-0.5">
           {items.map((session) => {
             const active = session.session_id === activeSessionId;
+            const deleting = deletingId === session.session_id;
             return (
-              <button
+              <div
                 key={session.session_id}
-                type="button"
-                onClick={() => onSelectSession(session.session_id)}
                 className={`group relative flex items-start gap-3 rounded-xl border px-3 py-2.5 text-left transition-all duration-150 ${
                   active
                     ? "border-primary/20 bg-primary/10"
                     : "border-transparent hover:bg-muted/60"
                 }`}
               >
-                <div
-                  className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg transition-colors ${
-                    active ? "bg-primary/20" : "bg-muted"
+                <button
+                  type="button"
+                  onClick={() => onSelectSession(session.session_id)}
+                  className="flex min-w-0 flex-1 items-start gap-3 text-left"
+                >
+                  <div
+                    className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg transition-colors ${
+                      active ? "bg-primary/20" : "bg-muted"
+                    }`}
+                  >
+                    <MessageSquare
+                      size={13}
+                      className={active ? "text-primary" : "text-muted-foreground"}
+                    />
+                  </div>
+                  <div className="min-w-0 flex-1 pr-6">
+                    <p
+                      className={`truncate text-sm leading-snug ${
+                        active ? "text-primary" : "text-foreground"
+                      }`}
+                      style={{ fontWeight: active ? 500 : 400 }}
+                    >
+                      {preview(session.last_message)}
+                    </p>
+                  </div>
+                </button>
+                <button
+                  type="button"
+                  title="Borrar chat"
+                  disabled={deleting}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (
+                      !window.confirm(
+                        "¿Borrar esta conversación? No se puede deshacer.",
+                      )
+                    ) {
+                      return;
+                    }
+                    setDeletingId(session.session_id);
+                    void Promise.resolve(onDeleteSession(session.session_id)).finally(
+                      () => setDeletingId(null),
+                    );
+                  }}
+                  className={`absolute right-2 top-2.5 flex h-6 w-6 items-center justify-center rounded-lg text-muted-foreground transition-all hover:bg-destructive/10 hover:text-destructive disabled:opacity-40 ${
+                    active || deleting
+                      ? "opacity-100"
+                      : "opacity-0 group-hover:opacity-100 focus-visible:opacity-100"
                   }`}
                 >
-                  <MessageSquare
-                    size={13}
-                    className={active ? "text-primary" : "text-muted-foreground"}
-                  />
-                </div>
-                <div className="min-w-0 flex-1">
-                  <p
-                    className={`truncate text-sm leading-snug ${
-                      active ? "text-primary" : "text-foreground"
-                    }`}
-                    style={{ fontWeight: active ? 500 : 400 }}
-                  >
-                    {preview(session.last_message)}
-                  </p>
-                </div>
-              </button>
+                  <Trash2 size={12} />
+                </button>
+              </div>
             );
           })}
         </div>

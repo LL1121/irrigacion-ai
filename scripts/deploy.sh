@@ -20,6 +20,14 @@ set -a
 source "$ENV_FILE"
 set +a
 
+PROXY_NETWORK="${PROXY_NETWORK:-proxy-network}"
+if ! docker network inspect "$PROXY_NETWORK" >/dev/null 2>&1; then
+  echo "==> Creando red externa '$PROXY_NETWORK' (para nginx/proxy)"
+  docker network create "$PROXY_NETWORK"
+else
+  echo "==> Red externa '$PROXY_NETWORK' OK"
+fi
+
 SKILL_HOST_DIR="${SKILL_HOST_DIR:-/var/lib/irrigacion/skills}"
 echo "==> Preparando workspace de skills: $SKILL_HOST_DIR"
 sudo mkdir -p "$SKILL_HOST_DIR"

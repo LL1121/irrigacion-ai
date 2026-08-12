@@ -13,6 +13,7 @@ import {
 } from "./native";
 import {
   approveSkill,
+  deleteSession,
   getSessionMessages,
   healthCheck,
   listSessions,
@@ -230,6 +231,25 @@ function AppShell() {
     }
   }
 
+  async function handleDeleteSession(id: string) {
+    try {
+      await deleteSession(id);
+      setSessions((prev) => prev.filter((s) => s.session_id !== id));
+      if (sessionId === id) {
+        abortRef.current?.abort();
+        setSessionId(newSessionId());
+        setMessages([]);
+        setApproving(false);
+      }
+    } catch (err) {
+      window.alert(
+        err instanceof Error
+          ? `No se pudo borrar el chat: ${err.message}`
+          : "No se pudo borrar el chat.",
+      );
+    }
+  }
+
   async function handleSend(text: string) {
     abortRef.current?.abort();
     const controller = new AbortController();
@@ -376,6 +396,7 @@ function AppShell() {
         onClose={() => setSidebarOpen(false)}
         onNewChat={() => void handleNewChat()}
         onSelectSession={(id) => void handleSelectSession(id)}
+        onDeleteSession={(id) => void handleDeleteSession(id)}
       />
       <ChatWindow
         messages={messages}

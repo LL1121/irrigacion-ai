@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.core.checkpointer import get_checkpointer
 from app.core.database import get_db
 from app.services.agent import (
     DEFAULT_SPEED_MODE,
@@ -184,6 +185,34 @@ def truncate_session(
     )
     db.commit()
     return {"session_id": str(session_id), "truncated_from": payload.from_created_at.isoformat()}
+
+
+@router.delete("/sessions/{session_id}")
+def delete_session(session_id: UUID, db: Session = Depends(get_db)) -> dict:
+    """Borra mensajes del chat y el estado LangGraph (HITL) de la sesión."""
+    sid = str(session_id)
+    result = db.execute(
+        text("DELETE FROM chat_messages WHERE session_id = :session_id"),
+        {"session_id": sid},
+    )
+    db.commit()
+
+    try:
+        get_checkpointer().delete_thread(sid)
+    except Exception:
+        # Fallback si delete_thread no está disponible o falla.
+        try:
+            for table in ("checkpoint_writes", "checkpoint_blobs", "checkpoints"):
+                db.execute(
+                    text(f"DELETE FROM {table} WHERE thread_id = :thread_id"),
+                    {"thread_id": sid},
+                )
+            db.commit()
+        except Exception:
+            pass
+
+    deleted = result.rowcount if result.rowcount is not None and result.rowcount >= 0 else 0
+    return {"session_id": sid, "deleted_messages": deleted}
 
 
 @router.get("/sessions")

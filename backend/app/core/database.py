@@ -1,4 +1,5 @@
 from collections.abc import Generator
+from pathlib import Path
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
@@ -12,9 +13,19 @@ engine = create_engine(
     pool_pre_ping=True,
 )
 
+_AUDIT_SQL = Path(__file__).resolve().parents[1] / "database" / "audit.sql"
+
+
+def _apply_sql_script(conn, path: Path) -> None:
+    """Ejecuta un script SQL multi-statement (funciones/triggers)."""
+    sql = path.read_text(encoding="utf-8")
+    dbapi = conn.connection.driver_connection
+    with dbapi.cursor() as cur:
+        cur.execute(sql)
+
 
 def ensure_runtime_schema() -> None:
-    """Columnas extra para volúmenes de DB ya inicializados (init.sql no se re-ejecuta)."""
+    """Migraciones ligeras + auditoría para volúmenes ya inicializados."""
     with engine.begin() as conn:
         conn.execute(
             text(
@@ -22,6 +33,11 @@ def ensure_runtime_schema() -> None:
                 "ADD COLUMN IF NOT EXISTS metadata JSONB"
             )
         )
+        if _AUDIT_SQL.is_file():
+            _apply_sql_script(conn, _AUDIT_SQL)
+        else:
+            raise FileNotFoundError(f"No se encontró el script de auditoría: {_AUDIT_SQL}")
+
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 

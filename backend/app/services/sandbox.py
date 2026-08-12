@@ -167,24 +167,76 @@ def _try_parse_json(text: str) -> dict[str, Any] | None:
         return None
 
 
-def execute_skill_in_sandbox_sync(code_str: str, input_data: dict) -> dict[str, Any]:
+def _run_inline(code_str: str, input_data: dict) -> dict[str, Any]:
+    """Ejecuta la skill en el mismo proceso del API (sin contenedor)."""
+    import traceback
+
+    namespace: dict[str, Any] = {"__name__": "__skill__"}
+    try:
+        exec(compile(code_str, "<skill>", "exec"), namespace)  # noqa: S102
+        run_fn = namespace.get("run")
+        if not callable(run_fn):
+            err = "Skill sin función run(input_data)"
+            payload = {"success": False, "error": err}
+            return {
+                "executed": True,
+                "exit_code": 1,
+                "stdout": json.dumps(payload, ensure_ascii=False),
+                "stderr": err,
+                "parsed": payload,
+                "error": err,
+                "mode": "inline",
+            }
+        result = run_fn(input_data or {})
+        payload = {"success": True, "result": result}
+        return {
+            "executed": True,
+            "exit_code": 0,
+            "stdout": json.dumps(payload, ensure_ascii=False, default=str),
+            "stderr": "",
+            "parsed": payload,
+            "mode": "inline",
+        }
+    except Exception as exc:
+        payload = {
+            "success": False,
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+        return {
+            "executed": True,
+            "exit_code": 1,
+            "stdout": json.dumps(payload, ensure_ascii=False),
+            "stderr": str(exc),
+            "parsed": payload,
+            "error": str(exc),
+            "mode": "inline",
+        }
+
+
+def execute_skill_sync(code_str: str, input_data: dict) -> dict[str, Any]:
     """Wrapper síncrono para nodos LangGraph (el endpoint de chat corre en threadpool)."""
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(execute_skill_in_sandbox(code_str, input_data))
+        return asyncio.run(execute_skill(code_str, input_data))
 
     import concurrent.futures
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         return pool.submit(
-            lambda: asyncio.run(execute_skill_in_sandbox(code_str, input_data))
+            lambda: asyncio.run(execute_skill(code_str, input_data))
         ).result()
 
 
-async def execute_skill_in_sandbox(code_str: str, input_data: dict) -> dict[str, Any]:
+# Alias histórico
+execute_skill_in_sandbox_sync = execute_skill_sync
+
+
+async def execute_skill(code_str: str, input_data: dict) -> dict[str, Any]:
     """
-    Audita con Gemini y, si es segura, ejecuta la skill en un contenedor efímero.
+    Audita con Gemini y, si es segura, ejecuta la skill.
+    Modo controlado por SKILL_EXECUTION_MODE: inline | sandbox.
     """
     audit = await audit_skill_code(code_str)
     if not audit.get("is_safe"):
@@ -194,10 +246,25 @@ async def execute_skill_in_sandbox(code_str: str, input_data: dict) -> dict[str,
             "execution": None,
         }
 
+    settings = get_settings()
+    mode = (settings.skill_execution_mode or "inline").strip().lower()
+    if mode not in {"inline", "sandbox"}:
+        mode = "inline"
+
+    if mode == "inline":
+        execution = await asyncio.to_thread(_run_inline, code_str, input_data or {})
+        return {
+            "status": "executed",
+            "audit": audit,
+            "execution": execution,
+        }
+
     work: Path | None = None
     try:
         work = await asyncio.to_thread(_write_workspace, code_str, input_data or {})
         execution = await asyncio.to_thread(_run_container, work)
+        if isinstance(execution, dict):
+            execution = {**execution, "mode": "sandbox"}
         return {
             "status": "executed",
             "audit": audit,
@@ -207,3 +274,8 @@ async def execute_skill_in_sandbox(code_str: str, input_data: dict) -> dict[str,
         if work is not None and work.exists():
             shutil.rmtree(work, ignore_errors=True)
             logger.debug("Workspace temporal eliminado: %s", work)
+
+
+async def execute_skill_in_sandbox(code_str: str, input_data: dict) -> dict[str, Any]:
+    """Compat: misma entrada que execute_skill (respeta SKILL_EXECUTION_MODE)."""
+    return await execute_skill(code_str, input_data)

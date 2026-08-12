@@ -22,7 +22,7 @@ from app.services.document_export import (
     artifact_info,
     save_artifact_from_base64,
 )
-from app.services.sandbox import execute_skill_in_sandbox_sync
+from app.services.sandbox import execute_skill_sync
 from app.services.skill_marketplace import (
     APPROVAL_KIND_DOWNLOAD,
     APPROVAL_KIND_EXECUTE,
@@ -381,10 +381,14 @@ def _route_after_plan(state: AgentState) -> Literal["human_gate_download", "huma
 def _approval_prompt(skill: dict[str, Any]) -> str:
     name = skill.get("name") or "desconocida"
     source = skill.get("source")
-    prefix = "Se descargó la skill" if source == "remote" else "Se encontró la skill"
+    if source == "remote":
+        return (
+            f"Ya tengo lista la skill '{name}' (descargada). "
+            "¿Autorizás a Gemini a auditarla y ejecutarla?"
+        )
     return (
-        f"No tengo esta habilidad instalada. {prefix} '{name}'. "
-        "¿Autorizás a Gemini a auditarla y ejecutarla en el sandbox?"
+        f"Encontré la skill '{name}' en el catálogo. "
+        "¿Autorizás a Gemini a auditarla y ejecutarla?"
     )
 
 
@@ -489,21 +493,24 @@ def _run_skill_node(state: AgentState) -> dict:
     code = skill.get("code") or ""
     arguments = skill.get("arguments") or {}
     try:
-        result = execute_skill_in_sandbox_sync(code, arguments)
+        result = execute_skill_sync(code, arguments)
     except Exception as exc:
-        logger.exception("Fallo al ejecutar skill en sandbox")
+        logger.exception("Fallo al ejecutar skill")
         name = skill.get("name") or "skill"
+        mode = get_settings().skill_execution_mode
+        hint = (
+            "Si usás sandbox y falta la imagen, en el servidor corré: "
+            "docker build -t skill-sandbox-image backend/sandbox_env"
+            if mode == "sandbox"
+            else "Revisá el código de la skill o cambiá SKILL_EXECUTION_MODE."
+        )
         return {
             "skill_result": {
                 "status": "error",
                 "audit": None,
                 "execution": {"error": str(exc)},
             },
-            "reply": (
-                f"No pude ejecutar la skill '{name}': {exc}. "
-                "Si falta la imagen del sandbox, en el servidor corré: "
-                "docker build -t skill-sandbox-image backend/sandbox_env"
-            ),
+            "reply": f"No pude ejecutar la skill '{name}': {exc}. {hint}",
             "pending_skill": skill,
         }
     return {"skill_result": result, "reply": "", "pending_skill": skill}

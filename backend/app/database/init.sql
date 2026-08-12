@@ -41,3 +41,6 @@ CREATE INDEX IF NOT EXISTS idx_semantic_cache_query_embedding_hnsw
 -- Índice B-Tree para recuperar historial por sesión
 CREATE INDEX IF NOT EXISTS idx_chat_messages_session_created
     ON chat_messages (session_id, created_at ASC);
+
+-- Auditoría (triggers): ver 02_audit.sql / app/database/audit.sql
+

@@ -135,6 +135,13 @@ export async function listSessions(): Promise<SessionSummary[]> {
   return data.sessions ?? [];
 }
 
+export async function deleteSession(sessionId: string): Promise<void> {
+  const res = await fetch(`${getApiBaseUrl()}/api/sessions/${sessionId}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) throw new Error(await parseError(res));
+}
+
 export async function getSessionMessages(
   sessionId: string,
 ): Promise<ChatMessage[]> {

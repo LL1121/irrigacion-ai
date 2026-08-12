@@ -17,7 +17,8 @@ services:
       - "5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./backend/app/database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./backend/app/database/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+      - ./backend/app/database/audit.sql:/docker-entrypoint-initdb.d/02_audit.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 10s
@@ -52,6 +53,8 @@ services:
       CORS_ORIGINS: ${CORS_ORIGINS}
       SKILL_WORKSPACE_DIR: /var/lib/irrigacion/skills
       SKILL_SANDBOX_IMAGE: ${SKILL_SANDBOX_IMAGE:-skill-sandbox-image}
+      # inline = mismo proceso API (sin Docker). sandbox = contenedor efímero.
+      SKILL_EXECUTION_MODE: ${SKILL_EXECUTION_MODE:-inline}
       # Build de la PWA (desktop-app/dist) montado como volumen de solo lectura.
       # Generalo antes del deploy con: cd desktop-app && npm run build
       FRONTEND_DIST_DIR: /app/static/dist
@@ -78,6 +81,9 @@ services:
       - 1.1.1.1
     networks:
       - irrigacion_internal
+      # Red de nginx / reverse-proxy (externa). Evita tener que hacer
+      # `docker network connect proxy-network irrigacion_api_prod` a mano.
+      - proxy
     restart: unless-stopped
     group_add:
       - "${DOCKER_GID:-0}"
@@ -88,3 +94,6 @@ volumes:
 networks:
   irrigacion_internal:
     driver: bridge
+  proxy:
+    external: true
+    name: ${PROXY_NETWORK:-proxy-network}
