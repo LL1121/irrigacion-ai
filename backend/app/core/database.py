@@ -33,6 +33,29 @@ def ensure_runtime_schema() -> None:
                 "ADD COLUMN IF NOT EXISTS metadata JSONB"
             )
         )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS skill_whitelist (
+                    id BIGSERIAL PRIMARY KEY,
+                    skill_id TEXT NOT NULL,
+                    code_sha256 TEXT NOT NULL,
+                    skill_name TEXT,
+                    source TEXT,
+                    risk_score INT,
+                    audit_reason TEXT,
+                    whitelisted_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (skill_id, code_sha256)
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS idx_skill_whitelist_skill_id "
+                "ON skill_whitelist (skill_id)"
+            )
+        )
         if _AUDIT_SQL.is_file():
             _apply_sql_script(conn, _AUDIT_SQL)
         else:

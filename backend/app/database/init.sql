@@ -42,5 +42,21 @@ CREATE INDEX IF NOT EXISTS idx_semantic_cache_query_embedding_hnsw
 CREATE INDEX IF NOT EXISTS idx_chat_messages_session_created
     ON chat_messages (session_id, created_at ASC);
 
+-- Skills auditadas por Gemini: skip HITL en próximas ejecuciones (mismo código)
+CREATE TABLE IF NOT EXISTS skill_whitelist (
+    id BIGSERIAL PRIMARY KEY,
+    skill_id TEXT NOT NULL,
+    code_sha256 TEXT NOT NULL,
+    skill_name TEXT,
+    source TEXT,
+    risk_score INT,
+    audit_reason TEXT,
+    whitelisted_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (skill_id, code_sha256)
+);
+
+CREATE INDEX IF NOT EXISTS idx_skill_whitelist_skill_id
+    ON skill_whitelist (skill_id);
+
 -- Auditoría (triggers): ver 02_audit.sql / app/database/audit.sql
 

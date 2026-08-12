@@ -214,37 +214,79 @@ def _run_inline(code_str: str, input_data: dict) -> dict[str, Any]:
         }
 
 
-def execute_skill_sync(code_str: str, input_data: dict) -> dict[str, Any]:
+def execute_skill_sync(
+    code_str: str,
+    input_data: dict,
+    *,
+    skill_id: str | None = None,
+    skill_name: str | None = None,
+    source: str | None = None,
+) -> dict[str, Any]:
     """Wrapper síncrono para nodos LangGraph (el endpoint de chat corre en threadpool)."""
+
+    def _run() -> dict[str, Any]:
+        return asyncio.run(
+            execute_skill(
+                code_str,
+                input_data,
+                skill_id=skill_id,
+                skill_name=skill_name,
+                source=source,
+            )
+        )
+
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(execute_skill(code_str, input_data))
+        return _run()
 
     import concurrent.futures
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(
-            lambda: asyncio.run(execute_skill(code_str, input_data))
-        ).result()
+        return pool.submit(_run).result()
 
 
 # Alias histórico
 execute_skill_in_sandbox_sync = execute_skill_sync
 
 
-async def execute_skill(code_str: str, input_data: dict) -> dict[str, Any]:
+async def execute_skill(
+    code_str: str,
+    input_data: dict,
+    *,
+    skill_id: str | None = None,
+    skill_name: str | None = None,
+    source: str | None = None,
+) -> dict[str, Any]:
     """
-    Audita con Gemini y, si es segura, ejecuta la skill.
+    Audita con Gemini (o salta si está en whitelist) y ejecuta la skill.
     Modo controlado por SKILL_EXECUTION_MODE: inline | sandbox.
     """
-    audit = await audit_skill_code(code_str)
-    if not audit.get("is_safe"):
-        return {
-            "status": "rejected",
-            "audit": audit,
-            "execution": None,
+    from app.services.skill_whitelist import add_to_whitelist, is_whitelisted
+
+    if skill_id and is_whitelisted(skill_id, code_str):
+        audit: dict[str, Any] = {
+            "is_safe": True,
+            "risk_score": 0,
+            "reason": "Whitelist: skill previamente auditada por Gemini",
+            "whitelisted": True,
         }
+    else:
+        audit = await audit_skill_code(code_str)
+        if not audit.get("is_safe"):
+            return {
+                "status": "rejected",
+                "audit": audit,
+                "execution": None,
+            }
+        if skill_id:
+            add_to_whitelist(
+                skill_id=skill_id,
+                code_str=code_str,
+                skill_name=skill_name,
+                source=source,
+                audit=audit,
+            )
 
     settings = get_settings()
     mode = (settings.skill_execution_mode or "inline").strip().lower()

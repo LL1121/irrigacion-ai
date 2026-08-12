@@ -113,3 +113,15 @@ CREATE TRIGGER trg_audit_semantic_cache
     AFTER INSERT OR UPDATE OR DELETE ON semantic_cache
     FOR EACH ROW
     EXECUTE FUNCTION audit_row_change();
+
+-- skill_whitelist (si la tabla ya existe)
+DO $$
+BEGIN
+    IF to_regclass('public.skill_whitelist') IS NOT NULL THEN
+        DROP TRIGGER IF EXISTS trg_audit_skill_whitelist ON skill_whitelist;
+        CREATE TRIGGER trg_audit_skill_whitelist
+            AFTER INSERT OR UPDATE OR DELETE ON skill_whitelist
+            FOR EACH ROW
+            EXECUTE FUNCTION audit_row_change();
+    END IF;
+END $$;

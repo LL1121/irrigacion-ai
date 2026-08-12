@@ -145,29 +145,145 @@ def run(input_data):
 
 _SKILL_DOCX = '''
 def run(input_data):
-    """Genera un archivo Word (.docx) con título y contenido en texto plano."""
+    """Genera un .docx con formato: headings, párrafos, viñetas, numeración y tablas."""
     import base64
+    import re
     from io import BytesIO
     from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Pt
 
     title = str(input_data.get("titulo") or input_data.get("title") or "Documento Irrigación")
-    content = str(
-        input_data.get("contenido")
-        or input_data.get("content")
-        or input_data.get("texto")
-        or input_data.get("body")
-        or ""
-    )
     filename = str(input_data.get("filename") or input_data.get("nombre") or f"{title}.docx")
     if not filename.lower().endswith(".docx"):
         filename = f"{filename}.docx"
 
+    def _add_formatted_runs(paragraph, text):
+        """Soporta **negrita** y *cursiva* (no anidados)."""
+        raw = str(text or "")
+        if not raw:
+            return
+        pattern = re.compile(r"(\\*\\*[^*]+\\*\\*|\\*[^*]+\\*|[^*]+)")
+        for token in pattern.findall(raw):
+            if token.startswith("**") and token.endswith("**") and len(token) > 4:
+                run = paragraph.add_run(token[2:-2])
+                run.bold = True
+            elif token.startswith("*") and token.endswith("*") and len(token) > 2:
+                run = paragraph.add_run(token[1:-1])
+                run.italic = True
+            else:
+                paragraph.add_run(token)
+
+    def _align(paragraph, value):
+        mapping = {
+            "left": WD_ALIGN_PARAGRAPH.LEFT,
+            "izquierda": WD_ALIGN_PARAGRAPH.LEFT,
+            "center": WD_ALIGN_PARAGRAPH.CENTER,
+            "centro": WD_ALIGN_PARAGRAPH.CENTER,
+            "right": WD_ALIGN_PARAGRAPH.RIGHT,
+            "derecha": WD_ALIGN_PARAGRAPH.RIGHT,
+            "justify": WD_ALIGN_PARAGRAPH.JUSTIFY,
+            "justificado": WD_ALIGN_PARAGRAPH.JUSTIFY,
+        }
+        key = str(value or "").strip().lower()
+        if key in mapping:
+            paragraph.alignment = mapping[key]
+
+    def _list_items(block, text):
+        items = block.get("items") or block.get("elementos")
+        if isinstance(items, list):
+            return items
+        return [text] if text else []
+
+    blocks = input_data.get("blocks") or input_data.get("bloques")
+    if not isinstance(blocks, list):
+        blocks = []
+
+    if not blocks:
+        content = str(
+            input_data.get("contenido")
+            or input_data.get("content")
+            or input_data.get("texto")
+            or ""
+        ).strip()
+        paragraphs = input_data.get("paragraphs") or input_data.get("parrafos")
+        if isinstance(paragraphs, list) and paragraphs:
+            blocks = [{"type": "paragraph", "text": str(p)} for p in paragraphs if str(p).strip()]
+        elif content:
+            parts = re.split(r"\\n\\s*\\n", content.replace("\\r\\n", "\\n"))
+            blocks = [{"type": "paragraph", "text": p.strip()} for p in parts if p.strip()]
+
+    if not blocks:
+        blocks = [{"type": "paragraph", "text": "(Sin contenido)"}]
+
     doc = Document()
-    doc.add_heading(title, level=0)
-    for block in content.replace("\\r\\n", "\\n").split("\\n"):
-        line = block.strip()
-        if line:
-            doc.add_paragraph(line)
+    style = doc.styles["Normal"]
+    style.font.name = "Calibri"
+    style.font.size = Pt(11)
+
+    include_title = bool(input_data.get("include_title", True))
+    if include_title and title:
+        h = doc.add_heading(title, level=0)
+        _align(h, input_data.get("title_align") or "center")
+
+    rendered = 0
+    for block in blocks:
+        if not isinstance(block, dict):
+            text = str(block).strip()
+            if text:
+                p = doc.add_paragraph()
+                _add_formatted_runs(p, text)
+                rendered += 1
+            continue
+
+        tipo = str(block.get("type") or block.get("tipo") or "paragraph").lower().strip()
+        text = block.get("text") or block.get("texto") or ""
+        level = int(block.get("level") or block.get("nivel") or 1)
+        level = max(1, min(level, 3))
+
+        if tipo in {"heading", "titulo", "heading1", "heading2", "heading3", "h1", "h2", "h3"}:
+            if tipo in {"heading1", "h1"}:
+                level = 1
+            elif tipo in {"heading2", "h2"}:
+                level = 2
+            elif tipo in {"heading3", "h3"}:
+                level = 3
+            h = doc.add_heading(str(text), level=level)
+            _align(h, block.get("align") or block.get("alineacion"))
+            rendered += 1
+        elif tipo in {"bullet", "viñeta", "vineta", "ul", "lista"}:
+            for item in _list_items(block, text):
+                item_s = str(item).strip()
+                if not item_s:
+                    continue
+                p = doc.add_paragraph(style="List Bullet")
+                _add_formatted_runs(p, item_s)
+                rendered += 1
+        elif tipo in {"number", "numbered", "ol", "numerada", "numerado"}:
+            for item in _list_items(block, text):
+                item_s = str(item).strip()
+                if not item_s:
+                    continue
+                p = doc.add_paragraph(style="List Number")
+                _add_formatted_runs(p, item_s)
+                rendered += 1
+        elif tipo in {"table", "tabla"}:
+            rows = block.get("rows") or block.get("filas") or []
+            if isinstance(rows, list) and rows:
+                cols = max(len(r) if isinstance(r, (list, tuple)) else 1 for r in rows)
+                table = doc.add_table(rows=len(rows), cols=cols)
+                table.style = "Table Grid"
+                for i, row in enumerate(rows):
+                    cells = list(row) if isinstance(row, (list, tuple)) else [row]
+                    for j in range(cols):
+                        cell_text = str(cells[j]) if j < len(cells) else ""
+                        table.rows[i].cells[j].text = cell_text
+                rendered += 1
+        else:
+            p = doc.add_paragraph()
+            _add_formatted_runs(p, str(text))
+            _align(p, block.get("align") or block.get("alineacion"))
+            rendered += 1
 
     buf = BytesIO()
     doc.save(buf)
@@ -177,6 +293,8 @@ def run(input_data):
         "content_base64": base64.b64encode(raw).decode("ascii"),
         "size_bytes": len(raw),
         "mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "titulo": title,
+        "block_count": rendered,
     }
 '''
 
@@ -232,8 +350,8 @@ CATALOG: list[SkillRecord] = [
         "id": "generar_documento_word",
         "name": "Generación de documento Word (.docx)",
         "description": (
-            "Redacta y exporta un informe o documento institucional en formato Word (.docx) "
-            "a partir de un título y el contenido en texto."
+            "Redacta y exporta un documento Word (.docx) respetando el formato pedido: "
+            "títulos/subtítulos, párrafos, viñetas, listas numeradas, tablas y negritas/cursivas."
         ),
         "tags": [
             "word",
@@ -244,6 +362,12 @@ CATALOG: list[SkillRecord] = [
             "exportar",
             "escribir",
             "archivo",
+            "formato",
+            "tabla",
+            "viñetas",
+            "lista",
+            "titulo",
+            "negrita",
         ],
         "code": _SKILL_DOCX.strip(),
     },
@@ -501,9 +625,14 @@ def infer_arguments(skill_id: str, user_message: str) -> dict[str, Any]:
                 else:
                     args["caudal_m3s"] = numbers[1]
     elif skill_id == "generar_documento_word":
-        title_match = re.search(r"(?:titulo|título|informe|documento)\s*[:\-]?\s*(.+)", text, re.I)
-        args["titulo"] = (title_match.group(1).strip()[:120] if title_match else "Documento Irrigación")
-        args["contenido"] = text
+        title_match = re.search(
+            r"(?:titulo|título)\s*[:\-]\s*(.+)$", text, re.I | re.M
+        )
+        if title_match:
+            args["titulo"] = title_match.group(1).strip()[:120]
+        # No copiar el pedido del usuario como "contenido": eso se redacta en
+        # prepare_docx_arguments() con el LLM.
+        args["pedido"] = text
     return args
 
 
@@ -514,11 +643,330 @@ def enrich_skill_arguments(skill: dict[str, Any], user_message: str) -> dict[str
     inferred = infer_arguments(skill_id, user_message)
     merged = {**inferred, **{k: v for k, v in current.items() if v not in (None, "", {})}}
     if skill_id == "generar_documento_word":
-        if not merged.get("contenido") and not merged.get("content"):
-            merged["contenido"] = user_message
         if not merged.get("titulo") and not merged.get("title"):
             merged["titulo"] = "Documento Irrigación"
+        merged["pedido"] = user_message
     return merged
+
+
+def prepare_docx_arguments(user_message: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Redacta título + bloques con formato real del Word (no el texto del pedido)."""
+    from langchain_core.messages import HumanMessage, SystemMessage
+    from langchain_openai import ChatOpenAI
+
+    from app.core.config import get_settings
+    from app.services.token_guard import fit_user_message
+
+    merged = dict(arguments or {})
+    existing_blocks = merged.get("blocks") or merged.get("bloques")
+    if isinstance(existing_blocks, list) and existing_blocks:
+        return merged
+
+    settings = get_settings()
+    llm = ChatOpenAI(
+        model=settings.chat_model,
+        api_key=settings.groq_api_key,
+        base_url=settings.groq_base_url,
+        temperature=0.55,
+    )
+    pedido = fit_user_message(user_message or merged.get("pedido") or "")
+    prompt = """
+Sos un redactor técnico de Irrigación de Malargüe. El usuario pidió un documento Word.
+Generá el CONTENIDO REAL del documento (nunca copies el pedido literal) y aplicá el FORMATO
+que pidió (títulos, subtítulos, viñetas, numeración, tablas, negritas, etc.).
+
+Reglas:
+- Si pide N párrafos aleatorios: inventá exactamente N párrafos (type=paragraph).
+- Si pide secciones/títulos: usá type=heading con level 1..3.
+- Si pide lista con viñetas: type=bullet + items[].
+- Si pide lista numerada: type=number + items[].
+- Si pide tabla o datos tabulares: type=table + rows[][] (primera fila = encabezados si aplica).
+- Negrita con **texto** y cursiva con *texto* dentro de text/items.
+- Español rioplatense, tono institucional claro.
+- Respondé ÚNICAMENTE JSON válido (sin markdown) con esta forma:
+{
+  "titulo": "Título del documento",
+  "filename": "opcional.docx",
+  "title_align": "center",
+  "blocks": [
+    {"type": "heading", "level": 1, "text": "Sección"},
+    {"type": "paragraph", "text": "Párrafo con **negrita** si hace falta", "align": "justify"},
+    {"type": "bullet", "items": ["ítem 1", "ítem 2"]},
+    {"type": "number", "items": ["paso 1", "paso 2"]},
+    {"type": "table", "rows": [["Col A", "Col B"], ["v1", "v2"]]}
+  ]
+}
+""".strip()
+    try:
+        response = llm.invoke(
+            [
+                SystemMessage(content=prompt),
+                HumanMessage(content=f"Pedido del usuario:\n{pedido}"),
+            ]
+        )
+        raw = (getattr(response, "content", None) or "").strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            title = str(data.get("titulo") or data.get("title") or "").strip()
+            if title:
+                merged["titulo"] = title[:120]
+            filename = str(data.get("filename") or data.get("nombre") or "").strip()
+            if filename:
+                merged["filename"] = filename
+            if data.get("title_align"):
+                merged["title_align"] = data.get("title_align")
+            blocks = data.get("blocks") or data.get("bloques")
+            if isinstance(blocks, list) and blocks:
+                merged["blocks"] = blocks
+            else:
+                content = str(data.get("contenido") or data.get("content") or "").strip()
+                paragraphs = data.get("paragraphs") or data.get("parrafos")
+                if isinstance(paragraphs, list) and paragraphs:
+                    merged["blocks"] = [
+                        {"type": "paragraph", "text": str(p).strip()}
+                        for p in paragraphs
+                        if str(p).strip()
+                    ]
+                elif content:
+                    parts = [p.strip() for p in re.split(r"\n\s*\n", content) if p.strip()]
+                    merged["blocks"] = [{"type": "paragraph", "text": p} for p in parts]
+                    merged["contenido"] = content
+    except Exception:
+        n_match = re.search(r"(\d+)\s*p[aá]rrafos?", (user_message or "").lower())
+        n = int(n_match.group(1)) if n_match else 3
+        n = max(1, min(n, 12))
+        stubs = [
+            (
+                "En la cuenca del río Atuel, el control de caudales requiere "
+                "mediciones periódicas en tomas y canales secundarios."
+            ),
+            (
+                "El prorrateo de turnos de riego se realiza según derechos "
+                "consuntivos y superficies empadronadas en cada zona."
+            ),
+            (
+                "La documentación institucional debe registrar volúmenes "
+                "entregados, incidencias operativas y acuerdos de distribución."
+            ),
+            (
+                "Las láminas de riego se estiman a partir del volumen aplicado "
+                "y la superficie efectiva bajo riego."
+            ),
+            (
+                "Un informe técnico claro facilita la coordinación entre "
+                "inspectores de cauce y usuarios de riego."
+            ),
+        ]
+        merged.setdefault("titulo", "Documento Irrigación")
+        merged["blocks"] = [
+            {"type": "paragraph", "text": stubs[i % len(stubs)], "align": "justify"}
+            for i in range(n)
+        ]
+
+    return merged
+
+
+# Esquemas de argumentos esperados por skill (para extracción inteligente vía LLM).
+SKILL_ARG_SCHEMAS: dict[str, dict[str, Any]] = {
+    "caudal_canal": {
+        "fields": {
+            "area_m2": "Área de la sección en m²",
+            "velocidad_ms": "Velocidad del agua en m/s",
+        },
+        "required": ["area_m2", "velocidad_ms"],
+        "notes": "Q = A·v. Inferí área y velocidad aunque estén en otra unidad y convertí a m² y m/s.",
+    },
+    "conversion_unidades": {
+        "fields": {
+            "valor": "Número a convertir",
+            "unidad": "Unidad de origen: l/s, m3/s, m3/h o m3/d",
+        },
+        "required": ["valor", "unidad"],
+        "notes": "Normalizá la unidad a una de: l/s, m3/s, m3/h, m3/d.",
+    },
+    "prorrateo_turno": {
+        "fields": {
+            "total": "Caudal o volumen total a repartir",
+            "partes": "Lista de {nombre, peso} (acciones, ha o derechos)",
+        },
+        "required": ["total", "partes"],
+        "notes": "Si dice '3 usuarios con 2, 3 y 5 acciones' armá partes con esos pesos.",
+    },
+    "lamina_riego": {
+        "fields": {
+            "volumen_m3": "Volumen aplicado en m³",
+            "superficie_ha": "Superficie en hectáreas (preferida)",
+            "superficie_m2": "Superficie en m² (alternativa)",
+        },
+        "required": ["volumen_m3"],
+        "notes": "Debe haber superficie_ha o superficie_m2.",
+    },
+    "tiempo_riego": {
+        "fields": {
+            "volumen_m3": "Volumen a aplicar en m³",
+            "caudal_ls": "Caudal en L/s (preferido)",
+            "caudal_m3s": "Caudal en m³/s (alternativa)",
+        },
+        "required": ["volumen_m3"],
+        "notes": "Debe haber caudal_ls o caudal_m3s.",
+    },
+}
+
+
+def _numeric_ready(value: Any) -> bool:
+    if value in (None, "", {}, []):
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    try:
+        float(str(value).replace(",", "."))
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _args_complete_for_skill(skill_id: str, args: dict[str, Any]) -> bool:
+    schema = SKILL_ARG_SCHEMAS.get(skill_id)
+    if not schema:
+        return bool(args)
+    for key in schema.get("required") or []:
+        if key == "partes":
+            partes = args.get("partes") or args.get("derechos")
+            if not isinstance(partes, list) or not partes:
+                return False
+            continue
+        if not _numeric_ready(args.get(key)):
+            return False
+    if skill_id == "lamina_riego":
+        return _numeric_ready(args.get("superficie_ha")) or _numeric_ready(
+            args.get("superficie_m2")
+        )
+    if skill_id == "tiempo_riego":
+        return _numeric_ready(args.get("caudal_ls")) or _numeric_ready(
+            args.get("caudal_m3s")
+        )
+    return True
+
+
+def _llm_extract_skill_arguments(
+    skill: dict[str, Any],
+    user_message: str,
+    current: dict[str, Any],
+) -> dict[str, Any]:
+    from langchain_core.messages import HumanMessage, SystemMessage
+    from langchain_openai import ChatOpenAI
+
+    from app.core.config import get_settings
+    from app.services.token_guard import fit_user_message
+
+    skill_id = str(skill.get("id") or "")
+    schema = SKILL_ARG_SCHEMAS.get(skill_id) or {
+        "fields": {},
+        "required": [],
+        "notes": skill.get("description") or "",
+    }
+    settings = get_settings()
+    llm = ChatOpenAI(
+        model=settings.chat_model,
+        api_key=settings.groq_api_key,
+        base_url=settings.groq_base_url,
+        temperature=0.1,
+    )
+    prompt = f"""
+Sos un extractor de argumentos para skills de Irrigación de Malargüe.
+Skill: {skill.get('name') or skill_id}
+Descripción: {skill.get('description') or ''}
+Campos esperados: {json.dumps(schema.get('fields') or {}, ensure_ascii=False)}
+Requeridos: {json.dumps(schema.get('required') or [], ensure_ascii=False)}
+Notas: {schema.get('notes') or ''}
+
+Extraé del pedido del usuario SOLO los argumentos de la skill.
+- Inferí unidades y convertí a las pedidas cuando sea obvio (ha↔m², L/s↔m³/s).
+- No inventes números que el usuario no dio.
+- Si falta un dato imprescindible, igual devolvé lo que puedas y dejá ausentes los demás.
+- Respondé ÚNICAMENTE JSON (objeto) con los campos.
+""".strip()
+    try:
+        response = llm.invoke(
+            [
+                SystemMessage(content=prompt),
+                HumanMessage(
+                    content=(
+                        f"Pedido:\n{fit_user_message(user_message)}\n\n"
+                        f"Parcial ya inferido:\n{json.dumps(current, ensure_ascii=False)}"
+                    )
+                ),
+            ]
+        )
+        raw = (getattr(response, "content", None) or "").strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            cleaned = {k: v for k, v in data.items() if v not in (None, "", [], {})}
+            return {**current, **cleaned}
+    except Exception:
+        pass
+    return current
+
+
+def prepare_skill_arguments(skill: dict[str, Any], user_message: str) -> dict[str, Any]:
+    """
+    Personaliza argumentos de cualquier skill:
+    - Word: redacta contenido + formato
+    - Cálculos: completa con heurística y, si falta, extracción LLM
+    - Remotas: intenta LLM genérico según descripción
+    """
+    skill_id = str(skill.get("id") or "")
+    base = enrich_skill_arguments(skill, user_message)
+
+    if skill_id == "generar_documento_word":
+        return prepare_docx_arguments(user_message, base)
+
+    if skill_id in SKILL_ARG_SCHEMAS:
+        if _args_complete_for_skill(skill_id, base):
+            return base
+        return _llm_extract_skill_arguments(skill, user_message, base)
+
+    # Skills remotas / desconocidas: si hay pocos args útiles, pedir al LLM.
+    useful = {
+        k: v
+        for k, v in base.items()
+        if k not in {"query", "pedido", "raw"} and v not in (None, "", {}, [])
+    }
+    if useful:
+        return base
+    return _llm_extract_skill_arguments(skill, user_message, base)
+
+
+def detect_response_style(user_message: str) -> str:
+    """Preferencia de presentación pedida por el usuario (chat o post-skill)."""
+    lowered = (user_message or "").lower()
+    hints: list[str] = []
+    if any(k in lowered for k in ("tabla", "tabular", "markdown table", "|")):
+        hints.append("Presentá números en tabla Markdown.")
+    if any(k in lowered for k in ("viñeta", "vineta", "bullet", "lista", "ítems", "items")):
+        hints.append("Usá lista con viñetas.")
+    if any(k in lowered for k in ("paso a paso", "pasos", "numerad")):
+        hints.append("Explicá en pasos numerados.")
+    if any(k in lowered for k in ("breve", "corto", "resumí", "resumi", "tl;dr", "en una línea")):
+        hints.append("Sé muy breve (máximo 5 líneas).")
+    if any(k in lowered for k in ("detall", "explicá", "explica", "desarroll")):
+        hints.append("Dale una explicación un poco más detallada, sin relleno.")
+    if any(k in lowered for k in ("formal", "institucional", "para el expediente")):
+        hints.append("Tono más formal/institucional.")
+    if any(k in lowered for k in ("simple", "para un peón", "como si fuera", "en criollo")):
+        hints.append("Lenguaje simple y directo, sin jerga innecesaria.")
+    if not hints:
+        return (
+            "Adaptá el formato al pedido: preferí claridad. "
+            "Si hay varios números, usá tabla o viñetas."
+        )
+    return " ".join(hints)
 
 
 def _tokenize(text: str) -> set[str]:
@@ -588,12 +1036,13 @@ def search_skill_marketplace(task: str, arguments_json: str = "{}") -> str:
     """Busca en el catálogo institucional una skill (herramienta Python) para la tarea.
 
     Usala cuando el usuario pide un cálculo, conversión, prorrateo, lámina o tiempo de riego,
-    generación de documentos Word, o cualquier automatización que no puedas resolver solo
-    con el contexto RAG. No inventes números: primero buscá la skill.
+    generación de documentos Word (con formato), o cualquier automatización que no puedas
+    resolver solo con el contexto RAG. No inventes números: primero buscá la skill.
 
     Args:
         task: descripción breve de la tarea (ej. 'calcular caudal con área y velocidad').
-        arguments_json: JSON con los números/datos extraídos del mensaje del usuario.
+        arguments_json: JSON con números/datos/unidades extraídos del mensaje
+            (ej. area_m2, velocidad_ms, valor, unidad, partes, volumen_m3, superficie_ha).
     """
     result = search_catalog(task, _parse_arguments(arguments_json))
     public = {k: v for k, v in result.items() if k != "code"}

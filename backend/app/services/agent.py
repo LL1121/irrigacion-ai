@@ -26,15 +26,17 @@ from app.services.sandbox import execute_skill_sync
 from app.services.skill_marketplace import (
     APPROVAL_KIND_DOWNLOAD,
     APPROVAL_KIND_EXECUTE,
+    detect_response_style,
     download_remote_prompt,
-    enrich_skill_arguments,
     find_local_skill,
     is_action_request,
+    prepare_skill_arguments,
     search_catalog,
     search_skill_marketplace,
     should_try_skill_marketplace,
 )
 from app.services.skill_remote import generate_remote_skill
+from app.services.skill_whitelist import is_whitelisted
 from app.services.token_guard import (
     dumps_capped,
     enforce_request_budget,
@@ -61,6 +63,13 @@ Tu objetivo es ayudar al personal de la oficina a resolver dudas sobre normativa
 3. **CRÍTICA CRUDA Y HONESTIDAD:** Si el usuario te plantea una idea floja, un cálculo dudoso o un procedimiento que va contra la normativa de Irrigación o las buenas prácticas, decíselo de frente. Señalá la debilidad o el error con respeto técnico, sin rodeos ni palabras bonitas, y proponé la alternativa correcta.
 4. **FORMATO FLEXIBLE:** Adaptá el formato de respuesta a lo que pida la situación (pueden ser listas con viñetas, tablas en Markdown para datos numéricos, un resumen de dos oraciones o una explicación técnica detallada). No uses siempre la misma estructura fija.
 
+### PERSONALIZACIÓN (MUY IMPORTANTE):
+1. **Seguí el formato pedido:** Si pide tabla, viñetas, pasos numerados, “breve”, “formal” o “en criollo”, obedecé eso en la respuesta.
+2. **Inferí intención:** Si el pedido es ambiguo pero razonable, elegí la interpretación más útil para la oficina y aclará en una línea qué asumiste.
+3. **Pedí solo lo imprescindible:** Si faltan datos para un cálculo, pedí únicamente esos datos (con unidades), no un cuestionario largo.
+4. **Consistencia en la conversación:** Si el usuario ya eligió un estilo o unidad, mantenelo salvo que diga lo contrario.
+5. **Skills con criterio:** Cuando uses herramientas/skills, pasá bien los números/unidades y respetá cualquier formato de salida que haya pedido (incluido Word con títulos, listas o tablas).
+
 ### LÍMITES, HONESTIDAD Y MANEJO DE INFORMACIÓN:
 1. **Prioridad Contexto Local (RAG):** Evaluá primero la información proveniente de los documentos locales de la base de datos de Irrigación.
 2. **Búsquedas Externas / Internet:** Si no encontrás la respuesta en la base local y tenés que recurrir a búsquedas web o conocimientos generales fuera del contexto local, es OBLIGATORIO que antecedas o cierres tu respuesta aclarando exactamente esto:
@@ -74,11 +83,13 @@ Tu objetivo es ayudar al personal de la oficina a resolver dudas sobre normativa
 SKILL_TOOLING_HINT = (
     "Herramientas: no tenés calculadoras locales bindeadas. Si el usuario pide un "
     "cálculo, conversión de unidades, prorrateo de turno, lámina o tiempo de riego, "
-    "generación de documentos Word, o cualquier automatización que no puedas resolver "
+    "generación de documentos Word (con formato: títulos, viñetas, tablas, negritas), "
+    "o cualquier automatización que no puedas resolver "
     "solo con los documentos, DEBÉS llamar a search_skill_marketplace. No inventes "
-    "resultados numéricos ni archivos: primero buscá la skill. Extraé números y datos "
-    "del mensaje en arguments_json. Si podés responder solo con el contexto RAG, "
-    "respondé en texto sin tools."
+    "resultados numéricos ni archivos: primero buscá la skill. Extraé números, unidades "
+    "y estructura pedida en arguments_json (ej. partes del prorrateo, ha vs m², L/s). "
+    "Si pide un formato de respuesta (tabla, breve, formal), respetalo al narrar. "
+    "Si podés responder solo con el contexto RAG, respondé en texto sin tools."
 )
 
 # Alias retrocompatible: el resto del módulo referenciaba SYSTEM_PROMPT.
@@ -99,7 +110,7 @@ CATALOG_HINT = (
     "Catálogo de skills (buscar con search_skill_marketplace): "
     "Cálculo de caudal (Q = A·v); Conversión de unidades de caudal; "
     "Prorrateo de turno de riego; Lámina de riego; Tiempo de riego; "
-    "Generación de documento Word (.docx)."
+    "Generación de documento Word (.docx) con formato (títulos, listas, tablas)."
 )
 
 
@@ -242,12 +253,25 @@ def _parse_tool_arguments(raw_args: dict[str, Any], user_message: str) -> tuple[
     return task, arguments
 
 
+def _auto_execute_skill_state(skill: dict[str, Any]) -> dict[str, Any]:
+    """Skill en whitelist: ejecutar sin HITL."""
+    return {
+        "pending_skill": skill,
+        "approval_kind": None,
+        "needs_approval": False,
+        "skill_approved": True,
+        "reply": "",
+    }
+
+
 def _resolve_skill_plan(task: str, arguments: dict[str, Any], user_message: str) -> dict[str, Any] | None:
     """Evalúa skills locales; si no hay match y es un pedido de acción, pide descarga."""
     if not (is_action_request(user_message) or should_try_skill_marketplace(user_message)):
         return None
     found = find_local_skill(task, arguments)
     if found.get("found"):
+        if is_whitelisted(str(found.get("id") or ""), str(found.get("code") or "")):
+            return _auto_execute_skill_state(found)
         return {
             "pending_skill": found,
             "approval_kind": APPROVAL_KIND_EXECUTE,
@@ -271,12 +295,17 @@ def _plan_node(state: AgentState) -> dict:
     )
     user_text = fit_user_message(state["user_message"])
     history_msgs = _history_messages(state.get("history") or [])
+    style_hint = fit_system_prompt(
+        "Preferencia de formato para esta respuesta: "
+        + detect_response_style(state["user_message"])
+    )
 
-    system, tooling, rag, user_text = enforce_request_budget(
+    system, tooling, rag, style_hint, user_text = enforce_request_budget(
         [
             ("system", system),
             ("tooling", tooling),
             ("rag", rag),
+            ("style", style_hint),
             ("user", user_text),
         ]
     )
@@ -285,6 +314,7 @@ def _plan_node(state: AgentState) -> dict:
         SystemMessage(content=system),
         SystemMessage(content=tooling),
         SystemMessage(content=rag),
+        SystemMessage(content=style_hint),
         *history_msgs,
         HumanMessage(content=user_text),
     ]
@@ -344,6 +374,8 @@ def _plan_node(state: AgentState) -> dict:
     if should_try_skill_marketplace(state["user_message"], reply):
         fallback = find_local_skill(state["user_message"], {"query": state["user_message"]})
         if fallback.get("found"):
+            if is_whitelisted(str(fallback.get("id") or ""), str(fallback.get("code") or "")):
+                return _auto_execute_skill_state(fallback)
             return {
                 "pending_skill": fallback,
                 "approval_kind": APPROVAL_KIND_EXECUTE,
@@ -369,7 +401,15 @@ def _plan_node(state: AgentState) -> dict:
     }
 
 
-def _route_after_plan(state: AgentState) -> Literal["human_gate_download", "human_gate_execute", "end_ok"]:
+def _route_after_plan(
+    state: AgentState,
+) -> Literal["run_skill", "human_gate_download", "human_gate_execute", "end_ok"]:
+    if (
+        state.get("skill_approved")
+        and state.get("pending_skill")
+        and not state.get("needs_approval")
+    ):
+        return "run_skill"
     kind = state.get("approval_kind")
     if kind == APPROVAL_KIND_DOWNLOAD:
         return "human_gate_download"
@@ -447,6 +487,8 @@ def _fetch_remote_skill_node(state: AgentState) -> dict:
             "needs_approval": False,
             "approval_kind": None,
         }
+    if is_whitelisted(str(skill.get("id") or ""), str(skill.get("code") or "")):
+        return _auto_execute_skill_state(skill)
     return {
         "pending_skill": skill,
         "approval_kind": APPROVAL_KIND_EXECUTE,
@@ -454,7 +496,15 @@ def _fetch_remote_skill_node(state: AgentState) -> dict:
     }
 
 
-def _route_after_fetch(state: AgentState) -> Literal["human_gate_execute", "end_ok"]:
+def _route_after_fetch(
+    state: AgentState,
+) -> Literal["run_skill", "human_gate_execute", "end_ok"]:
+    if (
+        state.get("skill_approved")
+        and state.get("pending_skill")
+        and not state.get("needs_approval")
+    ):
+        return "run_skill"
     if state.get("needs_approval") and state.get("pending_skill"):
         return "human_gate_execute"
     return "end_ok"
@@ -493,11 +543,17 @@ def _run_skill_node(state: AgentState) -> dict:
         }
 
     skill = dict(state.get("pending_skill") or {})
-    skill["arguments"] = enrich_skill_arguments(skill, state["user_message"])
+    skill["arguments"] = prepare_skill_arguments(skill, state["user_message"])
     code = skill.get("code") or ""
     arguments = skill.get("arguments") or {}
     try:
-        result = execute_skill_sync(code, arguments)
+        result = execute_skill_sync(
+            code,
+            arguments,
+            skill_id=str(skill.get("id") or "") or None,
+            skill_name=str(skill.get("name") or "") or None,
+            source=str(skill.get("source") or "local") or None,
+        )
     except Exception as exc:
         logger.exception("Fallo al ejecutar skill")
         name = skill.get("name") or "skill"
@@ -635,15 +691,43 @@ def _compose_skill_reply_node(state: AgentState) -> dict:
     sanitized = sanitize_json_for_llm(raw_payload)
     payload = dumps_capped(sanitized, max_tokens=token_budget()["skill_result_max"])
 
-    # Si ya hay archivo generado, no hace falta mandar el JSON al LLM.
+    # Si ya hay archivo generado, narrar breve respetando el estilo pedido.
+    style = detect_response_style(state["user_message"])
     if attachments:
-        reply = _fallback_skill_reply(
-            name=name,
-            user_message=state["user_message"],
-            skill_data=skill_data,
-            sanitized_payload=sanitized,
-            attachments=attachments,
-        )
+        reply = ""
+        try:
+            llm = _llm(tools=False)
+            response = llm.invoke(
+                [
+                    SystemMessage(
+                        content=(
+                            "Sos el asistente técnico de Irrigación de Malargüe. "
+                            "Confirmá que generaste el archivo y, si aplica, resumí "
+                            "qué contiene (título/secciones) sin inventar. "
+                            f"Estilo: {style}"
+                        )
+                    ),
+                    HumanMessage(
+                        content=(
+                            f"Pedido: {fit_user_message(state['user_message'])}\n"
+                            f"Skill: {name}\n"
+                            f"Archivos: {', '.join(a['filename'] for a in attachments)}\n"
+                            f"Meta: {dumps_capped(sanitize_json_for_llm(skill_data or {}), max_tokens=400)}"
+                        )
+                    ),
+                ]
+            )
+            reply = (getattr(response, "content", None) or "").strip()
+        except Exception:
+            logger.exception("Fallo al narrar archivo de skill; uso fallback")
+        if not reply:
+            reply = _fallback_skill_reply(
+                name=name,
+                user_message=state["user_message"],
+                skill_data=skill_data,
+                sanitized_payload=sanitized,
+                attachments=attachments,
+            )
         return {"reply": reply, "attachments": attachments}
 
     reply = ""
@@ -660,9 +744,10 @@ def _compose_skill_reply_node(state: AgentState) -> dict:
                 SystemMessage(
                     content=(
                         "Sos el asistente técnico de Irrigación de Malargüe. "
-                        "Presentá el resultado de la skill de forma clara y profesional. "
+                        "Presentá el resultado de la skill de forma clara. "
                         "No inventes valores que no estén en el JSON. "
-                        "Sé breve (máximo 12 líneas)."
+                        "Incluí unidades. "
+                        f"Estilo de presentación: {style}"
                     )
                 ),
                 HumanMessage(content=user_prompt),
@@ -756,6 +841,7 @@ def build_agent_graph(db: Session):
         "plan",
         _route_after_plan,
         {
+            "run_skill": "run_skill",
             "human_gate_download": "human_gate_download",
             "human_gate_execute": "human_gate_execute",
             "end_ok": END,
@@ -769,7 +855,11 @@ def build_agent_graph(db: Session):
     graph.add_conditional_edges(
         "fetch_remote_skill",
         _route_after_fetch,
-        {"human_gate_execute": "human_gate_execute", "end_ok": END},
+        {
+            "run_skill": "run_skill",
+            "human_gate_execute": "human_gate_execute",
+            "end_ok": END,
+        },
     )
     graph.add_edge("human_gate_execute", "run_skill")
     graph.add_edge("run_skill", "compose_skill_reply")
