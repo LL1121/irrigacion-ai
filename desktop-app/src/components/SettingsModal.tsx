@@ -3,6 +3,7 @@ import {
   Bell,
   BellOff,
   Clock,
+  Gauge,
   Info,
   Monitor,
   Moon,
@@ -15,6 +16,7 @@ import {
 } from "lucide-react";
 import { getApiBaseUrl, isSameOriginDeployment, LAN_API_BASE, setApiBaseUrl } from "../services/config";
 import { healthCheck } from "../services/api";
+import type { SpeedMode } from "../services/api";
 import { useTheme } from "../theme";
 import { isTauriRuntime } from "../native";
 
@@ -32,7 +34,15 @@ type SettingsModalProps = {
   onFontScaleChange: (scale: number) => void;
   showTimestamps: boolean;
   onShowTimestampsChange: (enabled: boolean) => void;
+  speedMode: SpeedMode;
+  onSpeedModeChange: (mode: SpeedMode) => void;
 };
+
+const SPEED_MODES: { id: SpeedMode; label: string; desc: string }[] = [
+  { id: "fast", label: "Rápido", desc: "Menos contexto, respuesta más ágil" },
+  { id: "balanced", label: "Equilibrado", desc: "Balance entre velocidad y profundidad" },
+  { id: "deep", label: "Profundo", desc: "Máximo contexto del archivo técnico" },
+];
 
 const THEMES = [
   { id: "light" as const, icon: Sun, label: "Día" },
@@ -129,6 +139,8 @@ export function SettingsModal({
   onFontScaleChange,
   showTimestamps,
   onShowTimestampsChange,
+  speedMode,
+  onSpeedModeChange,
 }: SettingsModalProps) {
   const { theme, setTheme } = useTheme();
   const [url, setUrl] = useState(getApiBaseUrl);
@@ -274,6 +286,26 @@ export function SettingsModal({
             </Section>
 
             <Section title="Chat">
+              <SettingRow
+                icon={Gauge}
+                label="Profundidad de búsqueda"
+                desc="Cuánto contexto del archivo técnico usa el agente"
+              >
+                <select
+                  value={speedMode}
+                  onChange={(e) => onSpeedModeChange(e.target.value as SpeedMode)}
+                  className="rounded-lg border border-border bg-input-background px-2 py-1 text-xs text-foreground outline-none focus:border-primary/50"
+                >
+                  {SPEED_MODES.map(({ id, label }) => (
+                    <option key={id} value={id}>
+                      {label}
+                    </option>
+                  ))}
+                </select>
+              </SettingRow>
+              <p className="px-1 text-[11px] leading-relaxed text-muted-foreground">
+                {SPEED_MODES.find((m) => m.id === speedMode)?.desc}
+              </p>
               <SettingRow icon={Clock} label="Mostrar hora" desc="Hora de envío en cada mensaje">
                 <Switch checked={showTimestamps} onCheckedChange={onShowTimestampsChange} />
               </SettingRow>

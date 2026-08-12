@@ -143,6 +143,43 @@ def run(input_data):
     }
 '''
 
+_SKILL_DOCX = '''
+def run(input_data):
+    """Genera un archivo Word (.docx) con título y contenido en texto plano."""
+    import base64
+    from io import BytesIO
+    from docx import Document
+
+    title = str(input_data.get("titulo") or input_data.get("title") or "Documento Irrigación")
+    content = str(
+        input_data.get("contenido")
+        or input_data.get("content")
+        or input_data.get("texto")
+        or input_data.get("body")
+        or ""
+    )
+    filename = str(input_data.get("filename") or input_data.get("nombre") or f"{title}.docx")
+    if not filename.lower().endswith(".docx"):
+        filename = f"{filename}.docx"
+
+    doc = Document()
+    doc.add_heading(title, level=0)
+    for block in content.replace("\\r\\n", "\\n").split("\\n"):
+        line = block.strip()
+        if line:
+            doc.add_paragraph(line)
+
+    buf = BytesIO()
+    doc.save(buf)
+    raw = buf.getvalue()
+    return {
+        "filename": filename,
+        "content_base64": base64.b64encode(raw).decode("ascii"),
+        "size_bytes": len(raw),
+        "mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    }
+'''
+
 CATALOG: list[SkillRecord] = [
     {
         "id": "caudal_canal",
@@ -191,27 +228,294 @@ CATALOG: list[SkillRecord] = [
         "tags": ["tiempo", "duracion", "riego", "horas", "caudal", "volumen"],
         "code": _SKILL_TIEMPO.strip(),
     },
+    {
+        "id": "generar_documento_word",
+        "name": "Generación de documento Word (.docx)",
+        "description": (
+            "Redacta y exporta un informe o documento institucional en formato Word (.docx) "
+            "a partir de un título y el contenido en texto."
+        ),
+        "tags": [
+            "word",
+            "docx",
+            "documento",
+            "informe",
+            "redactar",
+            "exportar",
+            "escribir",
+            "archivo",
+        ],
+        "code": _SKILL_DOCX.strip(),
+    },
 ]
 
 
-def looks_like_skill_intent(text: str) -> bool:
-    """Heurística para cálculos/automatizaciones que requieren una skill."""
-    lowered = (text or "").lower()
-    has_number = bool(re.search(r"\d", lowered))
-    verbs = (
-        "calcul",
+APPROVAL_KIND_EXECUTE = "execute_local"
+APPROVAL_KIND_DOWNLOAD = "download_remote"
+
+_SKILL_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "caudal_canal": (
+        "caudal",
+        "q=",
+        "q =",
+        "area",
+        "área",
+        "velocidad",
+        "seccion",
+        "sección",
+        "canal",
+        "toma",
+    ),
+    "conversion_unidades": (
         "convert",
-        "prorrate",
+        "conversion",
+        "conversión",
         "equival",
-        "repart",
-        "cuánto da",
-        "cuanto da",
+        "l/s",
+        "m3/s",
+        "m³/s",
+        "m3/h",
+        "m3/d",
         "pasame a",
         "pasá a",
-        "pasa a l",
-        "pasa a m",
+        "pasa a",
+        "unidades",
+    ),
+    "prorrateo_turno": (
+        "prorrate",
+        "repart",
+        "reparto",
+        "turno",
+        "derechos",
+        "acciones",
+        "hectarea",
+        "hectárea",
+    ),
+    "lamina_riego": ("lamina", "lámina", "milimetros", "milímetros", "mm de riego"),
+    "tiempo_riego": (
+        "tiempo de riego",
+        "cuanto regar",
+        "cuánto regar",
+        "duracion",
+        "duración",
+        "horas de riego",
+    ),
+    "generar_documento_word": (
+        "word",
+        "docx",
+        "documento",
+        "informe",
+        "redact",
+        "exportar",
+        "generar archivo",
+        "armame",
+        "armá",
+        "escribime",
+        "escribí",
+    ),
+}
+
+_CALC_VERBS = (
+    "calcul",
+    "convert",
+    "prorrate",
+    "equival",
+    "repart",
+    "cuánto da",
+    "cuanto da",
+    "pasame a",
+    "pasá a",
+    "pasa a",
+    "cuanto es",
+    "cuánto es",
+    "dame el",
+    "decime cu",
+)
+
+_UNCERTAINTY_MARKERS = (
+    "no puedo calcular",
+    "no tengo una herramienta",
+    "no dispongo de",
+    "no puedo hacer ese cálculo",
+    "necesitaría datos numéricos",
+    "faltan datos",
+    "no encontré una skill",
+    "reformulá con números",
+)
+
+
+def should_try_skill_marketplace(text: str, assistant_reply: str | None = None) -> bool:
+    """Determina si conviene buscar en el marketplace antes de responder."""
+    lowered = (text or "").lower()
+    if not lowered.strip():
+        return False
+
+    if any(kw in lowered for keywords in _SKILL_KEYWORDS.values() for kw in keywords):
+        return True
+    if any(verb in lowered for verb in _CALC_VERBS):
+        return True
+    if re.search(r"\d", lowered) and any(
+        term in lowered
+        for term in ("caudal", "riego", "convert", "prorrate", "lamina", "lámina", "m3", "l/s")
+    ):
+        return True
+
+    if assistant_reply:
+        reply_lower = assistant_reply.lower()
+        if any(marker in reply_lower for marker in _UNCERTAINTY_MARKERS):
+            return True
+    return False
+
+
+_ACTION_REQUEST_PATTERNS = (
+    r"\bpod[eé]s\b",
+    r"\bpodes\b",
+    r"\bpuede[s]?\s+hacer",
+    r"\bsabr[eé]s\b",
+    r"\bsabes\b",
+    r"\bhac[eé]\lo\b",
+    r"\bhac[eé]\s",
+    r"\bhace\s",
+    r"\bquiero que\b",
+    r"\bnecesito que\b",
+    r"\bme pod[eé]s\b",
+    r"\bme podes\b",
+    r"\btien[eé]s\s+(?:alguna|una)\s+(?:skill|habilidad|herramienta)",
+    r"\bpod[eé]s\s+(?:calcular|convertir|generar|exportar|redactar|armar)",
+)
+
+
+def is_action_request(text: str) -> bool:
+    """Detecta pedidos del tipo 'hacé esto' o '¿podés hacer esto?'."""
+    lowered = (text or "").lower().strip()
+    if not lowered:
+        return False
+    if should_try_skill_marketplace(text):
+        return True
+    return any(re.search(pattern, lowered) for pattern in _ACTION_REQUEST_PATTERNS)
+
+
+def looks_like_skill_intent(text: str) -> bool:
+    """Heurística amplia: cálculos, conversiones, automatizaciones y documentos."""
+    return is_action_request(text)
+
+
+def match_catalog_by_keywords(text: str) -> dict[str, Any] | None:
+    """Coincidencia directa de palabras clave del usuario contra skills locales."""
+    lowered = (text or "").lower()
+    best: SkillRecord | None = None
+    best_score = 0
+    for skill in CATALOG:
+        score = 0
+        for keyword in _SKILL_KEYWORDS.get(skill["id"], ()):
+            if keyword in lowered:
+                score += 2
+        for tag in skill["tags"]:
+            if len(tag) >= 3 and tag in lowered:
+                score += 1
+        if score > best_score:
+            best_score = score
+            best = skill
+    if best is None or best_score < 2:
+        return None
+    return search_catalog(best["name"], infer_arguments(best["id"], text))
+
+
+def find_local_skill(task: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Busca una skill instalada que pueda resolver la tarea."""
+    keyword_hit = match_catalog_by_keywords(task)
+    if keyword_hit and keyword_hit.get("found"):
+        return keyword_hit
+    result = search_catalog(task, arguments or {"query": task})
+    if result.get("found"):
+        score = int(result.get("score") or 0)
+        if score >= 2 or is_action_request(task):
+            return result
+    return {**result, "found": False}
+
+
+def download_remote_prompt() -> str:
+    return (
+        "No puedo hacer eso que me pediste. "
+        "¿Querés que descargue la habilidad desde internet?"
     )
-    return has_number and any(verb in lowered for verb in verbs)
+
+
+def _extract_numbers(text: str) -> list[float]:
+    raw = re.findall(r"(\d+(?:[.,]\d+)?)", text or "")
+    out: list[float] = []
+    for item in raw:
+        try:
+            out.append(float(item.replace(",", ".")))
+        except ValueError:
+            continue
+    return out
+
+
+def infer_arguments(skill_id: str, user_message: str) -> dict[str, Any]:
+    """Inferencia heurística de argumentos cuando el LLM no los extrajo."""
+    text = user_message or ""
+    lowered = text.lower()
+    numbers = _extract_numbers(text)
+    args: dict[str, Any] = {"query": text}
+
+    if skill_id == "caudal_canal":
+        if len(numbers) >= 2:
+            args["area_m2"] = numbers[0]
+            args["velocidad_ms"] = numbers[1]
+        elif len(numbers) == 1:
+            if any(k in lowered for k in ("area", "área", "m2", "m²", "seccion", "sección")):
+                args["area_m2"] = numbers[0]
+            else:
+                args["velocidad_ms"] = numbers[0]
+    elif skill_id == "conversion_unidades":
+        if numbers:
+            args["valor"] = numbers[0]
+        for unit in ("l/s", "l/s", "m3/s", "m³/s", "m3/h", "m3/d", "m3/dia", "m3/día"):
+            if unit.replace("³", "3") in lowered.replace("³", "3"):
+                args["unidad"] = unit
+                break
+    elif skill_id == "prorrateo_turno":
+        if numbers:
+            args["total"] = numbers[0]
+        pesos = re.findall(r"(\d+(?:[.,]\d+)?)\s*(?:ha|acciones?|derechos?)", lowered)
+        if pesos:
+            args["partes"] = [{"nombre": f"parte_{i+1}", "peso": float(p.replace(",", "."))} for i, p in enumerate(pesos)]
+    elif skill_id == "lamina_riego":
+        if numbers:
+            args["volumen_m3"] = numbers[0]
+            if len(numbers) > 1:
+                if "ha" in lowered:
+                    args["superficie_ha"] = numbers[1]
+                else:
+                    args["superficie_m2"] = numbers[1]
+    elif skill_id == "tiempo_riego":
+        if numbers:
+            args["volumen_m3"] = numbers[0]
+            if len(numbers) > 1:
+                if "l/s" in lowered or "l/s" in lowered:
+                    args["caudal_ls"] = numbers[1]
+                else:
+                    args["caudal_m3s"] = numbers[1]
+    elif skill_id == "generar_documento_word":
+        title_match = re.search(r"(?:titulo|título|informe|documento)\s*[:\-]?\s*(.+)", text, re.I)
+        args["titulo"] = (title_match.group(1).strip()[:120] if title_match else "Documento Irrigación")
+        args["contenido"] = text
+    return args
+
+
+def enrich_skill_arguments(skill: dict[str, Any], user_message: str) -> dict[str, Any]:
+    """Completa argumentos faltantes antes de ejecutar la skill."""
+    skill_id = str(skill.get("id") or "")
+    current = dict(skill.get("arguments") or {})
+    inferred = infer_arguments(skill_id, user_message)
+    merged = {**inferred, **{k: v for k, v in current.items() if v not in (None, "", {})}}
+    if skill_id == "generar_documento_word":
+        if not merged.get("contenido") and not merged.get("content"):
+            merged["contenido"] = user_message
+        if not merged.get("titulo") and not merged.get("title"):
+            merged["titulo"] = "Documento Irrigación"
+    return merged
 
 
 def _tokenize(text: str) -> set[str]:
@@ -221,6 +525,7 @@ def _tokenize(text: str) -> set[str]:
 def search_catalog(task: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     """Busca la skill más pertinente en el catálogo institucional."""
     tokens = _tokenize(task)
+    lowered_task = (task or "").lower()
     best: SkillRecord | None = None
     best_score = 0
     for skill in CATALOG:
@@ -228,8 +533,11 @@ def search_catalog(task: str, arguments: dict[str, Any] | None = None) -> dict[s
             [skill["id"], skill["name"], skill["description"], " ".join(skill["tags"])]
         ).lower()
         score = sum(1 for token in tokens if token in haystack)
-        if skill["id"] in (task or "").lower() or skill["name"].lower() in (task or "").lower():
+        if skill["id"] in lowered_task or skill["name"].lower() in lowered_task:
             score += 4
+        for keyword in _SKILL_KEYWORDS.get(skill["id"], ()):
+            if keyword in lowered_task:
+                score += 2
         if score > best_score:
             best_score = score
             best = skill
@@ -242,13 +550,18 @@ def search_catalog(task: str, arguments: dict[str, Any] | None = None) -> dict[s
                 for s in CATALOG
             ],
         }
+    resolved_args = arguments or {}
+    if best["id"] == "generar_documento_word" or not any(
+        k not in {"query", "raw", "valor"} for k in resolved_args
+    ):
+        resolved_args = {**infer_arguments(best["id"], task), **resolved_args}
     return {
         "found": True,
         "id": best["id"],
         "name": best["name"],
         "description": best["description"],
         "code": best["code"],
-        "arguments": arguments or {},
+        "arguments": resolved_args,
         "score": best_score,
     }
 
@@ -271,9 +584,9 @@ def _parse_arguments(raw: Any) -> dict[str, Any]:
 def search_skill_marketplace(task: str, arguments_json: str = "{}") -> str:
     """Busca en el catálogo institucional una skill (herramienta Python) para la tarea.
 
-    Usala cuando el usuario pide un cálculo, conversión o automatización y no hay
-    una herramienta local bindeada para resolverlo. No inventes números: primero
-    buscá la skill.
+    Usala cuando el usuario pide un cálculo, conversión, prorrateo, lámina o tiempo de riego,
+    generación de documentos Word, o cualquier automatización que no puedas resolver solo
+    con el contexto RAG. No inventes números: primero buscá la skill.
 
     Args:
         task: descripción breve de la tarea (ej. 'calcular caudal con área y velocidad').

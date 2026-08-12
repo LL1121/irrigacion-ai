@@ -55,6 +55,36 @@ app.include_router(chat.router)
 app.include_router(skills.router)
 
 
+def _resolve_updates_dir() -> Path | None:
+    """Directorio con latest.json y paquetes firmados para el auto-updater Tauri."""
+    candidates: list[Path] = []
+    override = _settings.updates_dir.strip()
+    if override:
+        candidates.append(Path(override))
+
+    backend_dir = Path(__file__).resolve().parent
+    candidates.append(backend_dir.parent / "updates")
+    candidates.append(Path("/app/static/updates"))
+    candidates.append(Path("/var/lib/irrigacion/updates"))
+
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if (resolved / "latest.json").is_file():
+            return resolved
+    return None
+
+
+_updates_dir = _resolve_updates_dir()
+if _updates_dir is not None:
+    logger.info("Sirviendo actualizaciones Tauri desde %s", _updates_dir)
+    app.mount("/updates", StaticFiles(directory=str(_updates_dir)), name="updates")
+else:
+    logger.warning(
+        "No se encontró updates/latest.json; el auto-updater de Tauri no tendrá "
+        "archivos en /updates. Creá la carpeta updates/ en la raíz del repo."
+    )
+
+
 @app.get("/health")
 def health() -> dict:
     settings = get_settings()

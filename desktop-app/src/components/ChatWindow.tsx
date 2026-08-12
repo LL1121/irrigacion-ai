@@ -1,24 +1,30 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
   ClipboardList,
   Download,
   Droplets,
   FileSearch,
   Gavel,
+  Globe,
   LoaderCircle,
   MapPin,
   Menu,
   Moon,
   Paperclip,
+  Pencil,
   Send,
   Settings,
   ShieldCheck,
   Sparkles,
+  Square,
   Sun,
   X,
 } from "lucide-react";
-import type { ChatMessage, SpeedMode } from "../services/api";
+import type { ChatAttachment, ChatMessage } from "../services/api";
+import { useTypewriter } from "../hooks/useTypewriter";
 import { useTheme } from "../theme";
+import { AttachmentCard, FileViewerModal } from "./FileViewerModal";
+import { cleanMessageText, resolveMessageAttachments } from "../utils/messageAttachments";
 
 type ChatWindowProps = {
   messages: ChatMessage[];
@@ -26,35 +32,14 @@ type ChatWindowProps = {
   approving?: boolean;
   apiOnline: boolean;
   showTimestamps: boolean;
-  speedMode: SpeedMode;
-  onSpeedModeChange: (mode: SpeedMode) => void;
   onSend: (message: string) => Promise<void> | void;
+  onStop?: () => void;
+  onEditMessage?: (index: number, newText: string) => Promise<void> | void;
   onApproveSkill?: (approved: boolean) => Promise<void> | void;
   onOpenSettings: () => void;
   onOpenUpload: () => void;
   onOpenSidebar: () => void;
 };
-
-const SPEED_MODES: { value: SpeedMode; emoji: string; label: string; title: string }[] = [
-  {
-    value: "fast",
-    emoji: "⚡",
-    label: "Rápido",
-    title: "Rápido: 2 fragmentos de contexto — respuesta más veloz",
-  },
-  {
-    value: "balanced",
-    emoji: "⚖️",
-    label: "Equilibrado",
-    title: "Equilibrado: 5 fragmentos de contexto — velocidad y profundidad medias",
-  },
-  {
-    value: "deep",
-    emoji: "🎯",
-    label: "Profundo",
-    title: "Profundo (predeterminado): 10 fragmentos de contexto — máxima precisión",
-  },
-];
 
 const SUGGESTED_PROMPTS = [
   {
@@ -119,17 +104,31 @@ function exportConversation(messages: ChatMessage[]) {
   URL.revokeObjectURL(url);
 }
 
-function TypingIndicator({ label }: { label: string }) {
+function LoadingBubble() {
   return (
     <div className="mb-4 flex items-start gap-3">
       <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-2xl bg-primary/15">
         <Sparkles size={14} className="text-primary" />
       </div>
-      <div className="flex items-center gap-2 rounded-3xl rounded-tl-sm border border-border bg-card px-4 py-3 text-sm text-muted-foreground shadow-sm">
-        <LoaderCircle className="animate-spin" size={14} />
-        {label}
+      <div className="flex min-h-[44px] min-w-[56px] items-center justify-center rounded-3xl rounded-tl-sm border border-border bg-card px-5 py-3 shadow-sm">
+        <LoaderCircle className="animate-spin text-primary" size={20} />
       </div>
     </div>
+  );
+}
+
+function AssistantText({
+  text,
+  animate,
+}: {
+  text: string;
+  animate: boolean;
+}) {
+  const visible = useTypewriter(text, animate);
+  return (
+    <p className="whitespace-pre-wrap text-sm leading-relaxed text-foreground">
+      {visible}
+    </p>
   );
 }
 
@@ -139,9 +138,9 @@ export function ChatWindow({
   approving = false,
   apiOnline,
   showTimestamps,
-  speedMode,
-  onSpeedModeChange,
   onSend,
+  onStop,
+  onEditMessage,
   onApproveSkill,
   onOpenSettings,
   onOpenUpload,
@@ -150,23 +149,78 @@ export function ChatWindow({
   const { resolvedTheme, setTheme } = useTheme();
   const isDark = resolvedTheme === "dark";
   const [draft, setDraft] = useState("");
+  const [historyPos, setHistoryPos] = useState<number | null>(null);
+  const [editingIndex, setEditingIndex] = useState<number | null>(null);
+  const [editingText, setEditingText] = useState("");
+  const [viewerAttachment, setViewerAttachment] = useState<ChatAttachment | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
   const last = messages[messages.length - 1];
   const waitingApproval = Boolean(
     last && last.status === "REQUIRES_APPROVAL" && last.role !== "user",
   );
   const inputLocked = loading || approving || waitingApproval;
+  const showStop = loading && !approving;
+
+  const userHistory = useMemo(
+    () => messages.filter((m) => m.role === "user").map((m) => m.message),
+    [messages],
+  );
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, loading, approving]);
+  }, [messages, loading, approving, editingIndex]);
 
   async function handleSubmit(event: FormEvent) {
     event.preventDefault();
+    if (editingIndex !== null && onEditMessage) {
+      const text = editingText.trim();
+      if (!text || inputLocked) return;
+      const idx = editingIndex;
+      setEditingIndex(null);
+      setEditingText("");
+      setHistoryPos(null);
+      await onEditMessage(idx, text);
+      return;
+    }
     const text = draft.trim();
     if (!text || inputLocked) return;
     setDraft("");
+    setHistoryPos(null);
     await onSend(text);
+  }
+
+  function handleDraftKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key === "ArrowUp" && !e.shiftKey && editingIndex === null) {
+      const ta = e.currentTarget;
+      if (ta.selectionStart === 0 && ta.selectionEnd === 0 && userHistory.length > 0) {
+        e.preventDefault();
+        const next =
+          historyPos === null
+            ? userHistory.length - 1
+            : Math.max(0, historyPos - 1);
+        setHistoryPos(next);
+        setDraft(userHistory[next] ?? "");
+      }
+      return;
+    }
+    if (e.key === "ArrowDown" && !e.shiftKey && editingIndex === null && historyPos !== null) {
+      e.preventDefault();
+      if (historyPos >= userHistory.length - 1) {
+        setHistoryPos(null);
+        setDraft("");
+      } else {
+        const next = historyPos + 1;
+        setHistoryPos(next);
+        setDraft(userHistory[next] ?? "");
+      }
+      return;
+    }
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      void handleSubmit(e);
+    }
   }
 
   return (
@@ -185,7 +239,10 @@ export function ChatWindow({
             <Sparkles size={15} className="text-primary" />
           </div>
           <div className="hidden min-w-0 sm:block">
-            <p className="truncate text-sm text-foreground" style={{ fontWeight: 600, lineHeight: 1.2 }}>
+            <p
+              className="truncate text-sm text-foreground"
+              style={{ fontWeight: 600, lineHeight: 1.2 }}
+            >
               Consulta técnica
             </p>
             <p className="text-[11px] text-muted-foreground">
@@ -196,25 +253,6 @@ export function ChatWindow({
                   : "Fuera de línea"}
             </p>
           </div>
-        </div>
-
-        <div className="flex shrink-0 items-center gap-0.5 rounded-xl border border-border bg-muted/40 p-0.5 sm:gap-1.5">
-          {SPEED_MODES.map((mode) => (
-            <button
-              key={mode.value}
-              type="button"
-              title={mode.title}
-              onClick={() => onSpeedModeChange(mode.value)}
-              className={`rounded-lg px-2 py-1.5 text-[11px] font-medium transition-all sm:px-2.5 sm:py-1 ${
-                speedMode === mode.value
-                  ? "bg-primary text-primary-foreground shadow-sm"
-                  : "text-muted-foreground hover:bg-background hover:text-foreground"
-              }`}
-            >
-              <span aria-hidden="true">{mode.emoji}</span>
-              <span className="hidden sm:inline"> {mode.label}</span>
-            </button>
-          ))}
         </div>
 
         <div className="flex shrink-0 items-center gap-0.5 sm:gap-1.5">
@@ -251,15 +289,17 @@ export function ChatWindow({
           <div className="mb-5 flex h-14 w-14 items-center justify-center rounded-3xl bg-primary/15 shadow-sm sm:h-16 sm:w-16">
             <Sparkles size={26} className="text-primary" />
           </div>
-          <h2 className="mb-1.5 text-center text-foreground" style={{ fontWeight: 600, fontSize: "1.15rem" }}>
+          <h2
+            className="mb-1.5 text-center text-foreground"
+            style={{ fontWeight: 600, fontSize: "1.15rem" }}
+          >
             ¿En qué te puedo ayudar?
           </h2>
           <p className="mb-8 max-w-sm text-center text-sm text-muted-foreground">
-            Subí actas, resoluciones o planos, y preguntá por caudales, tomas o
-            resoluciones específicas.
+            Subí actas, resoluciones o planos, y preguntá por caudales, tomas o resoluciones
+            específicas.
           </p>
-
-          <div className="grid w-full max-w-2xl grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          <div className="grid w-full max-w-4xl grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
             {SUGGESTED_PROMPTS.map(({ icon: Icon, label, prompt }) => (
               <button
                 key={label}
@@ -284,30 +324,38 @@ export function ChatWindow({
         </div>
       ) : (
         <div className="min-h-0 flex-1 overflow-y-auto">
-          <div className="mx-auto max-w-3xl px-3 py-4 sm:px-4 sm:py-6">
+          <div className="mx-auto w-full px-3 py-4 sm:px-6 sm:py-6 lg:px-10 xl:px-16">
             {messages.map((msg, index) => {
               const isUser = msg.role === "user";
               const isLast = index === messages.length - 1;
               const showCard = msg.status === "REQUIRES_APPROVAL" && !isUser;
+              const msgKey = msg.id ?? `${msg.role}-${index}-${msg.created_at ?? index}`;
 
               if (showCard) {
+                const isDownloadApproval = msg.approval_kind === "download_remote";
                 return (
-                  <div key={`${msg.role}-${index}-${msg.created_at ?? index}`} className="mb-4 flex items-start gap-3">
+                  <div key={msgKey} className="mb-4 flex items-start gap-3">
                     <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-2xl bg-primary/15">
                       <Sparkles size={14} className="text-primary" />
                     </div>
-                    <div className="max-w-[88%] rounded-3xl rounded-tl-sm border border-primary/30 bg-card px-4 py-3 shadow-sm sm:max-w-[78%]">
+                    <div className="max-w-[min(92%,56rem)] lg:max-w-[min(88%,72rem)] xl:max-w-[min(85%,80rem)] rounded-3xl rounded-tl-sm border border-primary/30 bg-card px-4 py-3 shadow-sm">
                       <div className="mb-2 inline-flex items-center gap-1 rounded-md bg-primary/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider text-primary">
-                        Autorización de skill
+                        {isDownloadApproval ? "Habilidad no disponible" : "Autorización de skill"}
                       </div>
                       <p className="text-sm leading-relaxed text-foreground">
-                        No tengo esta habilidad. Se encontró la skill{" "}
-                        <span className="font-semibold text-primary">
-                          '{msg.skill_name || "desconocida"}'
-                        </span>
-                        . ¿Autorizás a Gemini a auditarla y ejecutarla en el sandbox?
+                        {isDownloadApproval ? (
+                          msg.message
+                        ) : (
+                          <>
+                            No tengo esta habilidad instalada. Se encontró la skill{" "}
+                            <span className="font-semibold text-primary">
+                              '{msg.skill_name || "desconocida"}'
+                            </span>
+                            . ¿Autorizás a Gemini a auditarla y ejecutarla en el sandbox?
+                          </>
+                        )}
                       </p>
-                      {msg.skill_description && (
+                      {!isDownloadApproval && msg.skill_description && (
                         <p className="mt-2 text-xs text-muted-foreground">{msg.skill_description}</p>
                       )}
                       {isPendingApproval(msg, isLast) && onApproveSkill && (
@@ -318,8 +366,17 @@ export function ChatWindow({
                             onClick={() => void onApproveSkill(true)}
                             className="inline-flex items-center gap-1.5 rounded-xl bg-primary px-3 py-1.5 text-xs font-semibold text-primary-foreground transition hover:opacity-90 disabled:opacity-40"
                           >
-                            <ShieldCheck size={14} />
-                            Autorizar
+                            {isDownloadApproval ? (
+                              <>
+                                <Globe size={14} />
+                                Sí, descargar
+                              </>
+                            ) : (
+                              <>
+                                <ShieldCheck size={14} />
+                                Autorizar
+                              </>
+                            )}
                           </button>
                           <button
                             type="button"
@@ -328,7 +385,7 @@ export function ChatWindow({
                             className="inline-flex items-center gap-1.5 rounded-xl border border-border px-3 py-1.5 text-xs font-semibold text-muted-foreground transition hover:border-destructive/40 hover:text-destructive disabled:opacity-40"
                           >
                             <X size={14} />
-                            Cancelar
+                            {isDownloadApproval ? "No, gracias" : "Cancelar"}
                           </button>
                         </div>
                       )}
@@ -338,16 +395,82 @@ export function ChatWindow({
               }
 
               const time = showTimestamps ? formatTime(msg.created_at) : null;
+              const attachments = !isUser ? resolveMessageAttachments(msg) : [];
+              const displayText = !isUser ? cleanMessageText(msg.message) : msg.message;
 
               if (isUser) {
+                const isEditing = editingIndex === index;
                 return (
-                  <div key={`${msg.role}-${index}-${msg.created_at ?? index}`} className="mb-4 flex justify-end">
-                    <div className="max-w-[85%] sm:max-w-[75%]">
-                      <div className="rounded-3xl rounded-tr-sm bg-primary px-4 py-3 text-primary-foreground shadow-sm">
-                        <p className="whitespace-pre-wrap text-sm leading-relaxed">{msg.message}</p>
-                      </div>
-                      {time && (
-                        <p className="mt-1 pr-1 text-right text-[10px] text-muted-foreground">{time}</p>
+                  <div key={msgKey} className="group mb-4 flex justify-end">
+                    <div className="relative max-w-[min(92%,56rem)] lg:max-w-[min(88%,72rem)] xl:max-w-[min(85%,80rem)]">
+                      {isEditing ? (
+                        <div className="rounded-3xl rounded-tr-sm border border-primary/40 bg-primary/10 px-3 py-2">
+                          <textarea
+                            value={editingText}
+                            onChange={(e) => setEditingText(e.target.value)}
+                            rows={3}
+                            className="w-full resize-none bg-transparent text-sm text-foreground outline-none"
+                            autoFocus
+                            onKeyDown={(e) => {
+                              if (e.key === "Escape") {
+                                setEditingIndex(null);
+                                setEditingText("");
+                              }
+                            }}
+                          />
+                          <div className="mt-2 flex justify-end gap-2">
+                            <button
+                              type="button"
+                              className="text-xs text-muted-foreground"
+                              onClick={() => {
+                                setEditingIndex(null);
+                                setEditingText("");
+                              }}
+                            >
+                              Cancelar
+                            </button>
+                            <button
+                              type="button"
+                              className="rounded-lg bg-primary px-2.5 py-1 text-xs font-medium text-primary-foreground"
+                              disabled={!editingText.trim() || inputLocked}
+                              onClick={() => {
+                                const text = editingText.trim();
+                                if (!text || inputLocked) return;
+                                setEditingIndex(null);
+                                setEditingText("");
+                                void onEditMessage?.(index, text);
+                              }}
+                            >
+                              Reenviar
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <>
+                          <div className="rounded-3xl rounded-tr-sm bg-primary px-4 py-3 text-primary-foreground shadow-sm">
+                            <p className="whitespace-pre-wrap text-sm leading-relaxed">
+                              {msg.message}
+                            </p>
+                          </div>
+                          {onEditMessage && !inputLocked && (
+                            <button
+                              type="button"
+                              title="Editar y reenviar"
+                              onClick={() => {
+                                setEditingIndex(index);
+                                setEditingText(msg.message);
+                              }}
+                              className="absolute -left-9 top-2 flex h-7 w-7 items-center justify-center rounded-lg text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 hover:bg-muted hover:text-foreground"
+                            >
+                              <Pencil size={14} />
+                            </button>
+                          )}
+                        </>
+                      )}
+                      {time && !isEditing && (
+                        <p className="mt-1 pr-1 text-right text-[10px] text-muted-foreground">
+                          {time}
+                        </p>
                       )}
                     </div>
                   </div>
@@ -355,31 +478,45 @@ export function ChatWindow({
               }
 
               return (
-                <div key={`${msg.role}-${index}-${msg.created_at ?? index}`} className="mb-4 flex items-start gap-3">
+                <div key={msgKey} className="mb-4 flex items-start gap-3">
                   <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-2xl bg-primary/15">
                     <Sparkles size={14} className="text-primary" />
                   </div>
-                  <div className="max-w-[88%] sm:max-w-[78%]">
+                  <div className="max-w-[min(92%,56rem)] lg:max-w-[min(88%,72rem)] xl:max-w-[min(85%,80rem)]">
                     <div className="rounded-3xl rounded-tl-sm border border-border bg-card px-4 py-3 shadow-sm">
                       {msg.from_cache && (
                         <div className="mb-2 inline-flex items-center gap-1 rounded-md bg-primary/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider text-primary">
                           Caché semántico
                         </div>
                       )}
-                      <p className="whitespace-pre-wrap text-sm leading-relaxed text-foreground">
-                        {msg.message}
-                      </p>
+                      <AssistantText text={displayText} animate={Boolean(msg.animate)} />
+                      {attachments.map((attachment) => (
+                        <AttachmentCard
+                          key={attachment.file_id}
+                          attachment={attachment}
+                          onOpen={setViewerAttachment}
+                        />
+                      ))}
                     </div>
-                    {time && <p className="mt-1 pl-1 text-[10px] text-muted-foreground">{time}</p>}
+                    {time && (
+                      <p className="mt-1 pl-1 text-[10px] text-muted-foreground">{time}</p>
+                    )}
                   </div>
                 </div>
               );
             })}
 
-            {(loading || approving) && (
-              <TypingIndicator
-                label={approving ? "Gemini audita y el sandbox ejecuta la skill…" : "Analizando contexto…"}
-              />
+            {loading && !approving && <LoadingBubble />}
+            {approving && (
+              <div className="mb-4 flex items-start gap-3">
+                <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-2xl bg-primary/15">
+                  <Sparkles size={14} className="text-primary" />
+                </div>
+                <div className="flex min-h-[44px] items-center gap-2 rounded-3xl rounded-tl-sm border border-border bg-card px-4 py-3 text-sm text-muted-foreground shadow-sm">
+                  <LoaderCircle className="animate-spin" size={16} />
+                  Gemini audita la skill…
+                </div>
+              </div>
             )}
             <div ref={bottomRef} />
           </div>
@@ -388,14 +525,14 @@ export function ChatWindow({
 
       <form
         onSubmit={handleSubmit}
-        className="shrink-0 px-3 pt-2 pb-[max(1rem,env(safe-area-inset-bottom))] sm:px-4 sm:pb-4"
+        className="shrink-0 px-3 pt-2 pb-[max(1rem,env(safe-area-inset-bottom))] sm:px-6 lg:px-10 xl:px-16 sm:pb-4"
       >
         {waitingApproval && (
-          <p className="mb-2 px-1 text-xs text-muted-foreground">
+          <p className="mx-auto mb-2 max-w-6xl px-1 text-xs text-muted-foreground">
             Autorizá o cancelá la skill pendiente para continuar el chat.
           </p>
         )}
-        <div className="mx-auto flex max-w-3xl items-end gap-1.5 rounded-3xl border border-border bg-card px-2.5 py-2 shadow-sm transition-all duration-200 focus-within:border-primary/40 focus-within:shadow-md sm:gap-2 sm:px-3 sm:py-2.5">
+        <div className="mx-auto flex w-full items-end gap-1.5 rounded-3xl border border-border bg-card px-2.5 py-2 shadow-sm transition-all duration-200 focus-within:border-primary/40 focus-within:shadow-md sm:gap-2 sm:px-3 sm:py-2.5">
           <button
             type="button"
             onClick={onOpenUpload}
@@ -406,40 +543,67 @@ export function ChatWindow({
           </button>
 
           <textarea
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
+            ref={textareaRef}
+            value={editingIndex !== null ? editingText : draft}
+            onChange={(e) =>
+              editingIndex !== null
+                ? setEditingText(e.target.value)
+                : setDraft(e.target.value)
+            }
             rows={1}
             placeholder={
-              waitingApproval ? "Pendiente de autorización…" : "Escribí tu consulta técnica…"
+              waitingApproval
+                ? "Pendiente de autorización…"
+                : editingIndex !== null
+                  ? "Editá tu mensaje y reenviá…"
+                  : "Escribí tu consulta técnica…"
             }
-            disabled={inputLocked}
+            disabled={inputLocked && editingIndex === null}
             className="max-h-40 min-h-9 flex-1 resize-none bg-transparent py-1 text-sm text-foreground outline-none placeholder:text-muted-foreground/60 disabled:opacity-50 sm:min-h-8"
             style={{ lineHeight: "1.5" }}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                void handleSubmit(e);
-              }
-            }}
+            onKeyDown={handleDraftKeyDown}
           />
 
-          <button
-            type="submit"
-            disabled={inputLocked || !draft.trim()}
-            className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl transition-all duration-200 sm:h-8 sm:w-8 ${
-              !inputLocked && draft.trim()
-                ? "bg-primary text-primary-foreground shadow-sm hover:opacity-90"
-                : "cursor-not-allowed bg-muted text-muted-foreground"
-            }`}
-          >
-            <Send size={15} />
-          </button>
+          {showStop ? (
+            <button
+              type="button"
+              title="Detener"
+              onClick={() => onStop?.()}
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-destructive text-destructive-foreground shadow-sm transition hover:opacity-90 sm:h-8 sm:w-8"
+            >
+              <Square size={14} fill="currentColor" />
+            </button>
+          ) : (
+            <button
+              type="submit"
+              disabled={
+                inputLocked ||
+                (editingIndex !== null ? !editingText.trim() : !draft.trim())
+              }
+              className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl transition-all duration-200 sm:h-8 sm:w-8 ${
+                !inputLocked &&
+                (editingIndex !== null ? editingText.trim() : draft.trim())
+                  ? "bg-primary text-primary-foreground shadow-sm hover:opacity-90"
+                  : "cursor-not-allowed bg-muted text-muted-foreground"
+              }`}
+            >
+              <Send size={15} />
+            </button>
+          )}
         </div>
 
-        <p className="mt-2 text-center text-[10px] text-muted-foreground/50">
+        <p className="mx-auto mt-2 max-w-6xl text-center text-[10px] text-muted-foreground/50">
           El asistente puede cometer errores. Verificá la información crítica.
         </p>
       </form>
+
+      {viewerAttachment && (
+        <FileViewerModal
+          attachment={viewerAttachment}
+          open={Boolean(viewerAttachment)}
+          onClose={() => setViewerAttachment(null)}
+        />
+      )}
     </main>
   );
 }

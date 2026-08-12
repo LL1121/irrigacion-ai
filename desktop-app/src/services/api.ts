@@ -2,14 +2,25 @@ import { getApiBaseUrl } from "./config";
 
 export type SpeedMode = "fast" | "balanced" | "deep";
 
+export type ChatAttachment = {
+  file_id: string;
+  filename: string;
+  mime: string;
+  size_bytes?: number | null;
+};
+
 export type ChatMessage = {
   role: "user" | "assistant" | string;
   message: string;
   created_at?: string | null;
+  id?: string;
+  animate?: boolean;
   from_cache?: boolean;
   status?: string;
   skill_name?: string | null;
   skill_description?: string | null;
+  attachments?: ChatAttachment[];
+  approval_kind?: "download_remote" | "execute_local" | string | null;
 };
 
 export type ChatResponse = {
@@ -18,6 +29,8 @@ export type ChatResponse = {
   status: string;
   skill_name?: string | null;
   skill_description?: string | null;
+  attachments?: ChatAttachment[] | null;
+  approval_kind?: "download_remote" | "execute_local" | string | null;
 };
 
 export type SkillApproveResponse = {
@@ -26,6 +39,8 @@ export type SkillApproveResponse = {
   skill_name?: string | null;
   skill_description?: string | null;
   approved: boolean;
+  attachments?: ChatAttachment[] | null;
+  approval_kind?: "download_remote" | "execute_local" | string | null;
   audit?: {
     is_safe?: boolean;
     risk_score?: number;
@@ -60,14 +75,28 @@ export async function sendChat(
   sessionId: string,
   message: string,
   speedMode: SpeedMode = "deep",
+  signal?: AbortSignal,
 ): Promise<ChatResponse> {
   const res = await fetch(`${getApiBaseUrl()}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ session_id: sessionId, message, speed_mode: speedMode }),
+    signal,
   });
   if (!res.ok) throw new Error(await parseError(res));
   return res.json();
+}
+
+export async function truncateSession(
+  sessionId: string,
+  fromCreatedAt: string,
+): Promise<void> {
+  const res = await fetch(`${getApiBaseUrl()}/api/sessions/${sessionId}/truncate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ from_created_at: fromCreatedAt }),
+  });
+  if (!res.ok) throw new Error(await parseError(res));
 }
 
 export async function approveSkill(

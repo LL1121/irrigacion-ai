@@ -1,0 +1,11 @@
+{
+  "version": "0.2.0",
+  "notes": "Describe los cambios de esta versión.",
+  "pub_date": "2026-08-12T14:00:00Z",
+  "platforms": {
+    "linux-x86_64": {
+      "signature": "CONTENIDO_DEL_ARCHIVO_.sig",
+      "url": "http://172.30.12.101:8000/updates/Irrigacion-Bot_0.2.0_amd64.AppImage.tar.gz"
+    }
+  }
+}

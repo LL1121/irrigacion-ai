@@ -101,9 +101,6 @@ export function Sidebar({
                   >
                     {preview(session.last_message)}
                   </p>
-                  <p className="mt-0.5 truncate font-mono text-[10px] text-muted-foreground">
-                    {session.session_id.slice(0, 8)}…
-                  </p>
                 </div>
               </button>
             );

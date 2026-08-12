@@ -18,12 +18,23 @@ from sqlalchemy.orm import Session
 from app.core.checkpointer import get_checkpointer
 from app.core.config import get_settings
 from app.services.cache import embed_query, save_to_semantic_cache
+from app.services.document_export import (
+    artifact_info,
+    save_artifact_from_base64,
+)
 from app.services.sandbox import execute_skill_in_sandbox_sync
 from app.services.skill_marketplace import (
-    looks_like_skill_intent,
+    APPROVAL_KIND_DOWNLOAD,
+    APPROVAL_KIND_EXECUTE,
+    download_remote_prompt,
+    enrich_skill_arguments,
+    find_local_skill,
+    is_action_request,
     search_catalog,
     search_skill_marketplace,
+    should_try_skill_marketplace,
 )
+from app.services.skill_remote import generate_remote_skill
 
 logger = logging.getLogger(__name__)
 
@@ -52,11 +63,12 @@ Tu objetivo es ayudar al personal de la oficina a resolver dudas sobre normativa
 
 SKILL_TOOLING_HINT = (
     "Herramientas: no tenés calculadoras locales bindeadas. Si el usuario pide un "
-    "cálculo, conversión de unidades, prorrateo de turno, lámina o tiempo de riego "
-    "(u otra automatización que no esté resuelta por los documentos), DEBÉS llamar "
-    "a la tool search_skill_marketplace. No inventes resultados numéricos: primero "
-    "buscá la skill. Extraé los números del mensaje en arguments_json. "
-    "Si podés responder solo con el contexto RAG, respondé en texto sin tools."
+    "cálculo, conversión de unidades, prorrateo de turno, lámina o tiempo de riego, "
+    "generación de documentos Word, o cualquier automatización que no puedas resolver "
+    "solo con los documentos, DEBÉS llamar a search_skill_marketplace. No inventes "
+    "resultados numéricos ni archivos: primero buscá la skill. Extraé números y datos "
+    "del mensaje en arguments_json. Si podés responder solo con el contexto RAG, "
+    "respondé en texto sin tools."
 )
 
 # Alias retrocompatible: el resto del módulo referenciaba SYSTEM_PROMPT.
@@ -76,7 +88,8 @@ def _resolve_top_k(speed_mode: str | None) -> int:
 CATALOG_HINT = (
     "Catálogo de skills (buscar con search_skill_marketplace): "
     "Cálculo de caudal (Q = A·v); Conversión de unidades de caudal; "
-    "Prorrateo de turno de riego; Lámina de riego; Tiempo de riego."
+    "Prorrateo de turno de riego; Lámina de riego; Tiempo de riego; "
+    "Generación de documento Word (.docx)."
 )
 
 
@@ -92,6 +105,9 @@ class AgentState(TypedDict):
     needs_approval: NotRequired[bool]
     skill_approved: NotRequired[bool | None]
     skill_result: NotRequired[dict[str, Any] | None]
+    attachments: NotRequired[list[dict[str, Any]]]
+    approval_kind: NotRequired[str | None]
+    download_approved: NotRequired[bool | None]
 
 
 @dataclass
@@ -102,6 +118,8 @@ class AgentOutcome:
     skill_description: str | None = None
     from_cache: bool = False
     audit: dict[str, Any] | None = None
+    attachments: list[dict[str, Any]] | None = None
+    approval_kind: str | None = None
 
 
 def _thread_config(session_id: str) -> dict:
@@ -213,6 +231,26 @@ def _parse_tool_arguments(raw_args: dict[str, Any], user_message: str) -> tuple[
     return task, arguments
 
 
+def _resolve_skill_plan(task: str, arguments: dict[str, Any], user_message: str) -> dict[str, Any] | None:
+    """Evalúa skills locales; si no hay match y es un pedido de acción, pide descarga."""
+    if not (is_action_request(user_message) or should_try_skill_marketplace(user_message)):
+        return None
+    found = find_local_skill(task, arguments)
+    if found.get("found"):
+        return {
+            "pending_skill": found,
+            "approval_kind": APPROVAL_KIND_EXECUTE,
+            "needs_approval": True,
+            "reply": "",
+        }
+    return {
+        "pending_skill": None,
+        "approval_kind": APPROVAL_KIND_DOWNLOAD,
+        "needs_approval": True,
+        "reply": "",
+    }
+
+
 def _plan_node(state: AgentState) -> dict:
     llm = _llm(tools=True)
     messages: list = [
@@ -235,14 +273,19 @@ def _plan_node(state: AgentState) -> dict:
             continue
         raw_args = call.get("args") if isinstance(call, dict) else getattr(call, "args", {})
         task, arguments = _parse_tool_arguments(raw_args or {}, state["user_message"])
-        found = search_catalog(task, arguments)
-        if found.get("found"):
+        resolved = _resolve_skill_plan(task, arguments, state["user_message"])
+        if resolved:
+            return resolved
+        if is_action_request(state["user_message"]):
             return {
-                "pending_skill": found,
+                "pending_skill": None,
+                "approval_kind": APPROVAL_KIND_DOWNLOAD,
                 "needs_approval": True,
                 "reply": "",
             }
-        available = ", ".join(s["name"] for s in found.get("available") or [])
+        available = ", ".join(
+            s["name"] for s in search_catalog(task, arguments).get("available") or []
+        )
         return {
             "pending_skill": None,
             "needs_approval": False,
@@ -253,11 +296,24 @@ def _plan_node(state: AgentState) -> dict:
         }
 
     reply = (getattr(response, "content", None) or "").strip()
-    if looks_like_skill_intent(state["user_message"]):
-        found = search_catalog(state["user_message"], {"query": state["user_message"]})
-        if found.get("found"):
+    resolved = _resolve_skill_plan(
+        state["user_message"], {"query": state["user_message"]}, state["user_message"]
+    )
+    if resolved:
+        return resolved
+    if should_try_skill_marketplace(state["user_message"], reply):
+        fallback = find_local_skill(state["user_message"], {"query": state["user_message"]})
+        if fallback.get("found"):
             return {
-                "pending_skill": found,
+                "pending_skill": fallback,
+                "approval_kind": APPROVAL_KIND_EXECUTE,
+                "needs_approval": True,
+                "reply": "",
+            }
+        if is_action_request(state["user_message"]):
+            return {
+                "pending_skill": None,
+                "approval_kind": APPROVAL_KIND_DOWNLOAD,
                 "needs_approval": True,
                 "reply": "",
             }
@@ -273,25 +329,99 @@ def _plan_node(state: AgentState) -> dict:
     }
 
 
-def _route_after_plan(state: AgentState) -> Literal["human_gate", "end_ok"]:
-    if state.get("needs_approval") and state.get("pending_skill"):
-        return "human_gate"
+def _route_after_plan(state: AgentState) -> Literal["human_gate_download", "human_gate_execute", "end_ok"]:
+    kind = state.get("approval_kind")
+    if kind == APPROVAL_KIND_DOWNLOAD:
+        return "human_gate_download"
+    if kind == APPROVAL_KIND_EXECUTE and state.get("pending_skill"):
+        return "human_gate_execute"
     return "end_ok"
 
 
 def _approval_prompt(skill: dict[str, Any]) -> str:
     name = skill.get("name") or "desconocida"
+    source = skill.get("source")
+    prefix = "Se descargó la skill" if source == "remote" else "Se encontró la skill"
     return (
-        f"No tengo esta habilidad. Se encontró la skill '{name}'. "
-        "¿Autorizas a Gemini a auditarla y ejecutarla en el Sandbox?"
+        f"No tengo esta habilidad instalada. {prefix} '{name}'. "
+        "¿Autorizás a Gemini a auditarla y ejecutarla en el sandbox?"
     )
 
 
-def _human_gate_node(state: AgentState) -> dict:
+def _interrupt_to_prompt(payload: dict[str, Any], values: dict[str, Any]) -> str:
+    kind = payload.get("approval_kind") or payload.get("intent")
+    if kind == APPROVAL_KIND_DOWNLOAD:
+        return download_remote_prompt()
+    skill = values.get("pending_skill") or {}
+    return _approval_prompt(
+        {
+            "name": payload.get("skill_name") or skill.get("name"),
+            "source": skill.get("source"),
+        }
+    )
+
+
+def _human_gate_download_node(state: AgentState) -> dict:
+    decision = interrupt(
+        {
+            "intent": APPROVAL_KIND_DOWNLOAD,
+            "approval_kind": APPROVAL_KIND_DOWNLOAD,
+            "task": state["user_message"],
+        }
+    )
+    approved = (
+        bool(decision.get("approved"))
+        if isinstance(decision, dict)
+        else bool(decision)
+    )
+    if not approved:
+        return {
+            "download_approved": False,
+            "reply": "Entendido. No voy a descargar esa habilidad desde internet.",
+            "needs_approval": False,
+            "approval_kind": None,
+        }
+    return {"download_approved": True}
+
+
+def _route_after_download_gate(state: AgentState) -> Literal["fetch_remote_skill", "end_ok"]:
+    if state.get("download_approved"):
+        return "fetch_remote_skill"
+    return "end_ok"
+
+
+def _fetch_remote_skill_node(state: AgentState) -> dict:
+    try:
+        skill = generate_remote_skill(
+            state["user_message"],
+            rag_context=_context_block(state.get("retrieved_docs") or []),
+        )
+    except Exception as exc:
+        logger.exception("Fallo al descargar skill remota")
+        return {
+            "reply": f"No pude descargar la habilidad: {exc}",
+            "needs_approval": False,
+            "approval_kind": None,
+        }
+    return {
+        "pending_skill": skill,
+        "approval_kind": APPROVAL_KIND_EXECUTE,
+        "needs_approval": True,
+    }
+
+
+def _route_after_fetch(state: AgentState) -> Literal["human_gate_execute", "end_ok"]:
+    if state.get("needs_approval") and state.get("pending_skill"):
+        return "human_gate_execute"
+    return "end_ok"
+
+
+def _human_gate_execute_node(state: AgentState) -> dict:
     skill = state.get("pending_skill") or {}
     decision = interrupt(
         {
-            "intent": "solicitud_permiso",
+            "intent": APPROVAL_KIND_EXECUTE,
+            "approval_kind": APPROVAL_KIND_EXECUTE,
             "skill_id": skill.get("id"),
             "skill_name": skill.get("name"),
             "skill_description": skill.get("description"),
@@ -314,11 +444,59 @@ def _run_skill_node(state: AgentState) -> dict:
             ),
         }
 
-    skill = state.get("pending_skill") or {}
+    skill = dict(state.get("pending_skill") or {})
+    skill["arguments"] = enrich_skill_arguments(skill, state["user_message"])
     code = skill.get("code") or ""
     arguments = skill.get("arguments") or {}
     result = execute_skill_in_sandbox_sync(code, arguments)
-    return {"skill_result": result, "reply": ""}
+    return {"skill_result": result, "reply": "", "pending_skill": skill}
+
+
+def _skill_result_payload(execution: dict[str, Any]) -> dict[str, Any] | None:
+    parsed = execution.get("parsed")
+    if not isinstance(parsed, dict):
+        return None
+    inner = parsed.get("result")
+    if isinstance(inner, dict):
+        if inner.get("content_base64") or inner.get("files"):
+            return inner
+        return inner
+    return parsed if parsed.get("content_base64") or parsed.get("files") else None
+
+
+def _persist_skill_attachments(skill_data: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not skill_data:
+        return []
+    attachments: list[dict[str, Any]] = []
+
+    def _save_one(payload: dict[str, Any]) -> None:
+        b64 = payload.get("content_base64")
+        if not b64:
+            return
+        filename = str(payload.get("filename") or "archivo")
+        mime = payload.get("mime")
+        try:
+            file_id, _ = save_artifact_from_base64(str(b64), filename, mime=mime)
+            info = artifact_info(file_id) or {}
+            attachments.append(
+                {
+                    "file_id": file_id,
+                    "filename": info.get("filename") or filename,
+                    "mime": info.get("mime") or mime or "application/octet-stream",
+                    "size_bytes": info.get("size_bytes"),
+                }
+            )
+        except Exception:
+            logger.exception("No se pudo persistir el archivo generado por la skill")
+
+    files = skill_data.get("files")
+    if isinstance(files, list):
+        for item in files:
+            if isinstance(item, dict):
+                _save_one(item)
+    else:
+        _save_one(skill_data)
+    return attachments
 
 
 def _compose_skill_reply_node(state: AgentState) -> dict:
@@ -365,7 +543,12 @@ def _compose_skill_reply_node(state: AgentState) -> dict:
     reply = (getattr(response, "content", None) or "").strip()
     if not reply:
         reply = f"Resultado de '{name}':\n{payload}"
-    return {"reply": reply}
+    skill_data = _skill_result_payload(execution)
+    attachments = _persist_skill_attachments(skill_data)
+    if attachments:
+        names = ", ".join(a["filename"] for a in attachments)
+        reply = f"{reply}\n\nGeneré el archivo: {names}. Podés abrirlo desde el visor debajo."
+    return {"reply": reply, "attachments": attachments}
 
 
 def _persist_message(
@@ -408,10 +591,17 @@ def extract_interrupt_payload(snapshot: Any) -> dict[str, Any] | None:
             if isinstance(value, dict):
                 return value
     values = getattr(snapshot, "values", None) or {}
+    if values.get("approval_kind") == APPROVAL_KIND_DOWNLOAD:
+        return {
+            "intent": APPROVAL_KIND_DOWNLOAD,
+            "approval_kind": APPROVAL_KIND_DOWNLOAD,
+            "task": values.get("user_message"),
+        }
     if values.get("needs_approval") and values.get("pending_skill"):
         skill = values["pending_skill"]
         return {
-            "intent": "solicitud_permiso",
+            "intent": APPROVAL_KIND_EXECUTE,
+            "approval_kind": APPROVAL_KIND_EXECUTE,
             "skill_id": skill.get("id"),
             "skill_name": skill.get("name"),
             "skill_description": skill.get("description"),
@@ -431,7 +621,9 @@ def build_agent_graph(db: Session):
     graph.add_node("retrieve", retrieve)
     graph.add_node("fetch_history", fetch_history)
     graph.add_node("plan", _plan_node)
-    graph.add_node("human_gate", _human_gate_node)
+    graph.add_node("human_gate_download", _human_gate_download_node)
+    graph.add_node("fetch_remote_skill", _fetch_remote_skill_node)
+    graph.add_node("human_gate_execute", _human_gate_execute_node)
     graph.add_node("run_skill", _run_skill_node)
     graph.add_node("compose_skill_reply", _compose_skill_reply_node)
 
@@ -441,9 +633,23 @@ def build_agent_graph(db: Session):
     graph.add_conditional_edges(
         "plan",
         _route_after_plan,
-        {"human_gate": "human_gate", "end_ok": END},
+        {
+            "human_gate_download": "human_gate_download",
+            "human_gate_execute": "human_gate_execute",
+            "end_ok": END,
+        },
     )
-    graph.add_edge("human_gate", "run_skill")
+    graph.add_conditional_edges(
+        "human_gate_download",
+        _route_after_download_gate,
+        {"fetch_remote_skill": "fetch_remote_skill", "end_ok": END},
+    )
+    graph.add_conditional_edges(
+        "fetch_remote_skill",
+        _route_after_fetch,
+        {"human_gate_execute": "human_gate_execute", "end_ok": END},
+    )
+    graph.add_edge("human_gate_execute", "run_skill")
     graph.add_edge("run_skill", "compose_skill_reply")
     graph.add_edge("compose_skill_reply", END)
 
@@ -472,17 +678,18 @@ def run_agent(
 
     pending = extract_interrupt_payload(compiled.get_state(config))
     if pending:
-        name = pending.get("skill_name") or "desconocida"
+        values = getattr(compiled.get_state(config), "values", None) or {}
+        prompt = _interrupt_to_prompt(pending, values)
+        kind = pending.get("approval_kind")
+        skill = values.get("pending_skill") or {}
+        name = pending.get("skill_name") or skill.get("name")
+        description = pending.get("skill_description") or skill.get("description")
         return AgentOutcome(
             status=STATUS_APPROVAL,
-            reply=_approval_prompt(
-                {
-                    "name": name,
-                    "description": pending.get("skill_description"),
-                }
-            ),
-            skill_name=name,
-            skill_description=pending.get("skill_description"),
+            reply=prompt,
+            skill_name=name if kind == APPROVAL_KIND_EXECUTE else None,
+            skill_description=description if kind == APPROVAL_KIND_EXECUTE else None,
+            approval_kind=kind,
         )
 
     try:
@@ -499,6 +706,9 @@ def run_agent(
                 "needs_approval": False,
                 "skill_approved": None,
                 "skill_result": None,
+                "attachments": [],
+                "approval_kind": None,
+                "download_approved": None,
             },
             config,
         )
@@ -513,11 +723,12 @@ def run_agent(
 
     if interrupt_payload:
         skill = values.get("pending_skill") or {}
-        name = interrupt_payload.get("skill_name") or skill.get("name") or "desconocida"
+        kind = interrupt_payload.get("approval_kind")
+        prompt = _interrupt_to_prompt(interrupt_payload, values)
+        name = interrupt_payload.get("skill_name") or skill.get("name")
         description = (
             interrupt_payload.get("skill_description") or skill.get("description")
         )
-        prompt = _approval_prompt({"name": name})
         _persist_message(db, sid, "user", user_message)
         _persist_message(
             db,
@@ -527,6 +738,7 @@ def run_agent(
             {
                 "kind": "requires_approval",
                 "status": STATUS_APPROVAL,
+                "approval_kind": kind,
                 "skill_name": name,
                 "skill_description": description,
             },
@@ -534,17 +746,22 @@ def run_agent(
         return AgentOutcome(
             status=STATUS_APPROVAL,
             reply=prompt,
-            skill_name=name,
-            skill_description=description,
+            skill_name=name if kind == APPROVAL_KIND_EXECUTE else None,
+            skill_description=description if kind == APPROVAL_KIND_EXECUTE else None,
+            approval_kind=kind,
         )
 
     reply = values.get("reply") or ""
+    attachments = values.get("attachments") or []
     embedding = values.get("query_embedding") or []
     _persist_message(db, sid, "user", user_message)
-    _persist_message(db, sid, "assistant", reply)
+    assistant_meta: dict[str, Any] | None = None
+    if attachments:
+        assistant_meta = {"attachments": attachments}
+    _persist_message(db, sid, "assistant", reply, assistant_meta)
     if embedding:
         save_to_semantic_cache(db, user_message, embedding, reply)
-    return AgentOutcome(status=STATUS_OK, reply=reply)
+    return AgentOutcome(status=STATUS_OK, reply=reply, attachments=attachments or None)
 
 
 def resume_agent(db: Session, session_id: UUID | str, approved: bool) -> AgentOutcome:
@@ -564,23 +781,57 @@ def resume_agent(db: Session, session_id: UUID | str, approved: bool) -> AgentOu
             raise
     snapshot = compiled.get_state(config)
     values = getattr(snapshot, "values", None) or {}
+    interrupt_payload = extract_interrupt_payload(snapshot)
+
+    if interrupt_payload:
+        prompt = _interrupt_to_prompt(interrupt_payload, values)
+        kind = interrupt_payload.get("approval_kind")
+        skill = values.get("pending_skill") or {}
+        name = interrupt_payload.get("skill_name") or skill.get("name")
+        description = interrupt_payload.get("skill_description") or skill.get("description")
+        _persist_message(
+            db,
+            sid,
+            "assistant",
+            prompt,
+            {
+                "kind": "requires_approval",
+                "status": STATUS_APPROVAL,
+                "approval_kind": kind,
+                "skill_name": name,
+                "skill_description": description,
+            },
+        )
+        return AgentOutcome(
+            status=STATUS_APPROVAL,
+            reply=prompt,
+            skill_name=name if kind == APPROVAL_KIND_EXECUTE else None,
+            skill_description=description if kind == APPROVAL_KIND_EXECUTE else None,
+            approval_kind=kind,
+        )
+
     reply = values.get("reply") or ""
+    attachments = values.get("attachments") or []
     skill_result = values.get("skill_result") or {}
     audit = (skill_result or {}).get("audit") if isinstance(skill_result, dict) else None
     user_message = values.get("user_message") or ""
     embedding = values.get("query_embedding") or []
 
-    _persist_message(
-        db,
-        sid,
-        "assistant",
-        reply,
-        {
-            "kind": "skill_result" if approved else "skill_denied",
-            "approved": approved,
-            "audit": audit,
-        },
-    )
+    meta: dict[str, Any] = {
+        "kind": "skill_result" if approved else "skill_denied",
+        "approved": approved,
+        "audit": audit,
+    }
+    if attachments:
+        meta["attachments"] = attachments
+    if reply:
+        _persist_message(
+            db,
+            sid,
+            "assistant",
+            reply,
+            meta,
+        )
     if approved and embedding and reply:
         save_to_semantic_cache(db, user_message, embedding, reply)
 
@@ -590,4 +841,6 @@ def resume_agent(db: Session, session_id: UUID | str, approved: bool) -> AgentOu
         skill_name=pending.get("skill_name"),
         skill_description=pending.get("skill_description"),
         audit=audit,
+        attachments=attachments or None,
+        approval_kind=pending.get("approval_kind"),
     )

@@ -67,4 +67,6 @@ def approve_skill(
         "skill_description": outcome.skill_description,
         "audit": outcome.audit,
         "approved": payload.approved,
+        "attachments": outcome.attachments,
+        "approval_kind": outcome.approval_kind,
     }

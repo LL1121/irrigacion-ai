@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Sidebar } from "./components/Sidebar";
 import { ChatWindow } from "./components/ChatWindow";
 import { FileUploadModal } from "./components/FileUploadModal";
 import { SettingsModal } from "./components/SettingsModal";
+import { UpdateModal } from "./components/UpdateModal";
 import { ThemeProvider } from "./theme";
 import {
   ensureNotificationPermission,
@@ -16,11 +17,15 @@ import {
   healthCheck,
   listSessions,
   sendChat,
+  truncateSession,
   type ChatMessage,
   type SessionSummary,
   type SpeedMode,
 } from "./services/api";
 import { newUuid } from "./utils/uuid";
+import { checkForAppUpdate } from "./services/updater";
+import type { Update } from "@tauri-apps/plugin-updater";
+import { isTauriRuntime } from "./native";
 
 const SOUND_STORAGE_KEY = "irrigacion.sound";
 const NOTIFICATIONS_STORAGE_KEY = "irrigacion.notifications";
@@ -95,6 +100,20 @@ function AppShell() {
   );
   const [speedMode, setSpeedMode] = useState<SpeedMode>(readSpeedMode);
   const [windowFocused, setWindowFocused] = useState(true);
+  const abortRef = useRef<AbortController | null>(null);
+  const [pendingUpdate, setPendingUpdate] = useState<Update | null>(null);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    void (async () => {
+      try {
+        const update = await checkForAppUpdate();
+        if (update) setPendingUpdate(update);
+      } catch {
+        // El servidor de updates puede estar offline; no bloquea el arranque.
+      }
+    })();
+  }, []);
 
   const refreshSessions = useCallback(async () => {
     try {
@@ -212,7 +231,12 @@ function AppShell() {
   }
 
   async function handleSend(text: string) {
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     const userMsg: ChatMessage = {
+      id: newUuid(),
       role: "user",
       message: text,
       created_at: new Date().toISOString(),
@@ -220,10 +244,11 @@ function AppShell() {
     setMessages((prev) => [...prev, userMsg]);
     setLoading(true);
     try {
-      const result = await sendChat(sessionId, text, speedMode);
+      const result = await sendChat(sessionId, text, speedMode, controller.signal);
       setMessages((prev) => [
         ...prev,
         {
+          id: newUuid(),
           role: "assistant",
           message: result.reply,
           from_cache: result.from_cache,
@@ -231,14 +256,28 @@ function AppShell() {
           skill_name: result.skill_name,
           skill_description: result.skill_description,
           created_at: new Date().toISOString(),
+          animate: result.status !== "REQUIRES_APPROVAL",
+          attachments: result.attachments ?? undefined,
+          approval_kind: result.approval_kind ?? undefined,
         },
       ]);
       notifyIfNeeded(result.reply);
       await refreshSessions();
     } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") {
+        setMessages((prev) => {
+          const last = prev[prev.length - 1];
+          if (last?.role === "user" && last.message === text) {
+            return prev.slice(0, -1);
+          }
+          return prev;
+        });
+        return;
+      }
       setMessages((prev) => [
         ...prev,
         {
+          id: newUuid(),
           role: "assistant",
           message:
             err instanceof Error
@@ -248,6 +287,43 @@ function AppShell() {
         },
       ]);
     } finally {
+      if (abortRef.current === controller) {
+        abortRef.current = null;
+      }
+      setLoading(false);
+    }
+  }
+
+  function handleStop() {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setLoading(false);
+  }
+
+  async function handleEditMessage(index: number, newText: string) {
+    const target = messages[index];
+    if (!target?.created_at || target.role !== "user") return;
+
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setLoading(true);
+    try {
+      await truncateSession(sessionId, target.created_at);
+      setMessages((prev) => prev.slice(0, index));
+      await handleSend(newText);
+    } catch (err) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: newUuid(),
+          role: "assistant",
+          message:
+            err instanceof Error
+              ? `Error al editar el mensaje: ${err.message}`
+              : "Error al editar el mensaje.",
+          created_at: new Date().toISOString(),
+        },
+      ]);
       setLoading(false);
     }
   }
@@ -259,9 +335,16 @@ function AppShell() {
       setMessages((prev) => [
         ...prev,
         {
+          id: newUuid(),
           role: "assistant",
           message: result.reply,
+          status: result.status,
+          skill_name: result.skill_name,
+          skill_description: result.skill_description,
           created_at: new Date().toISOString(),
+          animate: result.status !== "REQUIRES_APPROVAL",
+          attachments: result.attachments ?? undefined,
+          approval_kind: result.approval_kind ?? undefined,
         },
       ]);
       notifyIfNeeded(result.reply);
@@ -300,9 +383,9 @@ function AppShell() {
         approving={approving}
         apiOnline={apiOnline}
         showTimestamps={showTimestamps}
-        speedMode={speedMode}
-        onSpeedModeChange={handleSpeedModeChange}
         onSend={handleSend}
+        onStop={handleStop}
+        onEditMessage={(index, text) => void handleEditMessage(index, text)}
         onApproveSkill={(approved) => void handleApproveSkill(approved)}
         onOpenSettings={() => setSettingsOpen(true)}
         onOpenUpload={() => setUploadOpen(true)}
@@ -326,7 +409,12 @@ function AppShell() {
         onFontScaleChange={handleFontScaleChange}
         showTimestamps={showTimestamps}
         onShowTimestampsChange={handleShowTimestampsChange}
+        speedMode={speedMode}
+        onSpeedModeChange={handleSpeedModeChange}
       />
+      {pendingUpdate && (
+        <UpdateModal update={pendingUpdate} onDismiss={() => setPendingUpdate(null)} />
+      )}
     </div>
   );
 }

@@ -1,18 +1,57 @@
-"""Endpoint de carga e indexación de archivos."""
+"""Endpoints de carga, descarga y vista previa de archivos."""
 
 from __future__ import annotations
 
 import logging
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.services.document_export import (
+    artifact_info,
+    artifact_preview,
+    resolve_generated_document,
+)
 from app.services.ingest import SUPPORTED_EXTENSIONS, detect_file_type, ingest_file
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["files"])
+
+
+@router.get("/documents/{file_id}")
+def download_generated_document(file_id: str) -> FileResponse:
+    path = resolve_generated_document(file_id)
+    if path is None or not path.is_file():
+        raise HTTPException(status_code=404, detail="Documento no encontrado o expirado.")
+    info = artifact_info(file_id) or {}
+    display_name = info.get("filename") or (
+        path.name.split("_", 1)[-1] if "_" in path.name else path.name
+    )
+    media_type = info.get("mime") or "application/octet-stream"
+    return FileResponse(
+        path,
+        media_type=str(media_type),
+        filename=str(display_name),
+    )
+
+
+@router.get("/documents/{file_id}/info")
+def generated_document_info(file_id: str) -> dict:
+    info = artifact_info(file_id)
+    if info is None:
+        raise HTTPException(status_code=404, detail="Documento no encontrado o expirado.")
+    return info
+
+
+@router.get("/documents/{file_id}/preview")
+def generated_document_preview(file_id: str) -> dict:
+    preview = artifact_preview(file_id)
+    if preview is None:
+        raise HTTPException(status_code=404, detail="Documento no encontrado o expirado.")
+    return preview
 
 
 @router.post("/upload")

@@ -6,6 +6,8 @@ import json
 from typing import Any, Optional
 from uuid import UUID
 
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import text
@@ -20,7 +22,12 @@ from app.services.agent import (
     run_agent,
 )
 from app.services.cache import check_semantic_cache
-from app.services.skill_marketplace import looks_like_skill_intent
+from app.services.skill_marketplace import (
+    APPROVAL_KIND_DOWNLOAD,
+    APPROVAL_KIND_EXECUTE,
+    download_remote_prompt,
+    looks_like_skill_intent,
+)
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
@@ -46,6 +53,24 @@ class ChatResponse(BaseModel):
     status: str
     skill_name: str | None = None
     skill_description: str | None = None
+    attachments: list[dict[str, Any]] | None = None
+    approval_kind: str | None = None
+
+
+def _pending_reply(pending: dict[str, Any]) -> tuple[str, str | None, str | None]:
+    kind = pending.get("approval_kind") or pending.get("intent")
+    if kind == APPROVAL_KIND_DOWNLOAD:
+        return download_remote_prompt(), None, None
+    name = pending.get("skill_name") or "desconocida"
+    description = pending.get("skill_description")
+    return (
+        (
+            f"No tengo esta habilidad instalada. Se encontró la skill '{name}'. "
+            "¿Autorizás a Gemini a auditarla y ejecutarla en el sandbox?"
+        ),
+        name,
+        description,
+    )
 
 
 def _persist_chat_message(
@@ -90,18 +115,15 @@ def _metadata_dict(raw: Any) -> dict[str, Any]:
 def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
     pending = get_pending_approval(db, payload.session_id)
     if pending:
-        name = pending.get("skill_name") or "desconocida"
-        description = pending.get("skill_description")
+        reply, name, description = _pending_reply(pending)
         return ChatResponse(
             session_id=payload.session_id,
-            reply=(
-                f"No tengo esta habilidad. Se encontró la skill '{name}'. "
-                "¿Autorizas a Gemini a auditarla y ejecutarla en el Sandbox?"
-            ),
+            reply=reply,
             from_cache=False,
             status=STATUS_APPROVAL,
             skill_name=name,
             skill_description=description,
+            approval_kind=pending.get("approval_kind") or pending.get("intent"),
         )
 
     cached = None
@@ -131,7 +153,37 @@ def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
         status=outcome.status,
         skill_name=outcome.skill_name,
         skill_description=outcome.skill_description,
+        attachments=outcome.attachments,
+        approval_kind=outcome.approval_kind,
     )
+
+
+class TruncateSessionRequest(BaseModel):
+    from_created_at: datetime
+
+
+@router.post("/sessions/{session_id}/truncate")
+def truncate_session(
+    session_id: UUID,
+    payload: TruncateSessionRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Elimina un mensaje y todo lo posterior (para editar y reenviar)."""
+    db.execute(
+        text(
+            """
+            DELETE FROM chat_messages
+            WHERE session_id = :session_id
+              AND created_at >= :from_created_at
+            """
+        ),
+        {
+            "session_id": str(session_id),
+            "from_created_at": payload.from_created_at,
+        },
+    )
+    db.commit()
+    return {"session_id": str(session_id), "truncated_from": payload.from_created_at.isoformat()}
 
 
 @router.get("/sessions")
@@ -198,26 +250,29 @@ def session_messages(session_id: UUID, db: Session = Depends(get_db)) -> dict:
             item["skill_name"] = meta["skill_name"]
         if meta.get("skill_description"):
             item["skill_description"] = meta["skill_description"]
+        if meta.get("attachments"):
+            item["attachments"] = meta["attachments"]
+        if meta.get("approval_kind"):
+            item["approval_kind"] = meta["approval_kind"]
         if meta.get("kind") == "requires_approval":
             item["status"] = STATUS_APPROVAL
+            item["approval_kind"] = meta.get("approval_kind") or item.get("approval_kind")
         messages.append(item)
 
     pending = get_pending_approval(db, session_id)
     if pending:
         already = any(m.get("status") == STATUS_APPROVAL for m in messages)
         if not already:
-            name = pending.get("skill_name") or "desconocida"
+            reply, name, description = _pending_reply(pending)
             messages.append(
                 {
                     "role": "assistant",
-                    "message": (
-                        f"No tengo esta habilidad. Se encontró la skill '{name}'. "
-                        "¿Autorizas a Gemini a auditarla y ejecutarla en el Sandbox?"
-                    ),
+                    "message": reply,
                     "created_at": None,
                     "status": STATUS_APPROVAL,
                     "skill_name": name,
-                    "skill_description": pending.get("skill_description"),
+                    "skill_description": description,
+                    "approval_kind": pending.get("approval_kind") or pending.get("intent"),
                 }
             )
 

@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     scanned_pdf_char_threshold: int = 50
     skill_sandbox_image: str = "skill-sandbox-image"
     skill_workspace_dir: str = "/var/lib/irrigacion/skills"
+    updates_dir: str = ""
 
     cors_origins: str = "*"
 

@@ -50,12 +50,14 @@ services:
       # Build de la PWA (desktop-app/dist) montado como volumen de solo lectura.
       # Generalo antes del deploy con: cd desktop-app && npm run build
       FRONTEND_DIST_DIR: /app/static/dist
+      UPDATES_DIR: /app/static/updates
     ports:
       - "${API_HOST_BIND:-0.0.0.0}:${API_PORT:-8000}:8000"
     volumes:
       - ${SKILL_HOST_DIR:-/var/lib/irrigacion/skills}:/var/lib/irrigacion/skills
       - /var/run/docker.sock:/var/run/docker.sock
       - ./desktop-app/dist:/app/static/dist:ro
+      - ${UPDATES_HOST_DIR:-./updates}:/app/static/updates:ro
     depends_on:
       db:
         condition: service_healthy

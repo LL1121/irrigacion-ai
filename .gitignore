@@ -70,6 +70,14 @@ desktop-app/src-tauri/WixTools/
 desktop-app/src-tauri/*.log
 # Bundles generados (deb/AppImage/msi/nsis)
 desktop-app/src-tauri/target/release/bundle/
+desktop-app/src-tauri/.tauri/*.key
+!desktop-app/src-tauri/.tauri/*.key.pub
+
+# Paquetes de update (binarios grandes; latest.json se genera con publish_update.sh)
+updates/*.tar.gz
+updates/*.AppImage
+updates/latest.json
+!updates/latest.json.example
 
 # -----------------------------------------------------------------------------
 # Docker / datos locales
