@@ -44,17 +44,19 @@ export function FileUploadModal({ open, onClose }: FileUploadModalProps) {
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/70 p-4 backdrop-blur-sm">
-      <div className="w-full max-w-lg rounded-2xl border border-border bg-panel shadow-2xl">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/20 p-4 backdrop-blur-sm">
+      <div className="w-full max-w-lg rounded-3xl border border-border bg-background shadow-2xl">
         <div className="flex items-center justify-between border-b border-border px-5 py-4">
           <div>
-            <h3 className="text-sm font-semibold text-text">Indexar documentos</h3>
-            <p className="text-xs text-muted">PDF, Word o imágenes escaneadas</p>
+            <h3 className="text-sm text-foreground" style={{ fontWeight: 600 }}>
+              Indexar documentos
+            </h3>
+            <p className="text-xs text-muted-foreground">PDF, Word o imágenes escaneadas</p>
           </div>
           <button
             type="button"
             onClick={onClose}
-            className="rounded-md p-1.5 text-muted transition hover:bg-panel-2 hover:text-text"
+            className="flex h-8 w-8 items-center justify-center rounded-xl text-muted-foreground transition-all hover:bg-muted hover:text-foreground"
           >
             <X size={16} />
           </button>
@@ -69,17 +71,17 @@ export function FileUploadModal({ open, onClose }: FileUploadModalProps) {
             onDragLeave={() => setDragging(false)}
             onDrop={onDrop}
             onClick={() => inputRef.current?.click()}
-            className={`flex cursor-pointer flex-col items-center justify-center rounded-xl border border-dashed px-6 py-10 transition ${
+            className={`flex cursor-pointer flex-col items-center justify-center rounded-2xl border border-dashed px-6 py-10 transition ${
               dragging
-                ? "border-accent bg-accent/10"
-                : "border-border bg-panel-2 hover:border-accent/40"
+                ? "border-primary bg-primary/10"
+                : "border-border bg-muted/40 hover:border-primary/40"
             }`}
           >
-            <FileUp className="mb-3 text-accent" size={28} />
-            <p className="text-sm font-medium text-text">
+            <FileUp className="mb-3 text-primary" size={28} />
+            <p className="text-sm text-foreground" style={{ fontWeight: 500 }}>
               Arrastrá archivos aquí o hacé clic
             </p>
-            <p className="mt-1 text-xs text-muted">.pdf · .docx · .png · .jpg</p>
+            <p className="mt-1 text-xs text-muted-foreground">.pdf · .docx · .png · .jpg</p>
             <input
               ref={inputRef}
               type="file"
@@ -93,14 +95,14 @@ export function FileUploadModal({ open, onClose }: FileUploadModalProps) {
           </div>
 
           {uploading && (
-            <div className="flex items-center gap-2 text-sm text-muted">
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
               <LoaderCircle className="animate-spin" size={16} />
               Procesando e indexando…
             </div>
           )}
 
           {error && (
-            <p className="rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger">
+            <p className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
               {error}
             </p>
           )}
@@ -110,10 +112,12 @@ export function FileUploadModal({ open, onClose }: FileUploadModalProps) {
               {results.map((item) => (
                 <li
                   key={`${item.filename}-${item.chunks_created}`}
-                  className="rounded-lg border border-border bg-panel-2 px-3 py-2"
+                  className="rounded-xl border border-border bg-card px-3 py-2"
                 >
-                  <div className="font-medium text-text">{item.filename}</div>
-                  <div className="text-muted">
+                  <div className="text-foreground" style={{ fontWeight: 500 }}>
+                    {item.filename}
+                  </div>
+                  <div className="text-muted-foreground">
                     {item.error
                       ? `Error: ${item.error}`
                       : `${item.chunks_created} chunks creados`}

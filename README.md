@@ -2,7 +2,33 @@
 
 Sistema de IA institucional para la oficina de Irrigación de Malargüe.
 
-Arquitectura híbrida: backend local en Python (FastAPI) + PostgreSQL con `pgvector` + **Groq** (chat) + **Gemini** (OCR/embeddings/centinela) + desktop Tauri.
+Arquitectura híbrida: **un servidor** (FastAPI + PostgreSQL + PWA) y **clientes Tauri** en las PCs de la oficina. Los celulares usan la PWA instalada; las computadoras usan el binario nativo. Todo el cómputo de IA (Groq/Gemini) y la base vectorial viven en el servidor.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  SERVIDOR (on-prem / LAN + Tailscale)                       │
+│  docker compose -f docker-compose.prod.yml                  │
+│  ┌──────────────┐  ┌─────────────────────────────────────┐  │
+│  │ PostgreSQL   │  │ FastAPI :8000                        │  │
+│  │ + pgvector   │◄─┤  /api/*  → chat, upload, skills     │  │
+│  │ (interno)    │  │  /       → PWA (desktop-app/dist)   │  │
+│  └──────────────┘  └─────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+         ▲                              ▲
+         │ HTTP                         │ HTTP (misma URL)
+         │                              │
+   ┌─────┴─────┐                  ┌─────┴─────┐
+   │ Tauri     │                  │ Celulares │
+   │ (PCs)     │                  │ PWA       │
+   │ binario   │                  │ Chrome/   │
+   │ liviano   │                  │ Safari    │
+   └───────────┘                  └───────────┘
+```
+
+| Cliente | Qué instala | URL del servidor |
+|---------|-------------|------------------|
+| **Celular** | PWA (“Agregar a pantalla de inicio”) | `http://<IP>:8000/` — misma URL para UI y API |
+| **PC oficina** | `.deb` / `.AppImage` Tauri | `http://100.68.57.77:8000` (Tailscale) o LAN |
 
 ## Deploy de producción (on-prem / LAN)
 
@@ -13,6 +39,7 @@ Pensado para un **servidor de la oficina** (sin exposición a Internet).
 ```bash
 cp .env.example .env
 # Editar: POSTGRES_PASSWORD, GROQ_API_KEY, GEMINI_API_KEY, CORS_ORIGINS
+# Opcional: API_PUBLIC_URL, LAN_API_URL (IPs reales del servidor)
 ```
 
 Generar password fuerte:
@@ -23,37 +50,43 @@ openssl rand -base64 32
 
 `DOCKER_GID` se detecta solo en el script de deploy (`getent group docker`).
 
-### 2. Desplegar
+### 2. Desplegar (servidor: DB + API + PWA)
+
+En el **servidor** (con Docker instalado):
 
 ```bash
 chmod +x scripts/*.sh
 ./scripts/deploy.sh
 ```
 
-Construye `skill-sandbox-image`, levanta `db` + `api` (`docker-compose.prod.yml`) y deja el API en `http://<IP-SERVIDOR>:8000`.
+El script:
+1. Compila la PWA (`npm run build` → `desktop-app/dist`)
+2. Construye la imagen sandbox de skills
+3. Levanta PostgreSQL + FastAPI con la PWA montada en `/`
 
-### 3. Firewall + Tailscale
+Queda todo en `http://<IP-SERVIDOR>:8000` (API **y** interfaz móvil).
 
-El API escucha en `0.0.0.0:8000` (LAN **y** Tailscale).
+### 3. Celulares (PWA)
 
-- **LAN oficina:** `http://172.30.12.101:8000`
-- **Remoto (Tailscale):** `http://100.68.57.77:8000`
+1. Conectarse a la LAN de oficina o Tailscale.
+2. Abrir en Chrome/Safari: `http://172.30.12.101:8000/` (LAN) o `http://100.68.57.77:8000/` (Tailscale).
+3. **Agregar a la pantalla de inicio** / **Instalar aplicación**.
+4. Listo — la app detecta la API automáticamente (mismo origen, sin configurar URL).
 
-Asegurate de que:
-1. Tailscale esté activo en el servidor y en tu notebook.
-2. El firewall del host permita TCP `8000` al menos desde la interfaz Tailscale (`tailscale0`) / ACL del tailnet.
-3. **No** publiques Postgres (sigue interno a Docker).
+### 4. PCs de escritorio (Tauri)
 
-La app de escritorio usa por defecto la IP Tailscale; en Configuración podés cambiar a la LAN.
-
-### 4. Clientes de escritorio
+En una máquina de build (puede ser el mismo servidor o tu notebook):
 
 ```bash
 ./scripts/build_desktop.sh
 # instalar el paquete en desktop-app/src-tauri/target/release/bundle/
 ```
 
-En la app: **Configuración** (engranaje). Default:
+El build embebe `API_PUBLIC_URL` del `.env` como URL default del cliente.
+
+En la app: **Configuración** → URL del servidor si hace falta cambiarla.
+
+Default:
 
 ```text
 http://100.68.57.77:8000
@@ -61,7 +94,19 @@ http://100.68.57.77:8000
 
 LAN oficina (opcional): `http://172.30.12.101:8000`
 
-### 5. Backups
+### 5. Firewall + Tailscale
+
+El API escucha en `0.0.0.0:8000` (LAN **y** Tailscale).
+
+- **LAN oficina:** `http://172.30.12.101:8000`
+- **Remoto (Tailscale):** `http://100.68.57.77:8000`
+
+Asegurate de que:
+1. Tailscale esté activo en el servidor y en los clientes que lo necesiten.
+2. El firewall del host permita TCP `8000` al menos desde la interfaz Tailscale (`tailscale0`) / ACL del tailnet.
+3. **No** publiques Postgres (sigue interno a Docker).
+
+### 6. Backups
 
 ```bash
 ./scripts/backup_db.sh
@@ -72,10 +117,23 @@ LAN oficina (opcional): `http://172.30.12.101:8000`
 
 - [ ] `.env` con secretos reales (no placeholders)
 - [ ] `curl http://127.0.0.1:8000/health` → ok
+- [ ] `curl -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/` → 200 (PWA)
+- [ ] PWA instalable desde celular en la LAN
+- [ ] App Tauri instalada en al menos una PC de prueba
 - [ ] Firewall LAN-only en `:8000`
-- [ ] App Tauri apunta a la IP del servidor
 - [ ] Backup programado (cron diario de `backup_db.sh`)
 - [ ] Probar upload + chat + skill maliciosa (rejected)
+
+### Actualizar frontend en producción
+
+Si cambiás solo la UI (sin tocar backend):
+
+```bash
+cd desktop-app && npm run build && cd ..
+docker compose --env-file .env -f docker-compose.prod.yml restart api
+```
+
+O volvé a correr `./scripts/deploy.sh` (rebuild completo).
 
 ### Proveedores de IA
 

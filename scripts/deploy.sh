@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deploy on-prem de irrigacion-bot (API + DB + imagen sandbox)
+# Deploy on-prem: PWA + API + PostgreSQL + imagen sandbox de skills
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -36,21 +36,56 @@ if [[ -z "${DOCKER_GID:-}" ]]; then
   fi
 fi
 
+echo "==> Compilando PWA (desktop-app/dist)"
+cd "$ROOT/desktop-app"
+npm ci
+npm run build
+cd "$ROOT"
+
+if [[ ! -f "$ROOT/desktop-app/dist/index.html" ]]; then
+  echo "Error: no se generó desktop-app/dist/index.html"
+  exit 1
+fi
+
 echo "==> Construyendo imagen de sandbox de skills"
 docker build -t "${SKILL_SANDBOX_IMAGE:-skill-sandbox-image}" "$ROOT/backend/sandbox_env"
 
-echo "==> Levantando stack de producción"
+echo "==> Levantando stack de producción (db + api + PWA estática)"
 "${COMPOSE[@]}" build api
 "${COMPOSE[@]}" up -d
+
+echo "==> Esperando healthcheck del API…"
+API_PORT="${API_PORT:-8000}"
+for _ in $(seq 1 30); do
+  if curl -fsS "http://127.0.0.1:${API_PORT}/health" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 2
+done
 
 echo "==> Estado"
 "${COMPOSE[@]}" ps
 
-API_PORT="${API_PORT:-8000}"
+PUBLIC="${API_PUBLIC_URL:-http://100.68.57.77:${API_PORT}}"
+LAN="${LAN_API_URL:-http://172.30.12.101:${API_PORT}}"
+
 echo
-echo "Listo. Healthcheck:"
+echo "════════════════════════════════════════════════════════════"
+echo " Deploy listo"
+echo "════════════════════════════════════════════════════════════"
+echo
+echo "API + health:"
 echo "  curl http://127.0.0.1:${API_PORT}/health"
-echo "  curl http://100.68.57.77:${API_PORT}/health"
 echo
-echo "En las PCs de escritorio, URL default (Tailscale):"
-echo "  http://100.68.57.77:${API_PORT}"
+echo "PWA móvil (misma URL — agregar a pantalla de inicio):"
+echo "  ${PUBLIC}/"
+echo "  ${LAN}/"
+echo
+echo "PCs de escritorio (Tauri — instalar binario, no usa la PWA):"
+echo "  ./scripts/build_desktop.sh"
+echo "  URL default del cliente: ${PUBLIC}"
+echo
+echo "Verificación rápida:"
+echo "  curl -fsS http://127.0.0.1:${API_PORT}/health | head -c 200 && echo"
+echo "  curl -fsS -o /dev/null -w 'PWA index: HTTP %{http_code}\n' http://127.0.0.1:${API_PORT}/"
+echo "  curl -fsS -o /dev/null -w 'manifest: HTTP %{http_code}\n' http://127.0.0.1:${API_PORT}/manifest.webmanifest"

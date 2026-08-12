@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.services.agent import (
+    DEFAULT_SPEED_MODE,
+    SPEED_MODE_TOP_K,
     STATUS_APPROVAL,
     get_pending_approval,
     run_agent,
@@ -26,6 +28,15 @@ router = APIRouter(prefix="/api", tags=["chat"])
 class ChatRequest(BaseModel):
     session_id: UUID
     message: str = Field(..., min_length=1)
+    speed_mode: Optional[str] = DEFAULT_SPEED_MODE  # "fast" | "balanced" | "deep"
+
+    @field_validator("speed_mode")
+    @classmethod
+    def _validate_speed_mode(cls, value: str | None) -> str:
+        normalized = (value or DEFAULT_SPEED_MODE).lower()
+        if normalized not in SPEED_MODE_TOP_K:
+            return DEFAULT_SPEED_MODE
+        return normalized
 
 
 class ChatResponse(BaseModel):
@@ -107,7 +118,9 @@ def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
         )
 
     try:
-        outcome = run_agent(db, payload.session_id, payload.message)
+        outcome = run_agent(
+            db, payload.session_id, payload.message, speed_mode=payload.speed_mode
+        )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"Error del agente: {exc}") from exc
 

@@ -30,12 +30,27 @@ logger = logging.getLogger(__name__)
 STATUS_OK = "agent"
 STATUS_APPROVAL = "REQUIRES_APPROVAL"
 
-SYSTEM_PROMPT = (
-    "Sos el asistente técnico oficial de la oficina de Irrigación de Malargüe. "
-    "Respondé basándote en el contexto documental y el historial. "
-    "Sé directo, técnico y profesional. "
-    "Si el contexto no alcanza para responder con certeza, indicalo claramente "
-    "sin inventar datos, normas ni caudales.\n\n"
+SYSTEM_PROMPT_IRRIGACION = """
+Sos un colega técnico y asistente virtual experto en la oficina de Irrigación de Malargüe.
+Tu objetivo es ayudar al personal de la oficina a resolver dudas sobre normativas, padrones, trámites, cálculos hidráulicos y gestión de expedientes.
+
+### PERSONALIDAD Y TONO DE COMUNICACIÓN:
+1. **Colega técnico e informado:** Hablá de forma natural, amigable, clara y directa. Olvidate del lenguaje burocrático, rígido o sobrecargado de etiqueta.
+2. **CERO ADULACIÓN Y CERO "SÍ A TODO":** No le des la razón al usuario por educación ni alabes sus propuestas si son incorrectas, ineficientes o inviables.
+3. **CRÍTICA CRUDA Y HONESTIDAD:** Si el usuario te plantea una idea floja, un cálculo dudoso o un procedimiento que va contra la normativa de Irrigación o las buenas prácticas, decíselo de frente. Señalá la debilidad o el error con respeto técnico, sin rodeos ni palabras bonitas, y proponé la alternativa correcta.
+4. **FORMATO FLEXIBLE:** Adaptá el formato de respuesta a lo que pida la situación (pueden ser listas con viñetas, tablas en Markdown para datos numéricos, un resumen de dos oraciones o una explicación técnica detallada). No uses siempre la misma estructura fija.
+
+### LÍMITES, HONESTIDAD Y MANEJO DE INFORMACIÓN:
+1. **Prioridad Contexto Local (RAG):** Evaluá primero la información proveniente de los documentos locales de la base de datos de Irrigación.
+2. **Búsquedas Externas / Internet:** Si no encontrás la respuesta en la base local y tenés que recurrir a búsquedas web o conocimientos generales fuera del contexto local, es OBLIGATORIO que antecedas o cierres tu respuesta aclarando exactamente esto:
+   > "Che, no tengo la información necesaria en la base local de Irrigación, así que la busqué en internet/conocimiento general. Revisá bien la respuesta antes de tomar una decisión institucional."
+3. **Prohibido Alucinar:** Si no sabés algo ni podés verificarlo en el contexto provisto, decí directamente que no tenés el dato.
+
+### NIVELES DE HERRAMIENTAS Y PERMISOS:
+- Operás por defecto con permisos de nivel ADMINISTRATIVO ALTO. Tenés acceso a herramientas de redacción de documentos, búsquedas en base vectorial y cálculos técnicos.
+""".strip()
+
+SKILL_TOOLING_HINT = (
     "Herramientas: no tenés calculadoras locales bindeadas. Si el usuario pide un "
     "cálculo, conversión de unidades, prorrateo de turno, lámina o tiempo de riego "
     "(u otra automatización que no esté resuelta por los documentos), DEBÉS llamar "
@@ -43,6 +58,20 @@ SYSTEM_PROMPT = (
     "buscá la skill. Extraé los números del mensaje en arguments_json. "
     "Si podés responder solo con el contexto RAG, respondé en texto sin tools."
 )
+
+# Alias retrocompatible: el resto del módulo referenciaba SYSTEM_PROMPT.
+SYSTEM_PROMPT = SYSTEM_PROMPT_IRRIGACION
+
+SPEED_MODE_TOP_K: dict[str, int] = {
+    "fast": 2,
+    "balanced": 5,
+    "deep": 10,
+}
+DEFAULT_SPEED_MODE = "deep"
+
+
+def _resolve_top_k(speed_mode: str | None) -> int:
+    return SPEED_MODE_TOP_K.get((speed_mode or DEFAULT_SPEED_MODE).lower(), SPEED_MODE_TOP_K[DEFAULT_SPEED_MODE])
 
 CATALOG_HINT = (
     "Catálogo de skills (buscar con search_skill_marketplace): "
@@ -54,6 +83,7 @@ CATALOG_HINT = (
 class AgentState(TypedDict):
     session_id: str
     user_message: str
+    speed_mode: NotRequired[str]
     history: list[dict]
     retrieved_docs: list[str]
     query_embedding: list[float]
@@ -116,6 +146,7 @@ def _history_messages(history: list[dict]) -> list:
 def _retrieve_node(state: AgentState, db: Session) -> dict:
     embedding = embed_query(state["user_message"])
     literal = _embedding_literal(embedding)
+    top_k = _resolve_top_k(state.get("speed_mode"))
 
     rows = db.execute(
         text(
@@ -127,10 +158,10 @@ def _retrieve_node(state: AgentState, db: Session) -> dict:
             FROM document_chunks
             WHERE embedding IS NOT NULL
             ORDER BY embedding <=> CAST(:embedding AS vector)
-            LIMIT 4
+            LIMIT :top_k
             """
         ),
-        {"embedding": literal},
+        {"embedding": literal, "top_k": top_k},
     ).mappings().all()
 
     docs: list[str] = []
@@ -185,7 +216,8 @@ def _parse_tool_arguments(raw_args: dict[str, Any], user_message: str) -> tuple[
 def _plan_node(state: AgentState) -> dict:
     llm = _llm(tools=True)
     messages: list = [
-        SystemMessage(content=SYSTEM_PROMPT),
+        SystemMessage(content=SYSTEM_PROMPT_IRRIGACION),
+        SystemMessage(content=SKILL_TOOLING_HINT),
         SystemMessage(content=CATALOG_HINT),
         SystemMessage(
             content="Contexto documental recuperado (RAG):\n\n"
@@ -424,11 +456,19 @@ def get_pending_approval(db: Session, session_id: UUID | str) -> dict[str, Any] 
     return extract_interrupt_payload(snapshot)
 
 
-def run_agent(db: Session, session_id: UUID | str, user_message: str) -> AgentOutcome:
+def run_agent(
+    db: Session,
+    session_id: UUID | str,
+    user_message: str,
+    speed_mode: str | None = DEFAULT_SPEED_MODE,
+) -> AgentOutcome:
     """Ejecuta el grafo. Puede devolver REQUIRES_APPROVAL si hay HITL."""
     compiled = build_agent_graph(db)
     sid = str(session_id)
     config = _thread_config(sid)
+    resolved_speed_mode = (speed_mode or DEFAULT_SPEED_MODE).lower()
+    if resolved_speed_mode not in SPEED_MODE_TOP_K:
+        resolved_speed_mode = DEFAULT_SPEED_MODE
 
     pending = extract_interrupt_payload(compiled.get_state(config))
     if pending:
@@ -450,6 +490,7 @@ def run_agent(db: Session, session_id: UUID | str, user_message: str) -> AgentOu
             {
                 "session_id": sid,
                 "user_message": user_message,
+                "speed_mode": resolved_speed_mode,
                 "history": [],
                 "retrieved_docs": [],
                 "query_embedding": [],

@@ -1,5 +1,7 @@
 import { getApiBaseUrl } from "./config";
 
+export type SpeedMode = "fast" | "balanced" | "deep";
+
 export type ChatMessage = {
   role: "user" | "assistant" | string;
   message: string;
@@ -57,11 +59,12 @@ async function parseError(res: Response): Promise<string> {
 export async function sendChat(
   sessionId: string,
   message: string,
+  speedMode: SpeedMode = "deep",
 ): Promise<ChatResponse> {
   const res = await fetch(`${getApiBaseUrl()}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ session_id: sessionId, message }),
+    body: JSON.stringify({ session_id: sessionId, message, speed_mode: speedMode }),
   });
   if (!res.ok) throw new Error(await parseError(res));
   return res.json();

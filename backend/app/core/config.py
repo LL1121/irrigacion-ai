@@ -40,6 +40,10 @@ class Settings(BaseSettings):
 
     cors_origins: str = "*"
 
+    # Override opcional del directorio con el build de la PWA (desktop-app/dist).
+    # Si queda vacío, main.py lo ubica con rutas relativas conocidas.
+    frontend_dist_dir: str = ""
+
     @property
     def is_production(self) -> bool:
         return self.app_env.lower() in {"production", "prod"}
