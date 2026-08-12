@@ -599,50 +599,350 @@ def looks_like_skill_intent(text: str) -> bool:
 
 def match_catalog_by_keywords(text: str) -> dict[str, Any] | None:
     """Coincidencia directa de palabras clave del usuario contra skills locales."""
-    lowered = (text or "").lower()
-    best: SkillRecord | None = None
-    best_score = 0
-    for skill in CATALOG:
-        score = 0
-        for keyword in _SKILL_KEYWORDS.get(skill["id"], ()):
-            if keyword in lowered:
-                score += 2
-        for tag in skill["tags"]:
-            if len(tag) >= 3 and tag in lowered:
-                score += 1
-        if score > best_score:
-            best_score = score
-            best = skill
-    if best is None or best_score < 2:
+    ranked = rank_catalog_skills(text)
+    if not ranked:
+        return None
+    best, best_score = ranked[0]
+    if best_score < 4:
+        return None
+    if len(ranked) > 1 and best_score - ranked[1][1] < 2:
         return None
     return search_catalog(best["name"], infer_arguments(best["id"], text))
 
 
+def rank_catalog_skills(task: str) -> list[tuple[SkillRecord, int]]:
+    """Puntúa todas las skills del catálogo (mayor = más pertinente)."""
+    tokens = _tokenize(task)
+    # Filtrar tokens demasiado genéricos que ensucian el score.
+    stop = {
+        "para",
+        "como",
+        "qué",
+        "que",
+        "una",
+        "unos",
+        "unas",
+        "los",
+        "las",
+        "del",
+        "con",
+        "por",
+        "hay",
+        "esta",
+        "este",
+        "esto",
+        "desde",
+        "sobre",
+        "me",
+        "te",
+        "se",
+        "le",
+        "de",
+        "la",
+        "el",
+        "en",
+        "un",
+        "al",
+        "lo",
+        "y",
+        "o",
+        "a",
+    }
+    tokens = {t for t in tokens if t not in stop and len(t) > 2}
+    lowered_task = (task or "").lower()
+    ranked: list[tuple[SkillRecord, int]] = []
+    for skill in CATALOG:
+        haystack = " ".join(
+            [skill["id"], skill["name"], skill["description"], " ".join(skill["tags"])]
+        ).lower()
+        score = sum(1 for token in tokens if token in haystack)
+        if skill["id"] in lowered_task or skill["name"].lower() in lowered_task:
+            score += 5
+        for keyword in _SKILL_KEYWORDS.get(skill["id"], ()):
+            if keyword in lowered_task:
+                score += 3
+        # Tags exactos (palabra completa) pesan más que substring accidental.
+        for tag in skill["tags"]:
+            if len(tag) >= 4 and re.search(rf"\b{re.escape(tag)}\b", lowered_task):
+                score += 2
+        if score > 0:
+            ranked.append((skill, score))
+    ranked.sort(key=lambda item: item[1], reverse=True)
+    return ranked
+
+
 def find_local_skill(task: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Busca una skill instalada que pueda resolver la tarea."""
-    # Pedidos web no deben mapear a skills de cálculo/Word del catálogo.
+    """Busca una skill instalada con match de alta confianza."""
+    available = [
+        {"id": s["id"], "name": s["name"], "description": s["description"]}
+        for s in CATALOG
+    ]
     if looks_like_web_or_external_request(task):
+        return {"found": False, "query": task, "available": available, "reason": "web_request"}
+
+    ranked = rank_catalog_skills(task)
+    if not ranked:
+        return {"found": False, "query": task, "available": available, "reason": "no_signal"}
+
+    best, best_score = ranked[0]
+    second_score = ranked[1][1] if len(ranked) > 1 else 0
+
+    # Ambigüedad: dos skills competidoras sin margen claro.
+    if best_score >= 3 and second_score >= 3 and (best_score - second_score) < 2:
         return {
             "found": False,
             "query": task,
-            "available": [
-                {"id": s["id"], "name": s["name"], "description": s["description"]}
-                for s in CATALOG
+            "available": available,
+            "ambiguous": True,
+            "candidates": [
+                {
+                    "id": s["id"],
+                    "name": s["name"],
+                    "description": s["description"],
+                    "score": sc,
+                }
+                for s, sc in ranked[:3]
             ],
+            "reason": "ambiguous",
         }
 
-    keyword_hit = match_catalog_by_keywords(task)
-    if keyword_hit and keyword_hit.get("found"):
-        # Exigir señal real de keywords (score de match_catalog >= 2 ya filtrado).
-        return keyword_hit
+    # Umbral alto: evita matches flojos (ej. un número suelto).
+    if best_score < 4:
+        return {
+            "found": False,
+            "query": task,
+            "available": available,
+            "top_score": best_score,
+            "reason": "low_confidence",
+        }
 
-    result = search_catalog(task, arguments or {"query": task})
-    if result.get("found"):
-        score = int(result.get("score") or 0)
-        # Nunca promover un match débil solo porque el mensaje es un "pedido de acción".
-        if score >= 3:
-            return result
-    return {**(result if isinstance(result, dict) else {}), "found": False, "query": task}
+    resolved_args = arguments or {}
+    inferred = infer_arguments(best["id"], task)
+    merged_args = {**inferred, **{k: v for k, v in resolved_args.items() if v not in (None, "", {})}}
+    return {
+        "found": True,
+        "id": best["id"],
+        "name": best["name"],
+        "description": best["description"],
+        "code": best["code"],
+        "arguments": merged_args,
+        "score": best_score,
+        "confidence": "high" if best_score - second_score >= 3 else "medium",
+    }
+
+
+def missing_fields_for_skill(skill_id: str, args: dict[str, Any]) -> list[str]:
+    """Campos requeridos que aún faltan (ids de schema)."""
+    schema = SKILL_ARG_SCHEMAS.get(skill_id)
+    if not schema:
+        return []
+    missing: list[str] = []
+    for key in schema.get("required") or []:
+        if key == "partes":
+            partes = args.get("partes") or args.get("derechos")
+            if not isinstance(partes, list) or not partes:
+                missing.append(key)
+            continue
+        if not _numeric_ready(args.get(key)):
+            missing.append(key)
+    if skill_id == "lamina_riego":
+        if not (
+            _numeric_ready(args.get("superficie_ha"))
+            or _numeric_ready(args.get("superficie_m2"))
+        ):
+            if "superficie_ha" not in missing and "superficie_m2" not in missing:
+                missing.append("superficie_ha_o_m2")
+    if skill_id == "tiempo_riego":
+        if not (
+            _numeric_ready(args.get("caudal_ls")) or _numeric_ready(args.get("caudal_m3s"))
+        ):
+            missing.append("caudal_ls_o_m3s")
+    return missing
+
+
+def clarifying_question_for_skill(
+    skill: dict[str, Any],
+    missing: list[str],
+    *,
+    ambiguous_candidates: list[dict[str, Any]] | None = None,
+) -> str:
+    """Pregunta concreta al usuario cuando falta claridad o datos."""
+    if ambiguous_candidates:
+        options = "\n".join(
+            f"- **{c.get('name')}**: {c.get('description')}" for c in ambiguous_candidates[:4]
+        )
+        return (
+            "No estoy 100% seguro de qué herramienta usar. "
+            "¿Cuál de estas necesitás?\n\n"
+            f"{options}\n\n"
+            "Respondeme con el nombre de la que corresponde (o reformulá el pedido)."
+        )
+
+    skill_name = skill.get("name") or skill.get("id") or "la skill"
+    schema = SKILL_ARG_SCHEMAS.get(str(skill.get("id") or ""), {})
+    labels = dict(schema.get("fields") or {})
+    label_map = {
+        **labels,
+        "superficie_ha_o_m2": "superficie (ha o m²)",
+        "caudal_ls_o_m3s": "caudal (L/s o m³/s)",
+        "partes": "partes/derechos con sus pesos (acciones o ha)",
+    }
+    needed = [label_map.get(m, m) for m in missing]
+    if not needed:
+        return (
+            f"Para usar **{skill_name}** me faltan datos. "
+            "¿Me pasás los valores con unidades?"
+        )
+    bullets = "\n".join(f"- {item}" for item in needed)
+    return (
+        f"Entiendo que querés usar **{skill_name}**, pero me faltan datos concretos:\n\n"
+        f"{bullets}\n\n"
+        "Pasámelos en un mensaje (con unidades) y lo calculo."
+    )
+
+
+def clarifying_question_for_unknown(user_message: str) -> str:
+    """Cuando el pedido es acción pero no hay match claro ni conviene adivinar."""
+    lowered = (user_message or "").lower()
+    if looks_like_web_or_external_request(user_message):
+        return (
+            "Puedo generar/descargar una skill para consultar esa web/API. "
+            "Antes confirmame:\n"
+            "- ¿Qué dato exacto necesitás? (ej. altura, caudal, última medición)\n"
+            "- ¿Código de punto/estación? (ej. 10009)\n"
+            "- ¿La URL es esa misma u otra endpoint/API?\n\n"
+            "Si ya está todo en tu mensaje, respondé **sí, descargá la skill**."
+        )
+    examples = ", ".join(s["name"] for s in CATALOG[:4])
+    return (
+        "No terminé de entender qué automatización necesitás. "
+        "¿Podés decirme en una frase qué resultado querés y con qué datos?\n\n"
+        f"Ejemplos de lo que sí puedo hacer del catálogo: {examples}, "
+        "o generar un Word / consultar una web institucional.\n\n"
+        "Si querés que arme una skill nueva para algo fuera del catálogo, "
+        "decime **descargá una skill** y describí la tarea."
+    )
+
+
+def resolve_skill_decision(
+    user_message: str,
+    arguments: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Decisión endurecida de skills.
+
+    action:
+      - execute: skill local clara (puede faltar HITL afuera)
+      - download: pedido web/externo o acción clara sin skill local
+      - clarify: falta certeza o faltan argumentos
+      - none: no parece pedido de skill
+    """
+    text = user_message or ""
+    lowered = text.lower().strip()
+    if not lowered:
+        return {"action": "none", "confidence": 0.0}
+
+    # Confirmación explícita de descarga tras una aclaración previa.
+    if re.search(
+        r"(?:s[ií]|dale|ok|okay).{0,30}descarg"
+        r"|descarg(?:á|a|ar).{0,40}skill"
+        r"|gener(?:á|a|ar).{0,40}skill"
+        r"|busc(?:á|a|ar).{0,40}skill",
+        lowered,
+    ):
+        return {
+            "action": "download",
+            "confidence": 0.9,
+            "reason": "explicit_download_confirm",
+        }
+
+    if not (is_action_request(text) or should_try_skill_marketplace(text)):
+        return {"action": "none", "confidence": 0.0}
+
+    # Web/URL: no adivinar catálogo; pedir confirmación corta o download directo
+    # si el pedido ya trae URL + dato concreto.
+    if looks_like_web_or_external_request(text):
+        has_url = contains_url(text)
+        has_target = bool(
+            re.search(
+                r"(?:punto|estación|estacion|código|codigo|id)\s*[:#-]?\s*\d{3,8}"
+                r"|\b\d{4,6}\b",
+                text,
+                re.I,
+            )
+        )
+        wants_metric = any(
+            k in text.lower()
+            for k in ("altura", "caudal", "nivel", "dato", "medición", "medicion", "valor")
+        )
+        if has_url and (has_target or wants_metric):
+            return {
+                "action": "download",
+                "confidence": 0.85,
+                "reason": "web_request_clear",
+            }
+        return {
+            "action": "clarify",
+            "confidence": 0.4,
+            "reply": clarifying_question_for_unknown(text),
+            "reason": "web_request_unclear",
+        }
+
+    found = find_local_skill(text, arguments)
+    if found.get("ambiguous"):
+        return {
+            "action": "clarify",
+            "confidence": 0.45,
+            "reply": clarifying_question_for_skill(
+                {},
+                [],
+                ambiguous_candidates=found.get("candidates") or [],
+            ),
+            "reason": "ambiguous_catalog",
+            "candidates": found.get("candidates"),
+        }
+
+    if found.get("found"):
+        args = dict(found.get("arguments") or {})
+        missing = missing_fields_for_skill(str(found.get("id") or ""), args)
+        # Word: el contenido se genera; no pedir args numéricos.
+        if str(found.get("id")) == "generar_documento_word":
+            missing = []
+        if missing:
+            return {
+                "action": "clarify",
+                "confidence": 0.55,
+                "skill": found,
+                "missing": missing,
+                "reply": clarifying_question_for_skill(found, missing),
+                "reason": "missing_arguments",
+            }
+        conf = 0.9 if found.get("confidence") == "high" else 0.7
+        return {
+            "action": "execute",
+            "confidence": conf,
+            "skill": found,
+            "reason": "local_match",
+        }
+
+    # Acción clara sin match: ofrecer descarga, no inventar skill local.
+    if is_action_request(text) or should_try_skill_marketplace(text):
+        # Si es muy vago ("podés hacer algo?"), preguntar.
+        tokens = _tokenize(text)
+        if len(tokens) < 4 and not re.search(r"\d", text):
+            return {
+                "action": "clarify",
+                "confidence": 0.35,
+                "reply": clarifying_question_for_unknown(text),
+                "reason": "vague_action",
+            }
+        return {
+            "action": "download",
+            "confidence": 0.65,
+            "reason": found.get("reason") or "no_local_skill",
+        }
+
+    return {"action": "none", "confidence": 0.0}
 
 
 def download_remote_prompt() -> str:
@@ -654,7 +954,17 @@ def download_remote_prompt() -> str:
 
 
 def _extract_numbers(text: str) -> list[float]:
-    raw = re.findall(r"(\d+(?:[.,]\d+)?)", text or "")
+    """Extrae cantidades; ignora dígitos que son parte de unidades (m3, m2, etc.)."""
+    cleaned = text or ""
+    cleaned = re.sub(
+        r"(?i)(?:\b(?:ha|cm|mm|l/?s|lps|m3/s|m³/s|m3/h|m3/d)\b"
+        r"|(?<=\d)\s*m[²³23]\b"
+        r"|\bm[²³23]\b"
+        r"|m\^[23]|m³|m²)",
+        " ",
+        cleaned,
+    )
+    raw = re.findall(r"(\d+(?:[.,]\d+)?)", cleaned)
     out: list[float] = []
     for item in raw:
         try:
@@ -694,21 +1004,29 @@ def infer_arguments(skill_id: str, user_message: str) -> dict[str, Any]:
         if pesos:
             args["partes"] = [{"nombre": f"parte_{i+1}", "peso": float(p.replace(",", "."))} for i, p in enumerate(pesos)]
     elif skill_id == "lamina_riego":
-        if numbers:
-            args["volumen_m3"] = numbers[0]
+        # Solo asignar volumen si el texto habla de volumen/lámina (no un "punto 10009").
+        if any(k in lowered for k in ("volumen", "m3", "m³", "lamina", "lámina", "mm")):
+            if numbers:
+                args["volumen_m3"] = numbers[0]
+                if len(numbers) > 1:
+                    if re.search(r"\bha\b|hect", lowered):
+                        args["superficie_ha"] = numbers[1]
+                    elif re.search(r"m[²2]|metro", lowered):
+                        args["superficie_m2"] = numbers[1]
+                    # Sin unidad de superficie → no adivinar el 2.º número.
+        elif re.search(r"\bha\b|hect", lowered) and numbers:
+            args["superficie_ha"] = numbers[0]
             if len(numbers) > 1:
-                if "ha" in lowered:
-                    args["superficie_ha"] = numbers[1]
-                else:
-                    args["superficie_m2"] = numbers[1]
+                args["volumen_m3"] = numbers[1]
     elif skill_id == "tiempo_riego":
-        if numbers:
-            args["volumen_m3"] = numbers[0]
-            if len(numbers) > 1:
-                if "l/s" in lowered or "l/s" in lowered:
-                    args["caudal_ls"] = numbers[1]
-                else:
-                    args["caudal_m3s"] = numbers[1]
+        if any(k in lowered for k in ("volumen", "m3", "m³", "tiempo", "regar", "caudal")):
+            if numbers:
+                args["volumen_m3"] = numbers[0]
+                if len(numbers) > 1:
+                    if "l/s" in lowered or "lps" in lowered or "litro" in lowered:
+                        args["caudal_ls"] = numbers[1]
+                    elif re.search(r"m[³3]/s|caudal", lowered):
+                        args["caudal_m3s"] = numbers[1]
     elif skill_id == "generar_documento_word":
         title_match = re.search(
             r"(?:titulo|título)\s*[:\-]\s*(.+)$", text, re.I | re.M
@@ -1060,32 +1378,14 @@ def _tokenize(text: str) -> set[str]:
 
 def search_catalog(task: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     """Busca la skill más pertinente en el catálogo institucional."""
-    tokens = _tokenize(task)
-    lowered_task = (task or "").lower()
-    best: SkillRecord | None = None
-    best_score = 0
-    for skill in CATALOG:
-        haystack = " ".join(
-            [skill["id"], skill["name"], skill["description"], " ".join(skill["tags"])]
-        ).lower()
-        score = sum(1 for token in tokens if token in haystack)
-        if skill["id"] in lowered_task or skill["name"].lower() in lowered_task:
-            score += 4
-        for keyword in _SKILL_KEYWORDS.get(skill["id"], ()):
-            if keyword in lowered_task:
-                score += 2
-        if score > best_score:
-            best_score = score
-            best = skill
-    if best is None or best_score < 1:
-        return {
-            "found": False,
-            "query": task,
-            "available": [
-                {"id": s["id"], "name": s["name"], "description": s["description"]}
-                for s in CATALOG
-            ],
-        }
+    ranked = rank_catalog_skills(task)
+    available = [
+        {"id": s["id"], "name": s["name"], "description": s["description"]}
+        for s in CATALOG
+    ]
+    if not ranked or ranked[0][1] < 1:
+        return {"found": False, "query": task, "available": available}
+    best, best_score = ranked[0]
     resolved_args = arguments or {}
     if best["id"] == "generar_documento_word" or not any(
         k not in {"query", "raw", "valor"} for k in resolved_args

@@ -33,6 +33,7 @@ from app.services.skill_marketplace import (
     looks_like_web_or_external_request,
     prepare_skill_arguments,
     reply_is_capability_refusal,
+    resolve_skill_decision,
     search_catalog,
     search_skill_marketplace,
     should_try_skill_marketplace,
@@ -67,10 +68,10 @@ Tu objetivo es ayudar al personal de la oficina a resolver dudas sobre normativa
 
 ### PERSONALIZACIÓN (MUY IMPORTANTE):
 1. **Seguí el formato pedido:** Si pide tabla, viñetas, pasos numerados, “breve”, “formal” o “en criollo”, obedecé eso en la respuesta.
-2. **Inferí intención:** Si el pedido es ambiguo pero razonable, elegí la interpretación más útil para la oficina y aclará en una línea qué asumiste.
+2. **Inferí intención con cuidado:** Si el pedido es ambiguo, NO adivines la herramienta. Preguntá en concreto qué dato falta o qué skill corresponde.
 3. **Pedí solo lo imprescindible:** Si faltan datos para un cálculo, pedí únicamente esos datos (con unidades), no un cuestionario largo.
 4. **Consistencia en la conversación:** Si el usuario ya eligió un estilo o unidad, mantenelo salvo que diga lo contrario.
-5. **Skills con criterio:** Cuando uses herramientas/skills, pasá bien los números/unidades y respetá cualquier formato de salida que haya pedido (incluido Word con títulos, listas o tablas).
+5. **Skills con criterio:** Cuando uses herramientas/skills, pasá bien los números/unidades. Si no estás seguro de la skill, preguntá antes de ejecutar.
 
 ### LÍMITES, HONESTIDAD Y MANEJO DE INFORMACIÓN:
 1. **Prioridad Contexto Local (RAG):** Evaluá primero la información proveniente de los documentos locales de la base de datos de Irrigación.
@@ -83,14 +84,13 @@ Tu objetivo es ayudar al personal de la oficina a resolver dudas sobre normativa
 """.strip()
 
 SKILL_TOOLING_HINT = (
-    "Herramientas: no tenés calculadoras locales bindeadas. Si el usuario pide un "
-    "cálculo, conversión, prorrateo, lámina, tiempo de riego, documento Word, "
-    "consultar una página/URL, telemetría u otra automatización que no puedas resolver "
-    "solo con los documentos, DEBÉS llamar a search_skill_marketplace. "
-    "NUNCA digas que no podés acceder a internet o a una web: si no hay skill local, "
-    "igual llamá a search_skill_marketplace (el sistema ofrecerá descargar una). "
-    "No inventes números ni archivos. Extraé URLs, puntos, unidades y datos en "
-    "arguments_json. Si podés responder solo con RAG, respondé en texto sin tools."
+    "Herramientas: si el usuario pide un cálculo, Word, consultar una URL/telemetría u otra "
+    "automatización, DEBÉS llamar a search_skill_marketplace. "
+    "NUNCA digas que no podés acceder a internet: buscá/descargá skill. "
+    "Matching estricto: no asumas lámina/caudal/tiempo solo por un número suelto. "
+    "Si el pedido es ambiguo o faltan datos (área, caudal, superficie, punto, unidad), "
+    "NO elijas una skill al azar ni inventes valores: preguntá específicamente lo que falta. "
+    "Extraé URLs, puntos y unidades en arguments_json solo cuando estén claros en el mensaje."
 )
 
 # Alias retrocompatible: el resto del módulo referenciaba SYSTEM_PROMPT.
@@ -266,56 +266,58 @@ def _auto_execute_skill_state(skill: dict[str, Any]) -> dict[str, Any]:
 
 
 def _force_skill_or_download(user_message: str) -> dict[str, Any]:
-    """Si no hay skill local adecuada, pedir descarga remota (nunca rendirse)."""
-    # Pedidos web/URL: el catálogo local (cálculos/Word) no aplica → descarga.
-    if looks_like_web_or_external_request(user_message):
+    """Resuelve skill con criterio estricto; si duda, pregunta."""
+    return _plan_from_decision(resolve_skill_decision(user_message))
+
+
+def _plan_from_decision(decision: dict[str, Any]) -> dict[str, Any]:
+    action = decision.get("action")
+    if action == "clarify":
+        return {
+            "pending_skill": None,
+            "needs_approval": False,
+            "approval_kind": None,
+            "reply": decision.get("reply")
+            or "¿Me podés aclarar qué necesitás exactamente?",
+        }
+    if action == "execute":
+        skill = decision.get("skill") or {}
+        if not skill.get("found"):
+            return {
+                "pending_skill": None,
+                "approval_kind": APPROVAL_KIND_DOWNLOAD,
+                "needs_approval": True,
+                "reply": "",
+            }
+        if is_whitelisted(str(skill.get("id") or ""), str(skill.get("code") or "")):
+            return _auto_execute_skill_state(skill)
+        return {
+            "pending_skill": skill,
+            "approval_kind": APPROVAL_KIND_EXECUTE,
+            "needs_approval": True,
+            "reply": "",
+        }
+    if action == "download":
         return {
             "pending_skill": None,
             "approval_kind": APPROVAL_KIND_DOWNLOAD,
             "needs_approval": True,
             "reply": "",
         }
-    resolved = _resolve_skill_plan(
-        user_message, {"query": user_message}, user_message
-    )
-    if resolved:
-        return resolved
     return {
         "pending_skill": None,
-        "approval_kind": APPROVAL_KIND_DOWNLOAD,
-        "needs_approval": True,
+        "needs_approval": False,
+        "approval_kind": None,
         "reply": "",
     }
 
 
 def _resolve_skill_plan(task: str, arguments: dict[str, Any], user_message: str) -> dict[str, Any] | None:
-    """Evalúa skills locales; si no hay match y es un pedido de acción, pide descarga."""
-    if not (is_action_request(user_message) or should_try_skill_marketplace(user_message)):
+    """Evalúa skills con matching endurecido + aclaraciones."""
+    decision = resolve_skill_decision(user_message, arguments)
+    if decision.get("action") == "none":
         return None
-    # No forzar una skill de cálculo/Word ante un pedido de web/telemetría.
-    if looks_like_web_or_external_request(user_message):
-        return {
-            "pending_skill": None,
-            "approval_kind": APPROVAL_KIND_DOWNLOAD,
-            "needs_approval": True,
-            "reply": "",
-        }
-    found = find_local_skill(task, arguments)
-    if found.get("found"):
-        if is_whitelisted(str(found.get("id") or ""), str(found.get("code") or "")):
-            return _auto_execute_skill_state(found)
-        return {
-            "pending_skill": found,
-            "approval_kind": APPROVAL_KIND_EXECUTE,
-            "needs_approval": True,
-            "reply": "",
-        }
-    return {
-        "pending_skill": None,
-        "approval_kind": APPROVAL_KIND_DOWNLOAD,
-        "needs_approval": True,
-        "reply": "",
-    }
+    return _plan_from_decision(decision)
 
 
 def _plan_node(state: AgentState) -> dict:
@@ -378,13 +380,14 @@ def _plan_node(state: AgentState) -> dict:
         resolved = _resolve_skill_plan(task, arguments, state["user_message"])
         if resolved:
             return resolved
-        if is_action_request(state["user_message"]):
-            return {
-                "pending_skill": None,
-                "approval_kind": APPROVAL_KIND_DOWNLOAD,
-                "needs_approval": True,
-                "reply": "",
-            }
+        # Re-evaluar con el mensaje completo (el task del tool a veces es pobre).
+        forced = _force_skill_or_download(state["user_message"])
+        if (
+            forced.get("reply")
+            or forced.get("needs_approval")
+            or forced.get("pending_skill")
+        ):
+            return forced
         available = ", ".join(
             s["name"] for s in search_catalog(task, arguments).get("available") or []
         )
@@ -393,7 +396,8 @@ def _plan_node(state: AgentState) -> dict:
             "needs_approval": False,
             "reply": (
                 "No encontré una skill en el catálogo para esa tarea. "
-                f"Disponibles: {available or '(ninguna)'}."
+                f"Disponibles: {available or '(ninguna)'}. "
+                "¿Me aclarás qué resultado querés y con qué datos?"
             ),
         }
 
