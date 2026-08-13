@@ -26,10 +26,12 @@ from app.services.sandbox import execute_skill_sync
 from app.services.skill_marketplace import (
     APPROVAL_KIND_DOWNLOAD,
     APPROVAL_KIND_EXECUTE,
+    conversation_context_text,
     detect_response_style,
     download_remote_prompt,
     find_local_skill,
     is_action_request,
+    is_result_challenge_or_correction,
     looks_like_web_or_external_request,
     prepare_skill_arguments,
     reply_is_capability_refusal,
@@ -37,8 +39,9 @@ from app.services.skill_marketplace import (
     search_catalog,
     search_skill_marketplace,
     should_try_skill_marketplace,
+    thread_brief_for_prompt,
 )
-from app.services.skill_remote import generate_remote_skill
+from app.services.skill_remote import generate_remote_skill, validate_remote_skill
 from app.services.skill_whitelist import is_whitelisted
 from app.services.token_guard import (
     dumps_capped,
@@ -72,6 +75,7 @@ Tu objetivo es ayudar al personal de la oficina a resolver dudas sobre normativa
 3. **Pedí solo lo imprescindible:** Si faltan datos para un cálculo, pedí únicamente esos datos (con unidades), no un cuestionario largo.
 4. **Consistencia en la conversación:** Si el usuario ya eligió un estilo o unidad, mantenelo salvo que diga lo contrario.
 5. **Skills con criterio:** Cuando uses herramientas/skills, pasá bien los números/unidades. Si no estás seguro de la skill, preguntá antes de ejecutar.
+6. **SEGUÍ EL HILO:** Cada mensaje es continuación del mismo chat. No trates el último mensaje como un pedido nuevo aislado. Si ya hay URL, punto o dato en el historial, usalos. Si el usuario corrige un resultado ("de dónde sacaste…", "en la página dice…"), respondé sobre ese resultado; no reinicies el cuestionario de skills.
 
 ### LÍMITES, HONESTIDAD Y MANEJO DE INFORMACIÓN:
 1. **Prioridad Contexto Local (RAG):** Evaluá primero la información proveniente de los documentos locales de la base de datos de Irrigación.
@@ -90,7 +94,9 @@ SKILL_TOOLING_HINT = (
     "Matching estricto: no asumas lámina/caudal/tiempo solo por un número suelto. "
     "Si el pedido es ambiguo o faltan datos (área, caudal, superficie, punto, unidad), "
     "NO elijas una skill al azar ni inventes valores: preguntá específicamente lo que falta. "
-    "Extraé URLs, puntos y unidades en arguments_json solo cuando estén claros en el mensaje."
+    "Extraé URLs, puntos y unidades del HILO COMPLETO (historial + mensaje), no solo del último texto. "
+    "Si el usuario solo confirma ('sí, descargá') o completa un dato (pega una URL), "
+    "continuá la tarea abierta del historial; no armes una skill meta de 'descargar skill'."
 )
 
 # Alias retrocompatible: el resto del módulo referenciaba SYSTEM_PROMPT.
@@ -225,7 +231,7 @@ def _fetch_history_node(state: AgentState, db: Session) -> dict:
             FROM chat_messages
             WHERE session_id = :session_id
             ORDER BY created_at DESC
-            LIMIT 6
+            LIMIT 20
             """
         ),
         {"session_id": state["session_id"]},
@@ -265,9 +271,22 @@ def _auto_execute_skill_state(skill: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _force_skill_or_download(user_message: str) -> dict[str, Any]:
+def _conversation_text(state: AgentState) -> str:
+    return conversation_context_text(
+        state.get("user_message") or "",
+        state.get("history") or [],
+    )
+
+
+def _force_skill_or_download(
+    user_message: str,
+    *,
+    context_text: str | None = None,
+) -> dict[str, Any]:
     """Resuelve skill con criterio estricto; si duda, pregunta."""
-    return _plan_from_decision(resolve_skill_decision(user_message))
+    return _plan_from_decision(
+        resolve_skill_decision(user_message, context_text=context_text)
+    )
 
 
 def _plan_from_decision(decision: dict[str, Any]) -> dict[str, Any]:
@@ -312,9 +331,19 @@ def _plan_from_decision(decision: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _resolve_skill_plan(task: str, arguments: dict[str, Any], user_message: str) -> dict[str, Any] | None:
+def _resolve_skill_plan(
+    task: str,
+    arguments: dict[str, Any],
+    user_message: str,
+    *,
+    context_text: str | None = None,
+) -> dict[str, Any] | None:
     """Evalúa skills con matching endurecido + aclaraciones."""
-    decision = resolve_skill_decision(user_message, arguments)
+    decision = resolve_skill_decision(
+        user_message,
+        arguments,
+        context_text=context_text or user_message,
+    )
     if decision.get("action") == "none":
         return None
     return _plan_from_decision(decision)
@@ -333,13 +362,18 @@ def _plan_node(state: AgentState) -> dict:
         "Preferencia de formato para esta respuesta: "
         + detect_response_style(state["user_message"])
     )
+    ctx = _conversation_text(state)
+    thread_hint = fit_system_prompt(
+        thread_brief_for_prompt(state["user_message"], state.get("history") or [])
+    )
 
-    system, tooling, rag, style_hint, user_text = enforce_request_budget(
+    system, tooling, rag, style_hint, thread_hint, user_text = enforce_request_budget(
         [
             ("system", system),
             ("tooling", tooling),
             ("rag", rag),
             ("style", style_hint),
+            ("thread", thread_hint),
             ("user", user_text),
         ]
     )
@@ -347,6 +381,7 @@ def _plan_node(state: AgentState) -> dict:
     messages: list = [
         SystemMessage(content=system),
         SystemMessage(content=tooling),
+        SystemMessage(content=thread_hint),
         SystemMessage(content=rag),
         SystemMessage(content=style_hint),
         *history_msgs,
@@ -357,7 +392,10 @@ def _plan_node(state: AgentState) -> dict:
     except Exception as exc:
         logger.exception("Fallo el plan LLM (posible límite de tokens)")
         resolved = _resolve_skill_plan(
-            state["user_message"], {"query": state["user_message"]}, state["user_message"]
+            state["user_message"],
+            {"query": state["user_message"]},
+            state["user_message"],
+            context_text=ctx,
         )
         if resolved:
             return resolved
@@ -377,11 +415,17 @@ def _plan_node(state: AgentState) -> dict:
             continue
         raw_args = call.get("args") if isinstance(call, dict) else getattr(call, "args", {})
         task, arguments = _parse_tool_arguments(raw_args or {}, state["user_message"])
-        resolved = _resolve_skill_plan(task, arguments, state["user_message"])
+        # Preferir la tarea del hilo completo si el tool mandó un task pobre.
+        if ctx and (not task or len(task) < 40 or task == state["user_message"]):
+            task = ctx
+            arguments = {**arguments, "query": ctx}
+        resolved = _resolve_skill_plan(
+            task, arguments, state["user_message"], context_text=ctx
+        )
         if resolved:
             return resolved
         # Re-evaluar con el mensaje completo (el task del tool a veces es pobre).
-        forced = _force_skill_or_download(state["user_message"])
+        forced = _force_skill_or_download(state["user_message"], context_text=ctx)
         if (
             forced.get("reply")
             or forced.get("needs_approval")
@@ -403,20 +447,37 @@ def _plan_node(state: AgentState) -> dict:
 
     reply = (getattr(response, "content", None) or "").strip()
 
+    # Réplica al hilo (corrección/cuestionamiento): no forzar marketplace ni re-preguntar.
+    if is_result_challenge_or_correction(state["user_message"]):
+        if not reply:
+            reply = (
+                "Tenés razón en cuestionarlo: si el valor no calza con lo que ves en la "
+                "página/API, decime y lo reconsultamos con la skill de telemetría "
+                "(API fullDto) usando el mismo punto/URL del hilo."
+            )
+        return {
+            "pending_skill": None,
+            "needs_approval": False,
+            "reply": reply,
+        }
+
     # Web/externo o negativa de capacidad → buscar skill / ofrecer descarga.
     # (No forzar ante cualquier "podés…": podría ser solo una pregunta RAG.)
     if looks_like_web_or_external_request(state["user_message"]) or reply_is_capability_refusal(
         reply
     ):
-        return _force_skill_or_download(state["user_message"])
+        return _force_skill_or_download(state["user_message"], context_text=ctx)
 
     resolved = _resolve_skill_plan(
-        state["user_message"], {"query": state["user_message"]}, state["user_message"]
+        state["user_message"],
+        {"query": state["user_message"]},
+        state["user_message"],
+        context_text=ctx,
     )
     if resolved:
         return resolved
     if should_try_skill_marketplace(state["user_message"], reply):
-        return _force_skill_or_download(state["user_message"])
+        return _force_skill_or_download(state["user_message"], context_text=ctx)
     if not reply:
         reply = (
             "No pude generar una respuesta a partir del contexto disponible. "
@@ -503,15 +564,23 @@ def _route_after_download_gate(state: AgentState) -> Literal["fetch_remote_skill
 
 
 def _fetch_remote_skill_node(state: AgentState) -> dict:
+    ctx = _conversation_text(state)
     try:
         skill = generate_remote_skill(
             state["user_message"],
             rag_context=_context_block(state.get("retrieved_docs") or []),
+            conversation_context=ctx,
         )
+        # Segunda red de seguridad: nunca ofrecer HITL sobre skills meta.
+        validate_remote_skill(skill, ctx or state["user_message"])
     except Exception as exc:
         logger.exception("Fallo al descargar skill remota")
         return {
-            "reply": f"No pude descargar la habilidad: {exc}",
+            "reply": (
+                f"No pude preparar una skill válida: {exc}\n\n"
+                "Decime de nuevo el dato concreto, la URL/API y el punto "
+                "(ej. altura del 10009 en telemetría)."
+            ),
             "needs_approval": False,
             "approval_kind": None,
         }
@@ -571,7 +640,26 @@ def _run_skill_node(state: AgentState) -> dict:
         }
 
     skill = dict(state.get("pending_skill") or {})
-    skill["arguments"] = prepare_skill_arguments(skill, state["user_message"])
+    ctx = _conversation_text(state)
+    try:
+        validate_remote_skill(skill, ctx or state["user_message"])
+    except Exception as exc:
+        logger.exception("Skill pendiente inválida bloqueada antes de ejecutar")
+        return {
+            "skill_result": None,
+            "reply": (
+                f"Aborté la ejecución: la skill no es válida ({exc}). "
+                "Pedime de nuevo el dato + URL/punto y generamos una skill real."
+            ),
+            "pending_skill": None,
+            "needs_approval": False,
+            "approval_kind": None,
+        }
+    skill["arguments"] = prepare_skill_arguments(
+        skill,
+        state["user_message"],
+        context_text=ctx,
+    )
     code = skill.get("code") or ""
     arguments = skill.get("arguments") or {}
     try:
@@ -774,7 +862,8 @@ def _compose_skill_reply_node(state: AgentState) -> dict:
                         "Sos el asistente técnico de Irrigación de Malargüe. "
                         "Presentá el resultado de la skill de forma clara. "
                         "No inventes valores que no estén en el JSON. "
-                        "Incluí unidades. "
+                        "Si ok=false o hay error, explicá el error sin inventar datos. "
+                        "Usá exactamente las unidades del resultado (cm, l/s, etc.). "
                         f"Estilo de presentación: {style}"
                     )
                 ),

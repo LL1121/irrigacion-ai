@@ -500,13 +500,11 @@ _WEB_OR_EXTERNAL_HINTS = (
     "serviciosweb",
     "desde internet",
     "en la web",
-    "en la pagina",
-    "en la página",
+    # Ojo: NO usar "en la página" suelto — suele ser comentario del hilo
+    # ("en la página dice 4cm"), no un pedido nuevo de scrapear.
     "altura en el punto",
     "altura del punto",
     "dato del punto",
-    "estación",
-    "estacion",
 )
 
 
@@ -518,9 +516,120 @@ def looks_like_web_or_external_request(text: str) -> bool:
     lowered = (text or "").lower()
     if not lowered.strip():
         return False
+    # Réplicas al hilo ("en la página dice X") no son un pedido web nuevo.
+    if is_result_challenge_or_correction(text):
+        return False
     if contains_url(lowered):
         return True
     return any(hint in lowered for hint in _WEB_OR_EXTERNAL_HINTS)
+
+
+def is_result_challenge_or_correction(text: str) -> bool:
+    """El usuario cuestiona/corrige un resultado previo del mismo hilo."""
+    lowered = (text or "").lower().strip()
+    if not lowered:
+        return False
+    patterns = (
+        r"de\s+d[oó]nde\s+sacaste",
+        r"de\s+donde\s+sali[oó]",
+        r"c[oó]mo\s+calculaste",
+        r"est[aá]\s+mal",
+        r"no\s+es\s+(?:eso|correcto|as[ií]|la\s+altura)",
+        r"(?:en\s+la\s+p[aá]gina|ah[ií]|ac[aá])\s+dice",
+        r"dice\s+\d",
+        r"inventaste",
+        r"alucin",
+        r"no\s+coincide",
+        r"fijate\s+que",
+        r"mir[aá]\s+que\s+(?:en|la|el|dice)",
+        r"pero\s+en\s+la\s+p[aá]gina",
+        r"sacaste\s+mal",
+        r"te\s+equivocaste",
+    )
+    return any(re.search(p, lowered) for p in patterns)
+
+
+def is_thread_followup(text: str, context_text: str | None = None) -> bool:
+    """Mensaje corto que continúa una tarea ya abierta en el historial."""
+    if is_download_confirmation_only(text):
+        return True
+    if is_result_challenge_or_correction(text):
+        return True
+    ctx = (context_text or "").strip()
+    if not ctx or ctx == (text or "").strip():
+        return False
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return False
+    # URL o punto sueltos, o respuesta parcial a un clarify previo.
+    if contains_url(cleaned) and len(cleaned) < 220:
+        return True
+    args = extract_web_skill_args(cleaned)
+    if args.get("punto") and len(_tokenize(cleaned)) <= 10:
+        return True
+    if len(cleaned) <= 160 and len(_tokenize(cleaned)) <= 12:
+        if has_actionable_remote_task(ctx) or looks_like_web_or_external_request(ctx):
+            return True
+    return False
+
+
+def missing_web_clarify_fields(context_text: str) -> list[str]:
+    """Qué falta preguntar para un pedido web, según el hilo completo."""
+    probe = context_text or ""
+    missing: list[str] = []
+    args = extract_web_skill_args(probe)
+    lowered = probe.lower()
+    has_url = contains_url(probe) or is_telemetria_request(probe)
+    has_target = bool(args.get("punto"))
+    wants_metric = any(
+        k in lowered
+        for k in ("altura", "caudal", "nivel", "dato", "medición", "medicion", "valor", "telemetr")
+    )
+    if not has_url:
+        missing.append("url")
+    if not has_target:
+        missing.append("punto")
+    if not wants_metric:
+        missing.append("metric")
+    return missing
+
+
+def thread_brief_for_prompt(
+    user_message: str,
+    history: list[dict[str, Any]] | None = None,
+) -> str:
+    """Resumen corto del hilo para que el LLM no trate cada mensaje como chat nuevo."""
+    history = history or []
+    effective = resolve_effective_remote_task(
+        user_message,
+        conversation_context_text(user_message, history),
+    )
+    last_assistant = ""
+    for item in reversed(history):
+        if (item.get("role") or "").lower() in {"assistant", "ai", "system"}:
+            last_assistant = (item.get("message") or "").strip()
+            if last_assistant:
+                break
+    args = extract_web_skill_args(effective)
+    lines = [
+        "CONTINUIDAD DEL HILO (obligatorio respetar):",
+        "- Este mensaje es continuación del mismo chat, no un pedido aislado.",
+        "- No vuelvas a pedir URL/punto/dato si ya están en el historial.",
+        "- Si el usuario corrige un resultado, explicá la fuente o reconsultá; no reinicies el cuestionario.",
+    ]
+    if effective and effective.strip() != (user_message or "").strip():
+        lines.append(f"- Tarea activa del hilo: {effective[:500]}")
+    if args.get("url"):
+        lines.append(f"- URL ya conocida: {args['url']}")
+    if args.get("punto"):
+        lines.append(f"- Punto ya conocido: {args['punto']}")
+    if last_assistant:
+        lines.append(f"- Última respuesta tuya (recorte): {last_assistant[:280]}")
+    if is_result_challenge_or_correction(user_message):
+        lines.append(
+            "- El usuario cuestiona/corrige el resultado anterior: respondé sobre ese hilo."
+        )
+    return "\n".join(lines)
 
 
 def reply_is_capability_refusal(reply: str | None) -> bool:
@@ -801,17 +910,42 @@ def clarifying_question_for_skill(
     )
 
 
-def clarifying_question_for_unknown(user_message: str) -> str:
+def clarifying_question_for_unknown(
+    user_message: str,
+    *,
+    context_text: str | None = None,
+) -> str:
     """Cuando el pedido es acción pero no hay match claro ni conviene adivinar."""
-    lowered = (user_message or "").lower()
-    if looks_like_web_or_external_request(user_message):
+    probe = (context_text or user_message or "").strip() or (user_message or "")
+    if looks_like_web_or_external_request(probe) or looks_like_web_or_external_request(
+        user_message
+    ) or is_telemetria_request(probe):
+        missing = missing_web_clarify_fields(probe)
+        label = {
+            "url": "¿Qué URL/API exacta? (pegá el link)",
+            "punto": "¿Código de punto/estación? (ej. 10009)",
+            "metric": "¿Qué dato necesitás? (altura, caudal, última medición…)",
+        }
+        if not missing:
+            return (
+                "Con lo que ya me pasaste en el chat alcanza. "
+                "Si querés que genere/ejecute la skill, respondé **sí, descargá la skill**."
+            )
+        bullets = "\n".join(f"- {label[m]}" for m in missing if m in label)
+        known = extract_web_skill_args(probe)
+        known_bits = []
+        if known.get("url"):
+            known_bits.append(f"URL: {known['url']}")
+        if known.get("punto"):
+            known_bits.append(f"punto: {known['punto']}")
+        known_line = (
+            ("Ya tengo: " + "; ".join(known_bits) + ".\n\n") if known_bits else ""
+        )
         return (
-            "Puedo generar/descargar una skill para consultar esa web/API. "
-            "Antes confirmame:\n"
-            "- ¿Qué dato exacto necesitás? (ej. altura, caudal, última medición)\n"
-            "- ¿Código de punto/estación? (ej. 10009)\n"
-            "- ¿La URL es esa misma u otra endpoint/API?\n\n"
-            "Si ya está todo en tu mensaje, respondé **sí, descargá la skill**."
+            f"{known_line}"
+            "Para seguir con esa consulta web/API me falta solo esto:\n"
+            f"{bullets}\n\n"
+            "Respondé con eso (o **sí, descargá la skill** si ya está completo en el hilo)."
         )
     examples = ", ".join(s["name"] for s in CATALOG[:4])
     return (
@@ -827,6 +961,8 @@ def clarifying_question_for_unknown(user_message: str) -> str:
 def resolve_skill_decision(
     user_message: str,
     arguments: dict[str, Any] | None = None,
+    *,
+    context_text: str | None = None,
 ) -> dict[str, Any]:
     """
     Decisión endurecida de skills.
@@ -836,11 +972,22 @@ def resolve_skill_decision(
       - download: pedido web/externo o acción clara sin skill local
       - clarify: falta certeza o faltan argumentos
       - none: no parece pedido de skill
+
+    context_text: historial de usuario + mensaje actual (URLs/punto de turnos previos).
     """
     text = user_message or ""
+    context = (context_text or text or "").strip() or text
     lowered = text.lower().strip()
-    if not lowered:
+    if not lowered and not context.strip():
         return {"action": "none", "confidence": 0.0}
+
+    # Continuidad: el usuario corrige/cuestiona un resultado del mismo hilo.
+    if is_result_challenge_or_correction(text):
+        return {
+            "action": "none",
+            "confidence": 0.2,
+            "reason": "thread_challenge",
+        }
 
     # Confirmación explícita de descarga tras una aclaración previa.
     if re.search(
@@ -850,41 +997,71 @@ def resolve_skill_decision(
         r"|busc(?:á|a|ar).{0,40}skill",
         lowered,
     ):
+        effective = resolve_effective_remote_task(text, context)
+        if has_actionable_remote_task(effective):
+            return {
+                "action": "download",
+                "confidence": 0.9,
+                "reason": "explicit_download_confirm",
+            }
         return {
-            "action": "download",
-            "confidence": 0.9,
-            "reason": "explicit_download_confirm",
+            "action": "clarify",
+            "confidence": 0.4,
+            "reply": (
+                "Puedo descargar/generar la skill, pero necesito la tarea real: "
+                "qué dato querés, de qué URL/API y (si aplica) el código de punto. "
+                "Ej.: «altura y caudal del punto 10009 en "
+                "https://serviciosweb.cloud.irrigacion.gov.ar/public/telemetriaMovil»."
+            ),
+            "reason": "download_confirm_without_task",
         }
 
-    if not (is_action_request(text) or should_try_skill_marketplace(text)):
+    # Solo una URL (o URL + poco texto) después de pedir datos: usar contexto.
+    if contains_url(text) and len(_tokenize(text)) <= 6:
+        ctx_args = extract_web_skill_args(context)
+        if ctx_args.get("punto") or any(
+            k in context.lower()
+            for k in ("altura", "caudal", "telemetr", "nivel", "medición", "medicion")
+        ):
+            return {
+                "action": "download",
+                "confidence": 0.85,
+                "reason": "url_followup_with_context",
+            }
+
+    if not (
+        is_action_request(text)
+        or should_try_skill_marketplace(text)
+        or looks_like_web_or_external_request(context)
+        or is_thread_followup(text, context)
+    ):
         return {"action": "none", "confidence": 0.0}
 
-    # Web/URL: no adivinar catálogo; pedir confirmación corta o download directo
-    # si el pedido ya trae URL + dato concreto.
-    if looks_like_web_or_external_request(text):
-        has_url = contains_url(text)
-        has_target = bool(
-            re.search(
-                r"(?:punto|estación|estacion|código|codigo|id)\s*[:#-]?\s*\d{3,8}"
-                r"|\b\d{4,6}\b",
-                text,
-                re.I,
-            )
-        )
-        wants_metric = any(
-            k in text.lower()
-            for k in ("altura", "caudal", "nivel", "dato", "medición", "medicion", "valor")
-        )
-        if has_url and (has_target or wants_metric):
+    # Web/URL: evaluar claridad sobre el CONTEXTO (historial), no solo el último mensaje.
+    if (
+        looks_like_web_or_external_request(text)
+        or looks_like_web_or_external_request(context)
+        or (is_thread_followup(text, context) and has_actionable_remote_task(context))
+    ):
+        probe = context if len(context) >= len(text) else text
+        missing = missing_web_clarify_fields(probe)
+        if not missing:
             return {
                 "action": "download",
                 "confidence": 0.85,
                 "reason": "web_request_clear",
             }
+        # Telemetría con punto aunque falte URL explícita en este turno.
+        if is_telemetria_request(probe) and "punto" not in missing:
+            return {
+                "action": "download",
+                "confidence": 0.8,
+                "reason": "telemetria_punto_clear",
+            }
         return {
             "action": "clarify",
             "confidence": 0.4,
-            "reply": clarifying_question_for_unknown(text),
+            "reply": clarifying_question_for_unknown(text, context_text=probe),
             "reason": "web_request_unclear",
         }
 
@@ -933,7 +1110,7 @@ def resolve_skill_decision(
             return {
                 "action": "clarify",
                 "confidence": 0.35,
-                "reply": clarifying_question_for_unknown(text),
+                "reply": clarifying_question_for_unknown(text, context_text=context),
                 "reason": "vague_action",
             }
         return {
@@ -951,6 +1128,176 @@ def download_remote_prompt() -> str:
         "¿Querés que descargue/genere la skill desde internet y la ejecute "
         "(con auditoría de Gemini)?"
     )
+
+
+_DOWNLOAD_CONFIRM_ONLY_RE = re.compile(
+    r"^\s*(?:s[ií]|dale|ok|okay|bueno|claro|perfecto)?[,.\s!]*"
+    r"(?:por\s+favor[,.\s]*)?"
+    r"(?:descarg(?:á|a|ar)|gener(?:á|a|ar)|busc(?:á|a|ar)|instal(?:á|a|ar))\w*"
+    r".{0,40}\bskills?\b"
+    r"[.\s!]*$",
+    re.I,
+)
+
+
+def is_download_confirmation_only(text: str) -> bool:
+    """True si el mensaje solo confirma descargar/generar skill (sin la tarea real)."""
+    cleaned = re.sub(r"\s+", " ", (text or "").strip())
+    if not cleaned or len(cleaned) > 120:
+        return False
+    if contains_url(cleaned):
+        return False
+    if re.search(
+        r"\b(?:altura|caudal|punto|url|api|telemetr|web|http|consultar|entrar)\b",
+        cleaned,
+        re.I,
+    ):
+        return False
+    return bool(_DOWNLOAD_CONFIRM_ONLY_RE.match(cleaned))
+
+
+def resolve_effective_remote_task(
+    user_message: str,
+    conversation_context: str | None = None,
+) -> str:
+    """
+    Tarea real para generar/ejecutar skills remotas.
+    Si el usuario solo dice 'sí, descargá la skill', usa el historial.
+    """
+    task = (user_message or "").strip()
+    context = (conversation_context or "").strip()
+    if not context:
+        return task
+
+    parts = [p.strip() for p in re.split(r"\n\s*\n", context) if p.strip()]
+    useful = [p for p in parts if not is_download_confirmation_only(p)]
+
+    if is_download_confirmation_only(task):
+        if useful:
+            return "\n\n".join(useful)
+        return context
+
+    # Mensaje corto (URL sola, etc.): enriquecer con historial previo.
+    if useful and task:
+        if task not in useful[-1]:
+            # Evitar duplicar si conversation_context ya incluye el mensaje actual.
+            prior = [p for p in useful if p != task]
+            if prior and (contains_url(task) or len(task) < 80):
+                return "\n\n".join(prior + [task])
+        return "\n\n".join(useful) if len("\n\n".join(useful)) >= len(task) else task
+
+    return context if len(context) > len(task) else task
+
+
+def has_actionable_remote_task(text: str) -> bool:
+    """Hay sustancia para armar una skill (no solo 'descargá la skill')."""
+    if not (text or "").strip():
+        return False
+    if is_download_confirmation_only(text):
+        return False
+    if contains_url(text) or is_telemetria_request(text):
+        return True
+    if extract_web_skill_args(text).get("punto"):
+        return True
+    lowered = text.lower()
+    if any(
+        k in lowered
+        for k in (
+            "altura",
+            "caudal",
+            "consultar",
+            "entrar",
+            "obtener",
+            "traer",
+            "scrap",
+            "api",
+            "word",
+            "documento",
+            "calcular",
+        )
+    ):
+        return True
+    # Texto con algo más que confirmación genérica.
+    tokens = _tokenize(text)
+    return len(tokens) >= 6
+
+
+def conversation_context_text(
+    user_message: str,
+    history: list[dict[str, Any]] | None = None,
+) -> str:
+    """Une mensajes de usuario del historial + el actual (para URL/punto/tarea)."""
+    parts: list[str] = []
+    for item in history or []:
+        role = (item.get("role") or "").lower()
+        msg = (item.get("message") or "").strip()
+        if role == "user" and msg:
+            parts.append(msg)
+    current = (user_message or "").strip()
+    if current and (not parts or parts[-1] != current):
+        parts.append(current)
+    return "\n\n".join(parts)
+
+
+def is_telemetria_request(text: str) -> bool:
+    from app.services.skill_http import extract_urls
+
+    lowered = (text or "").lower()
+    if not lowered.strip():
+        return False
+    if "telemetr" in lowered or "dato-medicions" in lowered or "fulldto" in lowered:
+        return True
+    return any("telemetr" in u.lower() for u in extract_urls(text))
+
+
+def extract_web_skill_args(text: str) -> dict[str, Any]:
+    """Extrae url(s) y código de punto desde texto (mensaje o historial)."""
+    from app.services.skill_http import extract_urls
+
+    args: dict[str, Any] = {}
+    urls = extract_urls(text)
+    if urls:
+        args["urls"] = urls
+        args["url"] = urls[0]
+    punto = re.search(
+        r"(?:punto|estaci[oó]n|c[oó]digo|codigo|id)\s*[:#-]?\s*(\d{3,8})",
+        text or "",
+        re.I,
+    )
+    if punto:
+        args["punto"] = punto.group(1)
+    elif re.search(r"\b\d{4,6}\b", text or ""):
+        # Evitar tomar años tipo 2026 si hay contexto de telemetría/URL.
+        candidates = re.findall(r"\b(\d{4,6})\b", text or "")
+        for cand in candidates:
+            if cand.startswith("20") and len(cand) == 4:
+                continue
+            args["punto"] = cand
+            break
+    return args
+
+
+def merge_web_skill_arguments(
+    arguments: dict[str, Any] | None,
+    text: str,
+) -> dict[str, Any]:
+    """Completa url/punto/api_url para skills web/telemetría sin pisar valores útiles."""
+    merged = dict(arguments or {})
+    extracted = extract_web_skill_args(text)
+    for key, value in extracted.items():
+        if merged.get(key) in (None, "", [], {}):
+            merged[key] = value
+    if is_telemetria_request(text) or any(
+        "telemetr" in str(u).lower() for u in (merged.get("urls") or [])
+    ):
+        merged.setdefault(
+            "api_url",
+            "https://serviciosweb.cloud.irrigacion.gov.ar/services/telemetria/"
+            "api/public/dato-medicions/fullDto",
+        )
+    if text and merged.get("query") in (None, "", {}):
+        merged["query"] = text
+    return merged
 
 
 def _extract_numbers(text: str) -> list[float]:
@@ -1317,15 +1664,24 @@ Extraé del pedido del usuario SOLO los argumentos de la skill.
     return current
 
 
-def prepare_skill_arguments(skill: dict[str, Any], user_message: str) -> dict[str, Any]:
+def prepare_skill_arguments(
+    skill: dict[str, Any],
+    user_message: str,
+    *,
+    context_text: str | None = None,
+) -> dict[str, Any]:
     """
     Personaliza argumentos de cualquier skill:
     - Word: redacta contenido + formato
     - Cálculos: completa con heurística y, si falta, extracción LLM
-    - Remotas: intenta LLM genérico según descripción
+    - Remotas: completa url/punto desde historial; LLM solo si sigue vacío
     """
     skill_id = str(skill.get("id") or "")
+    ctx = (context_text or user_message or "").strip()
     base = enrich_skill_arguments(skill, user_message)
+    base = merge_web_skill_arguments(base, ctx)
+    if ctx and (skill.get("source") == "remote" or skill_id.startswith("remote_")):
+        base["query"] = ctx
 
     if skill_id == "generar_documento_word":
         return prepare_docx_arguments(user_message, base)
@@ -1343,7 +1699,7 @@ def prepare_skill_arguments(skill: dict[str, Any], user_message: str) -> dict[st
     }
     if useful:
         return base
-    return _llm_extract_skill_arguments(skill, user_message, base)
+    return _llm_extract_skill_arguments(skill, ctx or user_message, base)
 
 
 def detect_response_style(user_message: str) -> str:
