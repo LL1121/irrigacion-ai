@@ -58,8 +58,8 @@ fi
 echo "==> Construyendo imagen de sandbox de skills"
 docker build -t "${SKILL_SANDBOX_IMAGE:-skill-sandbox-image}" "$ROOT/backend/sandbox_env"
 
-echo "==> Levantando stack de producción (db + api + PWA estática)"
-"${COMPOSE[@]}" build api
+echo "==> Levantando stack de producción (db + api + PWA + site institucional)"
+"${COMPOSE[@]}" build api site
 "${COMPOSE[@]}" up -d
 
 echo "==> Esperando healthcheck del API…"
@@ -85,7 +85,13 @@ echo
 echo "API + health:"
 echo "  curl http://127.0.0.1:${API_PORT}/health"
 echo
-echo "PWA móvil (misma URL — agregar a pantalla de inicio):"
+SITE_PORT="${SITE_PORT:-8088}"
+echo "Landing institucional (apuntar irrigacionmalargue.net en Cloudflare):"
+echo "  http://127.0.0.1:${SITE_PORT}/"
+echo "  http://127.0.0.1:${SITE_PORT}/politicas-privacidad"
+echo "  contenedor: irrigacion_site_prod  (red proxy-network)"
+echo
+echo "PWA / asistente (ia.irrigacionmalargue.net):"
 echo "  ${PUBLIC}/"
 echo "  ${LAN}/"
 echo

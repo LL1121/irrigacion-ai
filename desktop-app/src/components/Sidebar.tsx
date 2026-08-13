@@ -304,7 +304,7 @@ export function Sidebar({
           </button>
         )}
         <a
-          href={`${getApiBaseUrl()}/politicas-privacidad`}
+          href="https://irrigacionmalargue.net/politicas-privacidad"
           target="_blank"
           rel="noreferrer"
           className="mb-2 block text-[11px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
