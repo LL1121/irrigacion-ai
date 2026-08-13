@@ -33,6 +33,12 @@ from app.services.document_export import (
     artifact_info,
     save_artifact_from_base64,
 )
+from app.services.command_router import (
+    GOOGLE_ACTIONS,
+    missing_google_slots,
+    save_user_context,
+    use_google,
+)
 from app.services.google_assistant import (
     APPROVAL_KIND_GOOGLE_TOOL,
     build_pending_google_tool,
@@ -70,7 +76,6 @@ from app.services.skill_marketplace import (
     resolve_skill_decision,
     search_catalog,
     search_skill_marketplace,
-    should_try_skill_marketplace,
     thread_brief_for_prompt,
 )
 from app.services.skill_remote import (
@@ -107,7 +112,7 @@ Tu objetivo es ayudar al personal de la oficina a resolver dudas sobre normativa
 
 ### PERSONALIZACIÓN (MUY IMPORTANTE):
 1. **Seguí el formato pedido:** Si pide tabla, viñetas, pasos numerados, “breve”, “formal” o “en criollo”, obedecé eso en la respuesta.
-2. **Inferí intención con cuidado:** Si el pedido es ambiguo, NO adivines la herramienta. Preguntá en concreto qué dato falta o qué skill corresponde.
+2. **Inferí intención con cuidado:** Interpretá el pedido completo (verbo + objeto), no una palabra suelta. Si es ambiguo, NO adivines la herramienta. Preguntá qué dato falta.
 3. **Pedí solo lo imprescindible:** Si faltan datos para un cálculo, pedí únicamente esos datos (con unidades), no un cuestionario largo.
 4. **Consistencia en la conversación:** Si el usuario ya eligió un estilo o unidad, mantenelo salvo que diga lo contrario.
 5. **Skills con criterio:** Cuando uses herramientas/skills, pasá bien los números/unidades. Si no estás seguro de la skill, preguntá antes de ejecutar.
@@ -124,15 +129,21 @@ Tu objetivo es ayudar al personal de la oficina a resolver dudas sobre normativa
 """.strip()
 
 SKILL_TOOLING_HINT = (
-    "Herramientas: si el usuario pide un cálculo, Word, consultar una URL/telemetría u otra "
-    "automatización, DEBÉS llamar a search_skill_marketplace. "
-    "NUNCA digas que no podés acceder a internet: buscá/descargá skill. "
-    "Matching estricto: no asumas lámina/caudal/tiempo solo por un número suelto. "
-    "Si el pedido es ambiguo o faltan datos (área, caudal, superficie, punto, unidad), "
-    "NO elijas una skill al azar ni inventes valores: preguntá específicamente lo que falta. "
-    "Extraé URLs, puntos y unidades del HILO COMPLETO (historial + mensaje), no solo del último texto. "
-    "Si el usuario solo confirma ('sí, descargá') o completa un dato (pega una URL), "
-    "continuá la tarea abierta del historial; no armes una skill meta de 'descargar skill'."
+    "Herramientas: TODA acción concreta se decide con una tool, no por una palabra suelta. "
+    "Google (mail/agenda/Drive): DEBÉS llamar a use_google con la action correcta. "
+    "El objeto manda: mail/correo/email → gmail_send o gmail_list; "
+    "evento/agenda/reunión → calendar_create o calendar_list; archivo Drive → drive_*. "
+    "'Programar el envío de un mail' es gmail_send, NUNCA calendar_create. "
+    "Si falta destinatario, título o fecha, NO llames use_google: preguntá. "
+    "Anotar/guardar/recordar contexto: llamá save_user_context. "
+    "Cálculo, Word, URL/telemetría u otra automatización: DEBÉS llamar a "
+    "search_skill_marketplace. NUNCA digas que no podés acceder a internet: "
+    "buscá/descargá skill. Matching estricto: no asumas lámina/caudal/tiempo "
+    "solo por un número suelto. Si el pedido es ambiguo o faltan datos, "
+    "NO elijas una skill al azar ni inventes valores: preguntá. "
+    "Extraé URLs, puntos y unidades del HILO COMPLETO. "
+    "Si el usuario confirma ('sí, descargá') o pega una URL, continuá la tarea "
+    "abierta; no armes una skill meta de 'descargar skill'."
 )
 
 # Alias retrocompatible: el resto del módulo referenciaba SYSTEM_PROMPT.
@@ -207,7 +218,9 @@ def _llm(*, tools: bool = False) -> ChatOpenAI:
         temperature=0.2,
     )
     if tools:
-        return llm.bind_tools([search_skill_marketplace])
+        return llm.bind_tools(
+            [use_google, save_user_context, search_skill_marketplace]
+        )
     return llm
 
 
@@ -356,7 +369,7 @@ def _handle_drive_index_to_context(
 
 
 def _pre_assist_node(state: AgentState, db: Session) -> dict:
-    """Contexto tipado + tools Google antes del plan LLM/skills."""
+    """Cierra un guardado de contexto pendiente. Las acciones nuevas las decide el LLM."""
     message = state["user_message"]
     session_id = state["session_id"]
     user_id = state.get("user_id")
@@ -398,78 +411,6 @@ def _pre_assist_node(state: AgentState, db: Session) -> dict:
                 "pending_skill": None,
                 "pending_google_tool": None,
             }
-
-    if looks_like_save_context_intent(message):
-        scope = parse_context_scope(message)
-        body = extract_note_body(message)
-        if scope:
-            reply = _save_scoped_note(db, content=body, scope=scope, user_id=user_id)
-            return {
-                "reply": reply,
-                "pre_assist_done": True,
-                "needs_approval": False,
-                "approval_kind": None,
-                "pending_skill": None,
-                "pending_google_tool": None,
-            }
-        set_pending_note(session_id, body)
-        return {
-            "reply": ask_scope_prompt(),
-            "pre_assist_done": True,
-            "needs_approval": False,
-            "approval_kind": None,
-            "pending_skill": None,
-            "pending_google_tool": None,
-        }
-
-    intent = detect_google_intent(message)
-    if intent:
-        if not user_id:
-            return {
-                "reply": (
-                    "Para usar Calendar, Gmail o Drive necesitás "
-                    "**iniciar sesión con Google** (botón en el menú)."
-                ),
-                "pre_assist_done": True,
-                "needs_approval": False,
-                "approval_kind": None,
-                "pending_google_tool": None,
-            }
-        if not google_oauth_configured():
-            return {
-                "reply": "Google OAuth todavía no está configurado en el servidor.",
-                "pre_assist_done": True,
-                "needs_approval": False,
-                "approval_kind": None,
-                "pending_google_tool": None,
-            }
-        pending = build_pending_google_tool(intent, message)
-        if pending.get("action") == "drive_index":
-            return _handle_drive_index_to_context(
-                db, user_id=user_id, session_id=session_id, pending=pending
-            )
-        if google_write_needs_hitl(db, user_id, pending):
-            return {
-                "pending_google_tool": pending,
-                "needs_approval": True,
-                "approval_kind": APPROVAL_KIND_GOOGLE_TOOL,
-                "pre_assist_done": True,
-                "pending_skill": None,
-                "reply": "",
-            }
-        try:
-            reply = execute_google_tool(db, user_id=user_id, pending=pending)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Fallo tool Google %s", pending.get("tool_id"))
-            reply = f"No pude completar la acción de Google: {exc}"
-        return {
-            "reply": reply,
-            "pre_assist_done": True,
-            "needs_approval": False,
-            "approval_kind": None,
-            "pending_google_tool": None,
-            "pending_skill": None,
-        }
 
     return {
         "pre_assist_done": False,
@@ -631,7 +572,133 @@ def _resolve_skill_plan(
     )
 
 
-def _plan_node(state: AgentState) -> dict:
+def _tool_call_name(call: Any) -> str:
+    if isinstance(call, dict):
+        return str(call.get("name") or "")
+    return str(getattr(call, "name", "") or "")
+
+
+def _tool_call_args(call: Any) -> dict[str, Any]:
+    raw = call.get("args") if isinstance(call, dict) else getattr(call, "args", {})
+    return raw if isinstance(raw, dict) else {}
+
+
+def _plan_save_context(state: AgentState, db: Session, args: dict[str, Any]) -> dict:
+    note = str(args.get("note") or "").strip() or extract_note_body(
+        state["user_message"]
+    )
+    scope = parse_context_scope(str(args.get("scope") or "")) or parse_context_scope(
+        state["user_message"]
+    )
+    if not note:
+        return {
+            "pending_skill": None,
+            "pending_google_tool": None,
+            "needs_approval": False,
+            "approval_kind": None,
+            "reply": "¿Qué querés que anote como contexto?",
+        }
+    if scope:
+        return {
+            "pending_skill": None,
+            "pending_google_tool": None,
+            "needs_approval": False,
+            "approval_kind": None,
+            "reply": _save_scoped_note(
+                db, content=note, scope=scope, user_id=state.get("user_id")
+            ),
+        }
+    set_pending_note(state["session_id"], note)
+    return {
+        "pending_skill": None,
+        "pending_google_tool": None,
+        "needs_approval": False,
+        "approval_kind": None,
+        "reply": ask_scope_prompt(),
+    }
+
+
+def _plan_google_action(state: AgentState, db: Session, args: dict[str, Any]) -> dict:
+    action = str(args.get("action") or "").strip()
+    meta = GOOGLE_ACTIONS.get(action)
+    empty = {
+        "pending_skill": None,
+        "pending_google_tool": None,
+        "needs_approval": False,
+        "approval_kind": None,
+        "google_approved": None,
+    }
+    if not meta:
+        return {
+            **empty,
+            "reply": (
+                "No entendí si era un mail, un evento de Calendar o algo de Drive. "
+                "Aclarámelo y lo hago."
+            ),
+        }
+    user_id = state.get("user_id")
+    if not user_id:
+        return {
+            **empty,
+            "reply": (
+                "Para usar Calendar, Gmail o Drive necesitás "
+                "**iniciar sesión con Google** (botón en el menú)."
+            ),
+        }
+    if not google_oauth_configured():
+        return {
+            **empty,
+            "reply": "Google OAuth todavía no está configurado en el servidor.",
+        }
+    query = str(args.get("query") or state["user_message"])
+    pending = build_pending_google_tool(
+        {"tool_id": meta["tool_id"], "action": action, "write": meta["write"]},
+        query,
+    )
+    overlay = {
+        key: args.get(key)
+        for key in (
+            "to",
+            "subject",
+            "body",
+            "summary",
+            "start_iso",
+            "end_iso",
+            "search",
+            "file_id",
+        )
+        if args.get(key)
+    }
+    pending["arguments"] = {**(pending.get("arguments") or {}), **overlay}
+    ask = missing_google_slots(action, query, pending.get("arguments"))
+    if ask:
+        return {**empty, "reply": ask}
+    if pending.get("action") == "drive_index":
+        result = _handle_drive_index_to_context(
+            db,
+            user_id=user_id,
+            session_id=state["session_id"],
+            pending=pending,
+        )
+        result["pending_skill"] = None
+        return result
+    if google_write_needs_hitl(db, user_id, pending):
+        return {
+            "pending_google_tool": pending,
+            "needs_approval": True,
+            "approval_kind": APPROVAL_KIND_GOOGLE_TOOL,
+            "pending_skill": None,
+            "reply": "",
+        }
+    try:
+        reply = execute_google_tool(db, user_id=user_id, pending=pending)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Fallo tool Google %s", pending.get("tool_id"))
+        reply = f"No pude completar la acción de Google: {exc}"
+    return {**empty, "reply": reply}
+
+
+def _plan_node(state: AgentState, db: Session) -> dict:
     llm = _llm(tools=True)
     system = fit_system_prompt(SYSTEM_PROMPT_IRRIGACION)
     tooling = fit_system_prompt(SKILL_TOOLING_HINT + "\n" + CATALOG_HINT)
@@ -690,12 +757,23 @@ def _plan_node(state: AgentState) -> dict:
             ),
         }
     tool_calls = getattr(response, "tool_calls", None) or []
+    google_call = next(
+        (call for call in tool_calls if _tool_call_name(call) == "use_google"),
+        None,
+    )
+    if google_call:
+        return _plan_google_action(state, db, _tool_call_args(google_call))
+    save_call = next(
+        (call for call in tool_calls if _tool_call_name(call) == "save_user_context"),
+        None,
+    )
+    if save_call:
+        return _plan_save_context(state, db, _tool_call_args(save_call))
 
     for call in tool_calls:
-        name = call.get("name") if isinstance(call, dict) else getattr(call, "name", "")
-        if name != "search_skill_marketplace":
+        if _tool_call_name(call) != "search_skill_marketplace":
             continue
-        raw_args = call.get("args") if isinstance(call, dict) else getattr(call, "args", {})
+        raw_args = _tool_call_args(call)
         task, arguments = _parse_tool_arguments(raw_args or {}, state["user_message"])
         # Preferir la tarea del hilo completo si el tool mandó un task pobre.
         if ctx and (not task or len(task) < 40 or task == state["user_message"]):
@@ -750,16 +828,6 @@ def _plan_node(state: AgentState) -> dict:
     ):
         return _force_skill_or_download(state["user_message"], context_text=ctx)
 
-    resolved = _resolve_skill_plan(
-        state["user_message"],
-        {"query": state["user_message"]},
-        state["user_message"],
-        context_text=ctx,
-    )
-    if resolved:
-        return resolved
-    if should_try_skill_marketplace(state["user_message"], reply):
-        return _force_skill_or_download(state["user_message"], context_text=ctx)
     if not reply:
         reply = (
             "No pude generar una respuesta a partir del contexto disponible. "
@@ -774,7 +842,19 @@ def _plan_node(state: AgentState) -> dict:
 
 def _route_after_plan(
     state: AgentState,
-) -> Literal["run_skill", "human_gate_download", "human_gate_execute", "end_ok"]:
+) -> Literal[
+    "run_skill",
+    "human_gate_download",
+    "human_gate_execute",
+    "human_gate_google",
+    "end_ok",
+]:
+    if (
+        state.get("approval_kind") == APPROVAL_KIND_GOOGLE_TOOL
+        and state.get("needs_approval")
+        and state.get("pending_google_tool")
+    ):
+        return "human_gate_google"
     if (
         state.get("skill_approved")
         and state.get("pending_skill")
@@ -1328,10 +1408,13 @@ def build_agent_graph(db: Session):
     def run_google(state: AgentState) -> dict:
         return _run_google_tool_node(state, db)
 
+    def plan(state: AgentState) -> dict:
+        return _plan_node(state, db)
+
     graph.add_node("retrieve", retrieve)
     graph.add_node("fetch_history", fetch_history)
     graph.add_node("pre_assist", pre_assist)
-    graph.add_node("plan", _plan_node)
+    graph.add_node("plan", plan)
     graph.add_node("human_gate_download", _human_gate_download_node)
     graph.add_node("fetch_remote_skill", _fetch_remote_skill_node)
     graph.add_node("human_gate_execute", _human_gate_execute_node)
@@ -1359,6 +1442,7 @@ def build_agent_graph(db: Session):
             "run_skill": "run_skill",
             "human_gate_download": "human_gate_download",
             "human_gate_execute": "human_gate_execute",
+            "human_gate_google": "human_gate_google",
             "end_ok": END,
         },
     )

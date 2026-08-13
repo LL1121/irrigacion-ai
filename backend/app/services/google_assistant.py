@@ -9,6 +9,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.services.auth_session import add_tool_whitelist, is_tool_whitelisted
+from app.services.command_router import heuristic_route
 from app.services.google_workspace import (
     calendar_create_event,
     calendar_list_events,
@@ -22,54 +23,20 @@ from app.services.response_normalize import looks_raw_technical
 
 APPROVAL_KIND_GOOGLE_TOOL = "google_tool"
 
-_CAL_LIST_RE = re.compile(
-    r"(?:agenda|calendario|qu[eé]\s+tengo|mis\s+eventos|reuniones|esta\s+semana|\bhoy\b)",
-    re.I,
-)
-_CAL_CREATE_RE = re.compile(
-    r"(?:agend(?:á|ar)\b|crear\s+(?:un\s+)?evento|program(?:á|a|ar)|bloque(?:á|a|ar)\s+en\s+el\s+calendario)",
-    re.I,
-)
-_GMAIL_LIST_RE = re.compile(
-    r"(?:mails?|correos?|inbox|bandeja|gmail|revis(?:á|a|ar)\s+(?:el\s+)?correo)",
-    re.I,
-)
-_GMAIL_SEND_RE = re.compile(
-    r"(?:envi(?:á|a|ar)\s+(?:un\s+)?(?:mail|correo|email)|mand(?:á|a|ar)\s+(?:un\s+)?(?:mail|correo))",
-    re.I,
-)
 _DRIVE_SEARCH_RE = re.compile(
     r"(?:busc(?:á|a|ar)\s+en\s+drive|en\s+mi\s+drive|google\s+drive|archivos?\s+de\s+drive)",
-    re.I,
-)
-_DRIVE_READ_RE = re.compile(
-    r"(?:le[eé]\s+(?:el\s+)?(?:archivo|documento)|abr[ií]\s+(?:el\s+)?(?:archivo|doc))",
-    re.I,
-)
-_DRIVE_INDEX_RE = re.compile(
-    r"(?:index(?:á|a|ar)|guard(?:á|a|ar)\s+(?:en|como)\s+contexto).{0,40}(?:drive|archivo|documento)",
     re.I,
 )
 
 
 def detect_google_intent(text: str) -> dict[str, Any] | None:
-    lowered = text or ""
-    # Crear antes que listar solo con verbos explícitos (evitar "agenda" ≠ "agendar").
-    if _CAL_CREATE_RE.search(lowered):
-        return {"tool_id": "calendar.create", "action": "calendar_create", "write": True}
-    if _CAL_LIST_RE.search(lowered):
-        return {"tool_id": "calendar.list", "action": "calendar_list", "write": False}
-    if _GMAIL_SEND_RE.search(lowered):
-        return {"tool_id": "gmail.send", "action": "gmail_send", "write": True}
-    if _GMAIL_LIST_RE.search(lowered):
-        return {"tool_id": "gmail.list", "action": "gmail_list", "write": False}
-    if _DRIVE_INDEX_RE.search(lowered):
-        return {"tool_id": "drive.index", "action": "drive_index", "write": False}
-    if _DRIVE_READ_RE.search(lowered) and re.search(r"\b[\w-]{10,}\b", lowered):
-        return {"tool_id": "drive.read", "action": "drive_read", "write": False}
-    if _DRIVE_SEARCH_RE.search(lowered):
-        return {"tool_id": "drive.search", "action": "drive_search", "write": False}
-    return None
+    """Heurística (sin LLM): tool Google clara, o clarify si el pedido es Google-ish."""
+    decision = heuristic_route(text)
+    if not decision:
+        return None
+    if decision.action == "clarify":
+        return {"tool_id": "command.clarify", "action": "clarify", "write": False}
+    return decision.as_google_intent()
 
 
 def _parse_simple_event(text: str) -> dict[str, Any]:
