@@ -14,7 +14,7 @@ export default defineConfig(async () => ({
       registerType: "autoUpdate",
       includeAssets: ["favicon-32x32.png", "apple-touch-icon.png"],
       manifest: {
-        name: "Irrigación Bot Malargüe",
+        name: "Irrigación Bot",
         short_name: "Irrigación Bot",
         description:
           "Asistente Virtual e IA Institucional de la Jefatura de Zona de Riego",
