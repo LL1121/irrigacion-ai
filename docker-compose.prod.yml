@@ -1,7 +1,9 @@
 # Producción on-prem (LAN / Tailscale)
 # Uso:
 #   cp .env.example .env
-#   ./scripts/deploy.sh
+#   ./scripts/deploy.sh              # todo
+#   ./scripts/deploy_api.sh          # solo API
+#   ./scripts/deploy_frontend.sh     # solo PWA
 #
 # Compose lee variables con: docker compose --env-file .env -f docker-compose.prod.yml ...
 

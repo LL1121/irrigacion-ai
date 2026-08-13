@@ -56,13 +56,25 @@ En el **servidor** (con Docker instalado):
 
 ```bash
 chmod +x scripts/*.sh
-./scripts/deploy.sh
+./scripts/deploy.sh          # todo (primera vez o cambio grande)
 ```
 
-El script:
-1. Compila la PWA (`npm run build` → `desktop-app/dist`)
+Deploys parciales (sin rebuild de lo que no cambió):
+
+```bash
+./scripts/deploy_api.sh         # solo backend (imagen api)
+./scripts/deploy_frontend.sh    # solo PWA (npm build + restart api)
+./scripts/deploy_site.sh        # landing irrigacionmalargue.net
+./scripts/deploy_db.sh          # solo Postgres (no borra el volumen)
+./scripts/deploy_sandbox.sh     # imagen sandbox de skills
+```
+
+`deploy.sh` completo:
+1. Levanta Postgres
 2. Construye la imagen sandbox de skills
-3. Levanta PostgreSQL + FastAPI con la PWA montada en `/`
+3. Compila la PWA (`desktop-app/dist`)
+4. Rebuild + up del API
+5. Rebuild + up del site institucional
 
 Queda todo en `http://<IP-SERVIDOR>:8000` (API **y** interfaz móvil).
 
@@ -129,11 +141,10 @@ Asegurate de que:
 Si cambiás solo la UI (sin tocar backend):
 
 ```bash
-cd desktop-app && npm run build && cd ..
-docker compose --env-file .env -f docker-compose.prod.yml restart api
+./scripts/deploy_frontend.sh
 ```
 
-O volvé a correr `./scripts/deploy.sh` (rebuild completo).
+Eso corre `npm run build` y reinicia el API (la PWA va montada en volumen; no rebuild de imagen).
 
 ### Proveedores de IA
 
