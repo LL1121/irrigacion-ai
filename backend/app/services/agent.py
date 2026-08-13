@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 
 from app.core.checkpointer import get_checkpointer
 from app.core.config import get_settings
-from app.services.cache import embed_query, save_to_semantic_cache
+from app.services.cache import cacheable_exchange, embed_query, save_to_semantic_cache
 from app.services.context_memory import (
     ask_scope_prompt,
     clear_pending_note,
@@ -48,7 +48,6 @@ from app.services.order_parse import (
 from app.services.google_assistant import (
     APPROVAL_KIND_GOOGLE_TOOL,
     build_pending_google_tool,
-    detect_google_intent,
     execute_google_tool,
     google_write_needs_hitl,
 )
@@ -1983,8 +1982,7 @@ def run_agent(
     if (
         embedding
         and not values.get("pre_assist_done")
-        and not looks_like_save_context_intent(user_message)
-        and not detect_google_intent(user_message)
+        and cacheable_exchange(user_message, reply)
     ):
         save_to_semantic_cache(db, user_message, embedding, reply)
     return AgentOutcome(status=STATUS_OK, reply=reply, attachments=attachments or None)

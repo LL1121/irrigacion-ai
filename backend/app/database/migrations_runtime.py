@@ -206,3 +206,19 @@ def apply_schema_migrations(conn: Connection) -> None:
             """
         )
     )
+
+    # Prompts de un turno (alcance / HITL) no son conocimiento reutilizable.
+    conn.execute(
+        text(
+            """
+            DO $$ BEGIN
+                DELETE FROM semantic_cache
+                WHERE ai_response ~* 'contexto personal'
+                   OR ai_response ~* 'autoriz[aá]s'
+                   OR ai_response ~* 'qu[eé] quer[eé]s que anote';
+            EXCEPTION
+                WHEN undefined_table THEN NULL;
+            END $$
+            """
+        )
+    )

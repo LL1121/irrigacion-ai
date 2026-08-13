@@ -23,13 +23,11 @@ from app.services.agent import (
     run_agent,
 )
 from app.services.auth_session import get_optional_user
-from app.services.cache import check_semantic_cache
-from app.services.context_memory import looks_like_save_context_intent
-from app.services.google_assistant import APPROVAL_KIND_GOOGLE_TOOL, detect_google_intent
+from app.services.cache import check_semantic_cache, should_use_semantic_cache
+from app.services.google_assistant import APPROVAL_KIND_GOOGLE_TOOL
 from app.services.skill_marketplace import (
     APPROVAL_KIND_DOWNLOAD,
     download_remote_prompt,
-    looks_like_skill_intent,
 )
 
 router = APIRouter(prefix="/api", tags=["chat"])
@@ -153,12 +151,7 @@ def chat(
         )
 
     cached = None
-    skip_cache = (
-        looks_like_skill_intent(payload.message)
-        or looks_like_save_context_intent(payload.message)
-        or detect_google_intent(payload.message) is not None
-    )
-    if not skip_cache:
+    if should_use_semantic_cache(payload.message):
         cached = check_semantic_cache(db, payload.message)
     if cached is not None:
         _persist_chat_message(

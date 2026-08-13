@@ -32,6 +32,29 @@ def test_casual_chat_no_es_trabajo():
     assert not is_casual_chat("programame un mail a ana@x.com")
 
 
+def test_charla_y_prompts_hitl_no_van_al_cache():
+    from app.services.cache import (
+        cacheable_exchange,
+        is_reusable_knowledge_reply,
+        should_use_semantic_cache,
+    )
+    from app.services.context_memory import ask_scope_prompt
+
+    assert not should_use_semantic_cache("Que onda crack! Como andas bld?")
+    assert not should_use_semantic_cache("cómo andás")
+    assert not cacheable_exchange("Que onda crack! Como andas bld?", "Todo bien")
+    assert should_use_semantic_cache("qué altura tiene el punto 10009")
+    assert cacheable_exchange(
+        "qué altura tiene el punto 10009",
+        "El punto 10009 está en 1,20 m.",
+    )
+    assert not is_reusable_knowledge_reply(ask_scope_prompt())
+    assert not is_reusable_knowledge_reply(
+        "Se encontró la skill 'red'. ¿Autorizás a Gemini a auditarla?"
+    )
+    assert is_reusable_knowledge_reply("El caudal del canal 12 es 80 l/s.")
+
+
 def test_parse_context_scope():
     assert parse_context_scope("personal") == "personal"
     assert parse_context_scope("irrigación") == "irrigacion"
