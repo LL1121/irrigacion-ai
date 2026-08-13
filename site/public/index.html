@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="es">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -10,8 +10,9 @@
   <meta property="og:title" content="Irrigación Bot" />
   <meta property="og:type" content="website" />
   <meta property="og:url" content="https://irrigacionmalargue.net/" />
-  <meta property="og:description" content="Irrigación Bot is an institutional assistant app for irrigation staff in Malargüe. It answers operational questions from internal documents and, with user consent, uses Google Calendar, Gmail and Drive." />
-  <meta name="description" content="Irrigación Bot is an institutional assistant app for irrigation staff in Malargüe. It answers operational questions from internal documents and, with user consent, uses Google Calendar, Gmail and Drive." />
+  <meta property="og:locale" content="en_US" />
+  <meta property="og:description" content="Irrigación Bot is an institutional assistant app for irrigation staff in Malargüe, Argentina. It answers operational questions from internal documents and, with user consent, uses Google Calendar, Gmail and Drive." />
+  <meta name="description" content="Irrigación Bot is an institutional assistant app for irrigation staff in Malargüe, Argentina. It answers operational questions from internal documents and, with user consent, uses Google Calendar, Gmail and Drive." />
   <meta name="robots" content="index,follow" />
   <link rel="canonical" href="https://irrigacionmalargue.net/" />
   <link rel="stylesheet" href="/styles.css" />
@@ -32,107 +33,102 @@
   <header>
     <div class="wrap">
       <div class="brand">Irrigación Bot</div>
-      <div class="sub">Jefatura de Zona de Riego · Malargüe</div>
+      <div class="sub">Irrigation District Office · Malargüe, Argentina</div>
       <nav>
-        <a href="https://irrigacionmalargue.net/">Inicio</a>
-        <a href="https://irrigacionmalargue.net/politicas-privacidad">Política de privacidad</a>
-        <a href="https://ia.irrigacionmalargue.net/">Abrir Irrigación Bot</a>
+        <a href="https://irrigacionmalargue.net/">Home</a>
+        <a href="https://irrigacionmalargue.net/politicas-privacidad">Privacy Policy</a>
+        <a href="https://ia.irrigacionmalargue.net/">Open Irrigación Bot</a>
       </nav>
     </div>
   </header>
   <main class="wrap">
     <h1>Irrigación Bot</h1>
-    <p class="lead"><strong>Nombre de la aplicación:</strong> Irrigación Bot</p>
+    <p class="lead"><strong>Application name:</strong> Irrigación Bot</p>
     <p>
-      Irrigación Bot es una aplicación de la
-      <strong>Jefatura de Zona de Riego de Malargüe</strong> (Mendoza, Argentina).
-      Esta página es pública: no hace falta iniciar sesión para leerla.
+      Irrigación Bot is an application operated by the
+      <strong>Jefatura de Zona de Riego de Malargüe</strong> (Irrigation District Office,
+      Malargüe, Mendoza, Argentina). This homepage is public. You do not need to sign in
+      to read it.
     </p>
 
     <div class="actions">
-      <a class="btn btn-primary" href="https://ia.irrigacionmalargue.net/">Abrir Irrigación Bot</a>
-      <a class="btn btn-ghost" href="https://irrigacionmalargue.net/politicas-privacidad">Política de privacidad</a>
+      <a class="btn btn-primary" href="https://ia.irrigacionmalargue.net/">Open Irrigación Bot</a>
+      <a class="btn btn-ghost" href="https://irrigacionmalargue.net/politicas-privacidad">Privacy Policy</a>
     </div>
 
-    <h2>Propósito de la aplicación</h2>
+    <h2>Application purpose</h2>
     <div class="card">
       <p>
-        El propósito de <strong>Irrigación Bot</strong> es ayudar al personal autorizado
-        de la Jefatura de Zona de Riego a hacer su trabajo diario: consultar información
-        operativa y normativa, recuperar documentos internos, y guardar notas de contexto
-        (de oficina o personales).
+        The purpose of <strong>Irrigación Bot</strong> is to help authorized staff of the
+        Irrigation District Office with daily work: answer operational and regulatory
+        questions, retrieve internal documents, and save office-wide or personal notes
+        as context for the assistant.
       </p>
       <p>
-        También puede, <strong>solo si el usuario inicia sesión con Google y lo autoriza</strong>,
-        usar Google Calendar, Gmail y Drive para listar o crear eventos, listar o enviar
-        correos, y buscar o leer archivos.
-      </p>
-      <p>
-        <strong>Application purpose:</strong> Irrigación Bot is a workplace assistant for
-        irrigation staff. It answers questions from internal documents and, with the user’s
-        Google sign-in and confirmation, can read or create Calendar events, list or send
-        Gmail messages, and search or read Drive files.
+        Irrigación Bot can also use <strong>Google Calendar, Gmail and Google Drive</strong>
+        only when the user signs in with Google and authorizes those actions.
       </p>
     </div>
 
-    <h2>Funcionalidad de Irrigación Bot</h2>
+    <h2>What Irrigación Bot does</h2>
     <div class="card">
       <ul>
-        <li>Chat de consulta sobre operación hídrica, normativa y documentos que la oficina ya cargó.</li>
-        <li>Guardar texto como contexto compartido de irrigación o como contexto personal del usuario.</li>
-        <li>Subir documentos de oficina para indexarlos y poder preguntar sobre ellos.</li>
-        <li>Google Calendar: ver la agenda y crear eventos, con confirmación en pantalla antes de crear.</li>
-        <li>Gmail: listar correos recientes y enviar un mail, con confirmación en pantalla antes de enviar.</li>
-        <li>Google Drive: buscar y leer archivos; opcionalmente indexar un archivo como contexto, si el usuario lo pide.</li>
+        <li>Chat Q&amp;A about irrigation operations, regulations, and documents the office has already uploaded.</li>
+        <li>Save text as shared irrigation context or as personal context for the signed-in user.</li>
+        <li>Upload office documents so staff can ask questions about them.</li>
+        <li>Google Calendar: list upcoming events and create an event, with an on-screen Authorize / Cancel step before creating.</li>
+        <li>Gmail: list recent messages and send email, with an on-screen Authorize / Cancel step before sending.</li>
+        <li>Google Drive (read-only): search and read files; optionally index a file as context if the user asks.</li>
       </ul>
     </div>
 
-    <h2>Por qué Irrigación Bot pide datos de Google</h2>
+    <h2>Why Irrigación Bot requests Google user data</h2>
     <div class="card">
       <p>
-        Irrigación Bot solicita acceso a la cuenta de Google del usuario únicamente para
-        las funciones que esa persona pide en el chat. No usamos esos datos para publicidad
-        ni para entrenar modelos de terceros.
+        Irrigación Bot requests Google account access only to provide the features the
+        signed-in user asks for in the chat. We do not use this data for advertising or
+        to train third-party AI models.
       </p>
       <ul>
-        <li><strong>Identidad (nombre, correo, foto):</strong> para iniciar sesión y saber qué contexto personal y tokens corresponden a cada persona.</li>
-        <li><strong>Calendar:</strong> para mostrar eventos próximos y crear un evento cuando el usuario lo pide.</li>
-        <li><strong>Gmail:</strong> para listar o resumir correos y enviar un mensaje cuando el usuario lo pide y confirma.</li>
-        <li><strong>Drive (solo lectura):</strong> para buscar y leer archivos que el usuario indica, o indexarlos como contexto si lo pide.</li>
+        <li><strong>Identity (name, email, profile photo):</strong> to sign the user in and associate personal context and OAuth tokens with that person.</li>
+        <li><strong>Calendar:</strong> to show upcoming events and create an event when the user asks.</li>
+        <li><strong>Gmail:</strong> to list or summarize recent mail and send a message when the user asks and confirms.</li>
+        <li><strong>Drive (read-only):</strong> to search and read files the user points to, or index them as context if requested.</li>
       </ul>
       <p>
-        Crear un evento o enviar un correo requiere un paso extra de Autorizar / Cancelar
-        en la propia aplicación.
+        Creating a calendar event or sending email requires an extra Authorize / Cancel
+        confirmation inside Irrigación Bot.
       </p>
     </div>
 
-    <h2>Política de privacidad</h2>
+    <h2>Privacy Policy</h2>
     <p>
-      La política de privacidad de Irrigación Bot (la misma URL que figura en la pantalla
-      de consentimiento de Google) está publicada aquí, sin iniciar sesión:
+      The Irrigación Bot privacy policy (the same URL configured on the Google OAuth
+      consent screen) is public and does not require login:
     </p>
     <p>
       <a href="https://irrigacionmalargue.net/politicas-privacidad">https://irrigacionmalargue.net/politicas-privacidad</a>
     </p>
 
-    <h2>Quién opera la aplicación</h2>
+    <h2>Who operates this application</h2>
     <p>
-      Irrigación Bot es operada por la Jefatura de Zona de Riego de Malargüe, en el
-      dominio propio <a href="https://irrigacionmalargue.net/">irrigacionmalargue.net</a>.
-      La aplicación de chat está en
+      Irrigación Bot is operated by Jefatura de Zona de Riego de Malargüe on the
+      first-party domain
+      <a href="https://irrigacionmalargue.net/">https://irrigacionmalargue.net</a>.
+      The chat application itself is at
       <a href="https://ia.irrigacionmalargue.net/">https://ia.irrigacionmalargue.net</a>.
     </p>
 
-    <h2>Contacto</h2>
+    <h2>Contact</h2>
     <p>
       Jefatura de Zona de Riego de Malargüe<br />
-      Correo: <a href="mailto:ia@irrigacionmalargue.net">ia@irrigacionmalargue.net</a>
+      Email: <a href="mailto:ia@irrigacionmalargue.net">ia@irrigacionmalargue.net</a>
     </p>
   </main>
   <footer>
     <div class="wrap">
-      Irrigación Bot · Página pública, sin inicio de sesión.
-      · <a href="https://irrigacionmalargue.net/politicas-privacidad">Política de privacidad</a>
+      Irrigación Bot · Public page, no sign-in required.
+      · <a href="https://irrigacionmalargue.net/politicas-privacidad">Privacy Policy</a>
     </div>
   </footer>
 </body>
