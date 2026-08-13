@@ -69,9 +69,9 @@ def google_callback(
     ).rstrip("/")
 
     if error:
-        return RedirectResponse(f"{frontend}/?auth_error={quote(error)}")
+        return RedirectResponse(f"{frontend}/app?auth_error={quote(error)}")
     if not code or not state or state not in _OAUTH_STATES:
-        return RedirectResponse(f"{frontend}/?auth_error=invalid_state")
+        return RedirectResponse(f"{frontend}/app?auth_error=invalid_state")
     _OAUTH_STATES.pop(state, None)
 
     try:
@@ -103,10 +103,10 @@ def google_callback(
         )
         jwt_token = create_access_token(user_id=user["id"], email=email)
     except Exception as exc:  # noqa: BLE001
-        return RedirectResponse(f"{frontend}/?auth_error={quote(str(exc)[:120])}")
+        return RedirectResponse(f"{frontend}/app?auth_error={quote(str(exc)[:120])}")
 
     response = RedirectResponse(
-        f"{frontend}/?auth=ok&access_token={quote(jwt_token)}"
+        f"{frontend}/app?auth=ok&access_token={quote(jwt_token)}"
     )
     response.set_cookie(
         key="irrigacion_session",

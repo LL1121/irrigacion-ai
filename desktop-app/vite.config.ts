@@ -22,8 +22,8 @@ export default defineConfig(async () => ({
         background_color: "#0f172a",
         display: "standalone",
         orientation: "portrait-primary",
-        start_url: "/",
-        scope: "/",
+        start_url: "/app",
+        scope: "/app",
         lang: "es-AR",
         icons: [
           {
@@ -49,6 +49,7 @@ export default defineConfig(async () => ({
       workbox: {
         // No interceptar API, health, updates ni páginas legales (Google OAuth).
         navigateFallbackDenylist: [
+          /^\/$/,
           /^\/api\//,
           /^\/health(?:\/|$)/,
           /^\/updates\//,

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api import auth, chat, files, legal, skills
@@ -55,6 +56,24 @@ app.include_router(chat.router)
 app.include_router(skills.router)
 app.include_router(auth.router)
 app.include_router(legal.router)
+
+_OAUTH_HOME_HTML = Path(__file__).resolve().parent / "app" / "static" / "oauth_home.html"
+_OAUTH_HOME_CSS = Path(__file__).resolve().parent / "app" / "static" / "oauth_home.css"
+
+
+@app.get("/", include_in_schema=False)
+def oauth_public_homepage() -> FileResponse:
+    """HTML estático (sin JS) para la verificación OAuth de Google."""
+    return FileResponse(
+        _OAUTH_HOME_HTML,
+        media_type="text/html; charset=utf-8",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/oauth-home.css", include_in_schema=False)
+def oauth_public_homepage_css() -> FileResponse:
+    return FileResponse(_OAUTH_HOME_CSS, media_type="text/css; charset=utf-8")
 
 
 def _resolve_updates_dir() -> Path | None:
@@ -123,10 +142,16 @@ def _resolve_frontend_dist() -> Path | None:
 _frontend_dist = _resolve_frontend_dist()
 if _frontend_dist is not None:
     logger.info("Sirviendo la PWA compilada desde %s", _frontend_dist)
+
+    @app.get("/app", include_in_schema=False)
+    @app.get("/app/", include_in_schema=False)
+    def pwa_app_shell() -> FileResponse:
+        return FileResponse(_frontend_dist / "index.html")
+
     app.mount("/", StaticFiles(directory=str(_frontend_dist), html=True), name="pwa")
 else:
     logger.warning(
-        "No se encontró desktop-app/dist; la SPA no se servirá en '/'. "
+        "No se encontró desktop-app/dist; la SPA no se servirá en '/app'. "
         "Ejecutá 'npm run build' en desktop-app/ (o definí FRONTEND_DIST_DIR) "
         "para habilitarla."
     )
