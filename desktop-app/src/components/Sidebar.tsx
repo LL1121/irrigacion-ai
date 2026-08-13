@@ -303,6 +303,14 @@ export function Sidebar({
             Iniciar sesión con Google
           </button>
         )}
+        <a
+          href={`${getApiBaseUrl()}/politicas-privacidad`}
+          target="_blank"
+          rel="noreferrer"
+          className="mb-2 block text-[11px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+        >
+          Política de privacidad
+        </a>
         <p className="truncate font-mono text-[10px] text-muted-foreground/70">
           {getApiBaseUrl()}
         </p>
