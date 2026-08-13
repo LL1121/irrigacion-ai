@@ -199,14 +199,30 @@ def persist_chunks(
     document_name: str,
     chunks: list[str],
     embeddings: list[list[float]],
+    *,
+    scope: str = "irrigacion",
+    user_id: str | None = None,
+    source: str = "upload",
+    title: str | None = None,
 ) -> int:
     if len(chunks) != len(embeddings):
         raise ValueError("La cantidad de chunks y embeddings no coincide")
 
+    scope_norm = (scope or "irrigacion").strip().lower()
+    if scope_norm not in {"irrigacion", "personal"}:
+        raise ValueError("scope debe ser 'irrigacion' o 'personal'")
+    if scope_norm == "personal" and not user_id:
+        raise ValueError("user_id es obligatorio para contexto personal")
+
     insert_sql = text(
         """
-        INSERT INTO document_chunks (document_name, content, embedding)
-        VALUES (:document_name, :content, CAST(:embedding AS vector))
+        INSERT INTO document_chunks (
+            document_name, content, embedding, scope, user_id, source, title
+        )
+        VALUES (
+            :document_name, :content, CAST(:embedding AS vector),
+            :scope, CAST(:user_id AS uuid), :source, :title
+        )
         """
     )
 
@@ -218,13 +234,76 @@ def persist_chunks(
                 "document_name": document_name,
                 "content": chunk,
                 "embedding": embedding_literal,
+                "scope": scope_norm,
+                "user_id": user_id,
+                "source": source or "upload",
+                "title": title,
             },
         )
     db.commit()
     return len(chunks)
 
 
-def ingest_file(db: Session, file_bytes: bytes, filename: str) -> dict:
+def ingest_text_note(
+    db: Session,
+    content: str,
+    *,
+    scope: str,
+    user_id: str | None = None,
+    title: str | None = None,
+    document_name: str | None = None,
+) -> dict:
+    """Indexa una nota de chat como contexto tipado (personal / irrigación)."""
+    cleaned = (content or "").strip()
+    if not cleaned:
+        raise ValueError("No hay texto para guardar como contexto")
+
+    scope_norm = (scope or "").strip().lower()
+    if scope_norm in {"irrigacion", "de irrigacion", "oficina", "institucional"}:
+        scope_norm = "irrigacion"
+    elif scope_norm in {"personal", "mio", "mío", "privado"}:
+        scope_norm = "personal"
+    if scope_norm not in {"irrigacion", "personal"}:
+        raise ValueError("scope debe ser 'irrigacion' o 'personal'")
+    if scope_norm == "personal" and not user_id:
+        raise ValueError(
+            "Para guardar contexto personal necesitás iniciar sesión con Google."
+        )
+
+    label = title or cleaned.split("\n", 1)[0][:80]
+    doc_name = document_name or (
+        f"nota-personal:{label}" if scope_norm == "personal" else f"nota-irrigacion:{label}"
+    )
+    chunks = split_text(cleaned)
+    if not chunks:
+        chunks = [cleaned]
+    embeddings = generate_embeddings(chunks)
+    created = persist_chunks(
+        db,
+        doc_name,
+        chunks,
+        embeddings,
+        scope=scope_norm,
+        user_id=user_id,
+        source="chat_note",
+        title=label,
+    )
+    return {
+        "chunks_created": created,
+        "scope": scope_norm,
+        "title": label,
+        "document_name": doc_name,
+    }
+
+
+def ingest_file(
+    db: Session,
+    file_bytes: bytes,
+    filename: str,
+    *,
+    scope: str = "irrigacion",
+    user_id: str | None = None,
+) -> dict:
     """Procesa un archivo subido y lo indexa en document_chunks."""
     detect_file_type(filename)
     suffix = Path(filename).suffix.lower()
@@ -251,9 +330,20 @@ def ingest_file(db: Session, file_bytes: bytes, filename: str) -> dict:
             }
 
         embeddings = generate_embeddings(chunks)
-        created = persist_chunks(db, filename, chunks, embeddings)
+        created = persist_chunks(
+            db,
+            filename,
+            chunks,
+            embeddings,
+            scope=scope,
+            user_id=user_id,
+            source="upload",
+            title=filename,
+        )
 
         return {
             "filename": filename,
             "chunks_created": created,
+            "scope": scope,
         }
+

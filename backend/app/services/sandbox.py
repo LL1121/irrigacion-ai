@@ -277,8 +277,13 @@ async def execute_skill(
     Audita con Gemini (o salta si está en whitelist) y ejecuta la skill.
     Modo controlado por SKILL_EXECUTION_MODE: inline | sandbox.
     """
-    from app.services.skill_whitelist import add_to_whitelist, is_whitelisted
+    from app.services.skill_whitelist import (
+        add_to_whitelist,
+        has_whitelisted_skill_id,
+        is_whitelisted,
+    )
 
+    curated_ids = {"remote_telemetria_punto"}
     if skill_id and is_whitelisted(skill_id, code_str):
         audit: dict[str, Any] = {
             "is_safe": True,
@@ -286,6 +291,21 @@ async def execute_skill(
             "reason": "Whitelist: skill previamente auditada por Gemini",
             "whitelisted": True,
         }
+    elif skill_id and skill_id in curated_ids and has_whitelisted_skill_id(skill_id):
+        # Template curada ya conocida: reusar sin re-auditar aunque el hash cambie un poco.
+        audit = {
+            "is_safe": True,
+            "risk_score": 0,
+            "reason": "Whitelist: skill curada previamente auditada",
+            "whitelisted": True,
+        }
+        add_to_whitelist(
+            skill_id=skill_id,
+            code_str=code_str,
+            skill_name=skill_name,
+            source=source or "remote",
+            audit=audit,
+        )
     else:
         audit = await audit_skill_code(code_str)
         if not audit.get("is_safe"):

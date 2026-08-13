@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import logging
+from typing import Literal
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.services.auth_session import get_optional_user
 from app.services.document_export import (
     artifact_info,
     artifact_preview,
@@ -56,11 +58,21 @@ def generated_document_preview(file_id: str) -> dict:
 
 @router.post("/upload")
 async def upload_files(
+    request: Request,
     files: list[UploadFile] = File(...),
+    scope: Literal["irrigacion", "personal"] = Form("irrigacion"),
     db: Session = Depends(get_db),
 ) -> dict:
     if not files:
         raise HTTPException(status_code=400, detail="Debés enviar al menos un archivo")
+
+    user = get_optional_user(request, db)
+    user_id = user["id"] if user else None
+    if scope == "personal" and not user_id:
+        raise HTTPException(
+            status_code=401,
+            detail="Para subir contexto personal necesitás iniciar sesión con Google.",
+        )
 
     results: list[dict] = []
     for upload in files:
@@ -89,7 +101,13 @@ async def upload_files(
                 )
                 continue
 
-            summary = ingest_file(db, content, filename)
+            summary = ingest_file(
+                db,
+                content,
+                filename,
+                scope=scope,
+                user_id=user_id if scope == "personal" else None,
+            )
             results.append(summary)
         except Exception as exc:  # noqa: BLE001 - reportar error por archivo
             logger.exception("Error procesando %s", filename)
@@ -106,4 +124,5 @@ async def upload_files(
         "processed": len(results),
         "results": results,
         "supported_extensions": sorted(SUPPORTED_EXTENSIONS),
+        "scope": scope,
     }

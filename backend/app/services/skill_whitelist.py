@@ -51,6 +51,52 @@ def is_whitelisted(
             session.close()
 
 
+def has_whitelisted_skill_id(skill_id: str | None, db: Session | None = None) -> bool:
+    """True si esa skill_id ya pasó auditoría alguna vez (cualquier hash)."""
+    sid = (skill_id or "").strip()
+    if not sid:
+        return False
+    own = db is None
+    session = db or SessionLocal()
+    try:
+        row = session.execute(
+            text(
+                """
+                SELECT 1
+                FROM skill_whitelist
+                WHERE skill_id = :skill_id
+                LIMIT 1
+                """
+            ),
+            {"skill_id": sid},
+        ).first()
+        return row is not None
+    except Exception:
+        logger.exception("No se pudo consultar skill_whitelist por id")
+        return False
+    finally:
+        if own:
+            session.close()
+
+
+def can_auto_reuse_skill(skill: dict[str, Any], db: Session | None = None) -> bool:
+    """
+    Decide si se puede ejecutar sin HITL de descarga/ejecución.
+    - Match exacto id+hash, o
+    - Templates curadas ya conocidas por skill_id (código estable en repo).
+    """
+    sid = str(skill.get("id") or "").strip()
+    code = str(skill.get("code") or "")
+    if not sid or not code.strip():
+        return False
+    if is_whitelisted(sid, code, db=db):
+        return True
+    # Skills curadas (telemetría, etc.): si ya se auditó ese id, reusar sin re-pedir.
+    if skill.get("template") and has_whitelisted_skill_id(sid, db=db):
+        return True
+    return False
+
+
 def add_to_whitelist(
     *,
     skill_id: str,

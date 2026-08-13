@@ -1,6 +1,15 @@
 import { useMemo, useState } from "react";
-import { MessageSquare, MessageSquarePlus, Search, Trash2, Waves, X } from "lucide-react";
-import type { SessionSummary } from "../services/api";
+import {
+  LogIn,
+  LogOut,
+  MessageSquare,
+  MessageSquarePlus,
+  Search,
+  Trash2,
+  Waves,
+  X,
+} from "lucide-react";
+import type { AuthUser, SessionSummary } from "../services/api";
 import { getApiBaseUrl } from "../services/config";
 
 type SidebarProps = {
@@ -8,10 +17,14 @@ type SidebarProps = {
   activeSessionId: string;
   apiOnline: boolean;
   open: boolean;
+  authUser: AuthUser | null;
+  authBusy?: boolean;
   onClose: () => void;
   onNewChat: () => void;
   onSelectSession: (sessionId: string) => void;
   onDeleteSession: (sessionId: string) => void;
+  onGoogleLogin: () => void;
+  onLogout: () => void;
 };
 
 function preview(text: string | null): string {
@@ -46,10 +59,14 @@ export function Sidebar({
   activeSessionId,
   apiOnline,
   open,
+  authUser,
+  authBusy = false,
   onClose,
   onNewChat,
   onSelectSession,
   onDeleteSession,
+  onGoogleLogin,
+  onLogout,
 }: SidebarProps) {
   const [search, setSearch] = useState("");
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -244,6 +261,48 @@ export function Sidebar({
       </div>
 
       <div className="border-t border-sidebar-border px-4 py-3">
+        {authUser ? (
+          <div className="mb-3 flex items-center gap-2.5">
+            {authUser.picture ? (
+              <img
+                src={authUser.picture}
+                alt=""
+                className="h-8 w-8 rounded-full object-cover"
+                referrerPolicy="no-referrer"
+              />
+            ) : (
+              <div className="flex h-8 w-8 items-center justify-center rounded-full bg-muted text-xs font-medium text-foreground">
+                {(authUser.name || authUser.email || "?").slice(0, 1).toUpperCase()}
+              </div>
+            )}
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-xs font-medium text-foreground">
+                {authUser.name || authUser.email}
+              </p>
+              <p className="truncate text-[10px] text-muted-foreground">{authUser.email}</p>
+            </div>
+            <button
+              type="button"
+              title="Cerrar sesión"
+              disabled={authBusy}
+              onClick={onLogout}
+              className="flex h-8 w-8 items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50"
+            >
+              <LogOut size={14} />
+            </button>
+          </div>
+        ) : (
+          <button
+            type="button"
+            disabled={authBusy || !apiOnline}
+            onClick={onGoogleLogin}
+            className="mb-3 flex h-9 w-full items-center justify-center gap-2 rounded-xl border border-border bg-background px-3 text-sm text-foreground transition-colors hover:bg-muted disabled:opacity-50"
+            style={{ fontWeight: 500 }}
+          >
+            <LogIn size={14} />
+            Iniciar sesión con Google
+          </button>
+        )}
         <p className="truncate font-mono text-[10px] text-muted-foreground/70">
           {getApiBaseUrl()}
         </p>

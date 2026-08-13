@@ -14,11 +14,16 @@ import {
 import {
   approveSkill,
   deleteSession,
+  fetchAuthMe,
   getSessionMessages,
   healthCheck,
   listSessions,
+  logoutAuth,
   sendChat,
+  setStoredAccessToken,
+  startGoogleLogin,
   truncateSession,
+  type AuthUser,
   type ChatMessage,
   type SessionSummary,
   type SpeedMode,
@@ -103,6 +108,8 @@ function AppShell() {
   const [windowFocused, setWindowFocused] = useState(true);
   const abortRef = useRef<AbortController | null>(null);
   const [pendingUpdate, setPendingUpdate] = useState<Update | null>(null);
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [authBusy, setAuthBusy] = useState(false);
 
   useEffect(() => {
     if (!isTauriRuntime()) return;
@@ -129,6 +136,33 @@ function AppShell() {
     setApiOnline(await healthCheck());
   }, []);
 
+  const refreshAuth = useCallback(async () => {
+    try {
+      const me = await fetchAuthMe();
+      setAuthUser(me.authenticated ? me.user : null);
+    } catch {
+      setAuthUser(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const token = params.get("access_token");
+    const authOk = params.get("auth");
+    const authError = params.get("auth_error");
+    if (token) {
+      setStoredAccessToken(token);
+    }
+    if (token || authOk || authError) {
+      const url = new URL(window.location.href);
+      url.searchParams.delete("access_token");
+      url.searchParams.delete("auth");
+      url.searchParams.delete("auth_error");
+      window.history.replaceState({}, "", url.pathname + url.search + url.hash);
+    }
+    void refreshAuth();
+  }, [refreshAuth]);
+
   useEffect(() => {
     void (async () => {
       await refreshHealth();
@@ -139,6 +173,28 @@ function AppShell() {
     }, 15000);
     return () => window.clearInterval(timer);
   }, [refreshSessions, refreshHealth]);
+
+  async function handleGoogleLogin() {
+    setAuthBusy(true);
+    try {
+      await startGoogleLogin();
+    } catch (err) {
+      setAuthBusy(false);
+      window.alert(err instanceof Error ? err.message : "No se pudo iniciar sesión");
+    }
+  }
+
+  async function handleLogout() {
+    setAuthBusy(true);
+    try {
+      await logoutAuth();
+      setAuthUser(null);
+    } catch (err) {
+      window.alert(err instanceof Error ? err.message : "No se pudo cerrar sesión");
+    } finally {
+      setAuthBusy(false);
+    }
+  }
 
   useEffect(() => {
     const onFocus = () => setWindowFocused(true);
@@ -400,10 +456,14 @@ function AppShell() {
         activeSessionId={sessionId}
         apiOnline={apiOnline}
         open={sidebarOpen}
+        authUser={authUser}
+        authBusy={authBusy}
         onClose={() => setSidebarOpen(false)}
         onNewChat={() => void handleNewChat()}
         onSelectSession={(id) => void handleSelectSession(id)}
         onDeleteSession={(id) => void handleDeleteSession(id)}
+        onGoogleLogin={() => void handleGoogleLogin()}
+        onLogout={() => void handleLogout()}
       />
       <ChatWindow
         messages={messages}

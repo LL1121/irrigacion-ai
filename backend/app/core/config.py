@@ -62,6 +62,16 @@ class Settings(BaseSettings):
     # Si queda vacío, main.py lo ubica con rutas relativas conocidas.
     frontend_dist_dir: str = ""
 
+    # Google OAuth (login + Calendar / Gmail / Drive)
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    google_redirect_uri: str = "http://localhost:8000/api/auth/google/callback"
+    token_encryption_key: str = ""
+    app_jwt_secret: str = ""
+    app_jwt_ttl_hours: int = 168
+    # URL a la que redirigir el browser tras login OK (PWA)
+    frontend_public_url: str = ""
+
     @property
     def is_production(self) -> bool:
         return self.app_env.lower() in {"production", "prod"}

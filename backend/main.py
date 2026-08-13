@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from app.api import chat, files, skills
+from app.api import auth, chat, files, skills
 from app.core.checkpointer import close_checkpointer, init_checkpointer
 from app.core.config import get_settings
 from app.core.database import ensure_runtime_schema
@@ -53,6 +53,7 @@ app.add_middleware(
 app.include_router(files.router)
 app.include_router(chat.router)
 app.include_router(skills.router)
+app.include_router(auth.router)
 
 
 def _resolve_updates_dir() -> Path | None:

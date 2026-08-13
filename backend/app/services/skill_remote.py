@@ -326,6 +326,38 @@ def _build_telemetria_skill(task: str) -> dict[str, Any]:
     return skill
 
 
+def resolve_reusable_remote_skill(
+    task: str,
+    *,
+    conversation_context: str | None = None,
+) -> dict[str, Any] | None:
+    """
+    Si ya hay una skill remota instalada/auditada para esta tarea (p.ej. telemetría),
+    devolverla lista para auto-ejecutar sin pedir descarga de nuevo.
+    """
+    from app.services.skill_whitelist import can_auto_reuse_skill
+
+    effective = resolve_effective_remote_task(task, conversation_context)
+    candidates: list[dict[str, Any]] = []
+    if is_telemetria_request(effective) or is_telemetria_request(task or ""):
+        candidates.append(_build_telemetria_skill(effective))
+
+    for skill in candidates:
+        if can_auto_reuse_skill(skill):
+            # Refrescar args con el pedido actual (punto/URL pueden cambiar).
+            skill["arguments"] = merge_web_skill_arguments(
+                dict(skill.get("arguments") or {}),
+                effective,
+            )
+            skill["arguments"]["query"] = effective
+            logger.info(
+                "Reusando skill remota whitelisteada id=%s (sin re-descarga)",
+                skill.get("id"),
+            )
+            return skill
+    return None
+
+
 def _fallback_for_invalid_skill(task: str, urls: list[str]) -> dict[str, Any] | None:
     if is_telemetria_request(task) or any("irrigacion.gov.ar" in u for u in urls):
         return _build_telemetria_skill(task)

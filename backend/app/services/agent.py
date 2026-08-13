@@ -18,9 +18,32 @@ from sqlalchemy.orm import Session
 from app.core.checkpointer import get_checkpointer
 from app.core.config import get_settings
 from app.services.cache import embed_query, save_to_semantic_cache
+from app.services.context_memory import (
+    ask_scope_prompt,
+    clear_pending_note,
+    confirm_saved_message,
+    extract_note_body,
+    get_pending_note,
+    looks_like_save_context_intent,
+    parse_context_scope,
+    save_context_note,
+    set_pending_note,
+)
 from app.services.document_export import (
     artifact_info,
     save_artifact_from_base64,
+)
+from app.services.google_assistant import (
+    APPROVAL_KIND_GOOGLE_TOOL,
+    build_pending_google_tool,
+    detect_google_intent,
+    execute_google_tool,
+    google_write_needs_hitl,
+)
+from app.services.google_workspace import (
+    drive_read_text_file,
+    drive_search_files,
+    google_oauth_configured,
 )
 from app.services.response_normalize import (
     classify_skill_payload,
@@ -50,8 +73,12 @@ from app.services.skill_marketplace import (
     should_try_skill_marketplace,
     thread_brief_for_prompt,
 )
-from app.services.skill_remote import generate_remote_skill, validate_remote_skill
-from app.services.skill_whitelist import is_whitelisted
+from app.services.skill_remote import (
+    generate_remote_skill,
+    resolve_reusable_remote_skill,
+    validate_remote_skill,
+)
+from app.services.skill_whitelist import can_auto_reuse_skill, is_whitelisted
 from app.services.token_guard import (
     dumps_capped,
     enforce_request_budget,
@@ -134,6 +161,7 @@ class AgentState(TypedDict):
     session_id: str
     user_message: str
     speed_mode: NotRequired[str]
+    user_id: NotRequired[str | None]
     history: list[dict]
     retrieved_docs: list[str]
     query_embedding: list[float]
@@ -145,6 +173,9 @@ class AgentState(TypedDict):
     attachments: NotRequired[list[dict[str, Any]]]
     approval_kind: NotRequired[str | None]
     download_approved: NotRequired[bool | None]
+    pending_google_tool: NotRequired[dict[str, Any] | None]
+    google_approved: NotRequired[bool | None]
+    pre_assist_done: NotRequired[bool]
 
 
 @dataclass
@@ -203,6 +234,7 @@ def _retrieve_node(state: AgentState, db: Session) -> dict:
     embedding = embed_query(state["user_message"])
     literal = _embedding_literal(embedding)
     top_k = _resolve_top_k(state.get("speed_mode"))
+    user_id = state.get("user_id")
 
     rows = db.execute(
         text(
@@ -210,25 +242,239 @@ def _retrieve_node(state: AgentState, db: Session) -> dict:
             SELECT
                 document_name,
                 content,
+                scope,
                 (embedding <=> CAST(:embedding AS vector)) AS distance
             FROM document_chunks
             WHERE embedding IS NOT NULL
+              AND (
+                    scope = 'irrigacion'
+                    OR (
+                        scope = 'personal'
+                        AND :user_id IS NOT NULL
+                        AND user_id = CAST(:user_id AS uuid)
+                    )
+              )
             ORDER BY embedding <=> CAST(:embedding AS vector)
             LIMIT :top_k
             """
         ),
-        {"embedding": literal, "top_k": top_k},
+        {"embedding": literal, "top_k": top_k, "user_id": user_id},
     ).mappings().all()
 
     docs: list[str] = []
     for row in rows:
+        scope = row.get("scope") or "irrigacion"
         docs.append(
-            f"[{row['document_name']} | dist={float(row['distance']):.4f}]\n{row['content']}"
+            f"[{row['document_name']} | {scope} | dist={float(row['distance']):.4f}]\n"
+            f"{row['content']}"
         )
 
     return {
         "query_embedding": embedding,
         "retrieved_docs": docs,
+    }
+
+
+def _save_scoped_note(
+    db: Session,
+    *,
+    content: str,
+    scope: str,
+    user_id: str | None,
+) -> str:
+    if scope == "personal" and not user_id:
+        return (
+            "Para guardar contexto **personal** necesitás iniciar sesión con Google. "
+            "Si preferís, decime **irrigación** y lo guardo compartido en la oficina."
+        )
+    try:
+        save_context_note(db, content, scope=scope, user_id=user_id)
+    except ValueError as exc:
+        return str(exc)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Fallo al guardar contexto tipado")
+        return f"No pude guardar el contexto: {exc}"
+    return confirm_saved_message(scope)
+
+
+def _handle_drive_index_to_context(
+    db: Session,
+    *,
+    user_id: str,
+    session_id: str,
+    pending: dict[str, Any],
+) -> dict:
+    args = pending.get("arguments") or {}
+    file_id = str(args.get("file_id") or "").strip()
+    try:
+        if not file_id:
+            hits = drive_search_files(
+                db, user_id, query=str(args.get("search") or args.get("query") or "")
+            )
+            if not hits:
+                return {
+                    "reply": (
+                        "No encontré un archivo en Drive para indexar. "
+                        "Pasame el ID o un nombre más preciso."
+                    ),
+                    "pre_assist_done": True,
+                    "needs_approval": False,
+                    "approval_kind": None,
+                    "pending_google_tool": None,
+                }
+            file_id = str(hits[0].get("id") or "")
+        data = drive_read_text_file(db, user_id, file_id)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "reply": f"No pude leer el archivo de Drive: {exc}",
+            "pre_assist_done": True,
+            "needs_approval": False,
+            "approval_kind": None,
+            "pending_google_tool": None,
+        }
+    body = (data.get("text") or "").strip()
+    title = data.get("name") or "archivo Drive"
+    if not body:
+        return {
+            "reply": f"El archivo «{title}» no tiene texto legible para indexar.",
+            "pre_assist_done": True,
+            "needs_approval": False,
+            "approval_kind": None,
+            "pending_google_tool": None,
+        }
+    set_pending_note(session_id, f"[{title}]\n{body[:8000]}")
+    return {
+        "reply": (
+            f"Leí «{title}» desde Drive. "
+            + ask_scope_prompt()
+        ),
+        "pre_assist_done": True,
+        "needs_approval": False,
+        "approval_kind": None,
+        "pending_google_tool": None,
+    }
+
+
+def _pre_assist_node(state: AgentState, db: Session) -> dict:
+    """Contexto tipado + tools Google antes del plan LLM/skills."""
+    message = state["user_message"]
+    session_id = state["session_id"]
+    user_id = state.get("user_id")
+
+    pending_note = get_pending_note(session_id)
+    if pending_note:
+        scope = parse_context_scope(message)
+        if scope:
+            clear_pending_note(session_id)
+            reply = _save_scoped_note(
+                db, content=pending_note, scope=scope, user_id=user_id
+            )
+            return {
+                "reply": reply,
+                "pre_assist_done": True,
+                "needs_approval": False,
+                "approval_kind": None,
+                "pending_skill": None,
+                "pending_google_tool": None,
+            }
+        if looks_like_save_context_intent(message):
+            # Nuevo pedido reemplaza el pendiente.
+            set_pending_note(session_id, extract_note_body(message))
+            return {
+                "reply": ask_scope_prompt(),
+                "pre_assist_done": True,
+                "needs_approval": False,
+                "approval_kind": None,
+                "pending_skill": None,
+                "pending_google_tool": None,
+            }
+        # Todavía espera personal/irrigación
+        if len(message.strip()) < 40:
+            return {
+                "reply": ask_scope_prompt(),
+                "pre_assist_done": True,
+                "needs_approval": False,
+                "approval_kind": None,
+                "pending_skill": None,
+                "pending_google_tool": None,
+            }
+
+    if looks_like_save_context_intent(message):
+        scope = parse_context_scope(message)
+        body = extract_note_body(message)
+        if scope:
+            reply = _save_scoped_note(db, content=body, scope=scope, user_id=user_id)
+            return {
+                "reply": reply,
+                "pre_assist_done": True,
+                "needs_approval": False,
+                "approval_kind": None,
+                "pending_skill": None,
+                "pending_google_tool": None,
+            }
+        set_pending_note(session_id, body)
+        return {
+            "reply": ask_scope_prompt(),
+            "pre_assist_done": True,
+            "needs_approval": False,
+            "approval_kind": None,
+            "pending_skill": None,
+            "pending_google_tool": None,
+        }
+
+    intent = detect_google_intent(message)
+    if intent:
+        if not user_id:
+            return {
+                "reply": (
+                    "Para usar Calendar, Gmail o Drive necesitás "
+                    "**iniciar sesión con Google** (botón en el menú)."
+                ),
+                "pre_assist_done": True,
+                "needs_approval": False,
+                "approval_kind": None,
+                "pending_google_tool": None,
+            }
+        if not google_oauth_configured():
+            return {
+                "reply": "Google OAuth todavía no está configurado en el servidor.",
+                "pre_assist_done": True,
+                "needs_approval": False,
+                "approval_kind": None,
+                "pending_google_tool": None,
+            }
+        pending = build_pending_google_tool(intent, message)
+        if pending.get("action") == "drive_index":
+            return _handle_drive_index_to_context(
+                db, user_id=user_id, session_id=session_id, pending=pending
+            )
+        if google_write_needs_hitl(db, user_id, pending):
+            return {
+                "pending_google_tool": pending,
+                "needs_approval": True,
+                "approval_kind": APPROVAL_KIND_GOOGLE_TOOL,
+                "pre_assist_done": True,
+                "pending_skill": None,
+                "reply": "",
+            }
+        try:
+            reply = execute_google_tool(db, user_id=user_id, pending=pending)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Fallo tool Google %s", pending.get("tool_id"))
+            reply = f"No pude completar la acción de Google: {exc}"
+        return {
+            "reply": reply,
+            "pre_assist_done": True,
+            "needs_approval": False,
+            "approval_kind": None,
+            "pending_google_tool": None,
+            "pending_skill": None,
+        }
+
+    return {
+        "pre_assist_done": False,
+        "pending_google_tool": None,
+        "google_approved": None,
     }
 
 
@@ -294,11 +540,18 @@ def _force_skill_or_download(
 ) -> dict[str, Any]:
     """Resuelve skill con criterio estricto; si duda, pregunta."""
     return _plan_from_decision(
-        resolve_skill_decision(user_message, context_text=context_text)
+        resolve_skill_decision(user_message, context_text=context_text),
+        user_message=user_message,
+        context_text=context_text,
     )
 
 
-def _plan_from_decision(decision: dict[str, Any]) -> dict[str, Any]:
+def _plan_from_decision(
+    decision: dict[str, Any],
+    *,
+    user_message: str = "",
+    context_text: str | None = None,
+) -> dict[str, Any]:
     action = decision.get("action")
     if action == "clarify":
         return {
@@ -311,13 +564,22 @@ def _plan_from_decision(decision: dict[str, Any]) -> dict[str, Any]:
     if action == "execute":
         skill = decision.get("skill") or {}
         if not skill.get("found"):
+            # Sin skill local: intentar reusar remota ya instalada antes de pedir descarga.
+            reused = resolve_reusable_remote_skill(
+                user_message or "",
+                conversation_context=context_text,
+            )
+            if reused:
+                return _auto_execute_skill_state(reused)
             return {
                 "pending_skill": None,
                 "approval_kind": APPROVAL_KIND_DOWNLOAD,
                 "needs_approval": True,
                 "reply": "",
             }
-        if is_whitelisted(str(skill.get("id") or ""), str(skill.get("code") or "")):
+        if can_auto_reuse_skill(skill) or is_whitelisted(
+            str(skill.get("id") or ""), str(skill.get("code") or "")
+        ):
             return _auto_execute_skill_state(skill)
         return {
             "pending_skill": skill,
@@ -326,6 +588,13 @@ def _plan_from_decision(decision: dict[str, Any]) -> dict[str, Any]:
             "reply": "",
         }
     if action == "download":
+        # Ya la ejecutamos / está en whitelist → no volver a pedir descarga.
+        reused = resolve_reusable_remote_skill(
+            user_message or "",
+            conversation_context=context_text,
+        )
+        if reused:
+            return _auto_execute_skill_state(reused)
         return {
             "pending_skill": None,
             "approval_kind": APPROVAL_KIND_DOWNLOAD,
@@ -355,7 +624,11 @@ def _resolve_skill_plan(
     )
     if decision.get("action") == "none":
         return None
-    return _plan_from_decision(decision)
+    return _plan_from_decision(
+        decision,
+        user_message=user_message,
+        context_text=context_text or user_message,
+    )
 
 
 def _plan_node(state: AgentState) -> dict:
@@ -516,6 +789,20 @@ def _route_after_plan(
     return "end_ok"
 
 
+def _route_after_pre_assist(
+    state: AgentState,
+) -> Literal["human_gate_google", "plan", "end_ok"]:
+    if (
+        state.get("approval_kind") == APPROVAL_KIND_GOOGLE_TOOL
+        and state.get("needs_approval")
+        and state.get("pending_google_tool")
+    ):
+        return "human_gate_google"
+    if state.get("pre_assist_done"):
+        return "end_ok"
+    return "plan"
+
+
 def _approval_prompt(skill: dict[str, Any]) -> str:
     name = skill.get("name") or "desconocida"
     source = skill.get("source")
@@ -530,10 +817,30 @@ def _approval_prompt(skill: dict[str, Any]) -> str:
     )
 
 
+def _google_tool_prompt(pending: dict[str, Any]) -> str:
+    tool_id = pending.get("tool_id") or pending.get("name") or "google"
+    args = pending.get("arguments") or {}
+    if tool_id == "calendar.create":
+        return (
+            f"Voy a crear el evento **{args.get('summary') or 'sin título'}** "
+            f"({args.get('start_iso')} → {args.get('end_iso')}) en tu Calendar. "
+            "¿Autorizás?"
+        )
+    if tool_id == "gmail.send":
+        return (
+            f"Voy a enviar un mail a **{args.get('to') or '(sin destinatario)'}** "
+            f"con asunto «{args.get('subject')}». ¿Autorizás?"
+        )
+    return f"Voy a ejecutar **{tool_id}** en tu cuenta Google. ¿Autorizás?"
+
+
 def _interrupt_to_prompt(payload: dict[str, Any], values: dict[str, Any]) -> str:
     kind = payload.get("approval_kind") or payload.get("intent")
     if kind == APPROVAL_KIND_DOWNLOAD:
         return download_remote_prompt()
+    if kind == APPROVAL_KIND_GOOGLE_TOOL:
+        pending = values.get("pending_google_tool") or {}
+        return _google_tool_prompt(pending)
     skill = values.get("pending_skill") or {}
     return _approval_prompt(
         {
@@ -574,6 +881,13 @@ def _route_after_download_gate(state: AgentState) -> Literal["fetch_remote_skill
 
 def _fetch_remote_skill_node(state: AgentState) -> dict:
     ctx = _conversation_text(state)
+    # Si ya está instalada/auditada, ni siquiera "descargar": ejecutar directo.
+    reused = resolve_reusable_remote_skill(
+        state["user_message"],
+        conversation_context=ctx,
+    )
+    if reused:
+        return _auto_execute_skill_state(reused)
     try:
         skill = generate_remote_skill(
             state["user_message"],
@@ -593,7 +907,9 @@ def _fetch_remote_skill_node(state: AgentState) -> dict:
             "needs_approval": False,
             "approval_kind": None,
         }
-    if is_whitelisted(str(skill.get("id") or ""), str(skill.get("code") or "")):
+    if can_auto_reuse_skill(skill) or is_whitelisted(
+        str(skill.get("id") or ""), str(skill.get("code") or "")
+    ):
         return _auto_execute_skill_state(skill)
     return {
         "pending_skill": skill,
@@ -635,6 +951,54 @@ def _human_gate_execute_node(state: AgentState) -> dict:
         "skill_approved": approved,
         "needs_approval": False,
         "approval_kind": None,
+    }
+
+
+def _human_gate_google_node(state: AgentState) -> dict:
+    pending = state.get("pending_google_tool") or {}
+    decision = interrupt(
+        {
+            "intent": APPROVAL_KIND_GOOGLE_TOOL,
+            "approval_kind": APPROVAL_KIND_GOOGLE_TOOL,
+            "skill_name": pending.get("name") or pending.get("tool_id"),
+            "skill_description": pending.get("description"),
+            "tool_id": pending.get("tool_id"),
+        }
+    )
+    if isinstance(decision, dict):
+        approved = bool(decision.get("approved"))
+    else:
+        approved = bool(decision)
+    return {
+        "google_approved": approved,
+        "needs_approval": False,
+        "approval_kind": None,
+    }
+
+
+def _run_google_tool_node(state: AgentState, db: Session) -> dict:
+    if not state.get("google_approved"):
+        return {
+            "reply": "Entendido. Cancelé la acción de Google.",
+            "pending_google_tool": None,
+            "google_approved": False,
+        }
+    user_id = state.get("user_id")
+    pending = state.get("pending_google_tool") or {}
+    if not user_id:
+        return {
+            "reply": "Necesitás iniciar sesión con Google para continuar.",
+            "pending_google_tool": None,
+        }
+    try:
+        reply = execute_google_tool(db, user_id=user_id, pending=pending)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Fallo tool Google post-HITL")
+        reply = f"No pude completar la acción de Google: {exc}"
+    return {
+        "reply": reply,
+        "pending_google_tool": None,
+        "google_approved": True,
     }
 
 
@@ -899,16 +1263,24 @@ def _persist_message(
     role: str,
     message: str,
     metadata: dict[str, Any] | None = None,
+    user_id: str | None = None,
 ) -> None:
     db.execute(
         text(
             """
-            INSERT INTO chat_messages (session_id, role, message, metadata)
-            VALUES (:session_id, :role, :message, CAST(:metadata AS jsonb))
+            INSERT INTO chat_messages (session_id, user_id, role, message, metadata)
+            VALUES (
+                :session_id,
+                CAST(:user_id AS uuid),
+                :role,
+                :message,
+                CAST(:metadata AS jsonb)
+            )
             """
         ),
         {
             "session_id": session_id,
+            "user_id": user_id,
             "role": role,
             "message": message,
             "metadata": json.dumps(metadata, ensure_ascii=False) if metadata else None,
@@ -950,18 +1322,36 @@ def build_agent_graph(db: Session):
     def fetch_history(state: AgentState) -> dict:
         return _fetch_history_node(state, db)
 
+    def pre_assist(state: AgentState) -> dict:
+        return _pre_assist_node(state, db)
+
+    def run_google(state: AgentState) -> dict:
+        return _run_google_tool_node(state, db)
+
     graph.add_node("retrieve", retrieve)
     graph.add_node("fetch_history", fetch_history)
+    graph.add_node("pre_assist", pre_assist)
     graph.add_node("plan", _plan_node)
     graph.add_node("human_gate_download", _human_gate_download_node)
     graph.add_node("fetch_remote_skill", _fetch_remote_skill_node)
     graph.add_node("human_gate_execute", _human_gate_execute_node)
+    graph.add_node("human_gate_google", _human_gate_google_node)
+    graph.add_node("run_google", run_google)
     graph.add_node("run_skill", _run_skill_node)
     graph.add_node("compose_skill_reply", _compose_skill_reply_node)
 
     graph.add_edge(START, "retrieve")
     graph.add_edge("retrieve", "fetch_history")
-    graph.add_edge("fetch_history", "plan")
+    graph.add_edge("fetch_history", "pre_assist")
+    graph.add_conditional_edges(
+        "pre_assist",
+        _route_after_pre_assist,
+        {
+            "human_gate_google": "human_gate_google",
+            "plan": "plan",
+            "end_ok": END,
+        },
+    )
     graph.add_conditional_edges(
         "plan",
         _route_after_plan,
@@ -987,6 +1377,8 @@ def build_agent_graph(db: Session):
         },
     )
     graph.add_edge("human_gate_execute", "run_skill")
+    graph.add_edge("human_gate_google", "run_google")
+    graph.add_edge("run_google", END)
     graph.add_edge("run_skill", "compose_skill_reply")
     graph.add_edge("compose_skill_reply", END)
 
@@ -1004,6 +1396,7 @@ def run_agent(
     session_id: UUID | str,
     user_message: str,
     speed_mode: str | None = DEFAULT_SPEED_MODE,
+    user_id: str | None = None,
 ) -> AgentOutcome:
     """Ejecuta el grafo. Puede devolver REQUIRES_APPROVAL si hay HITL."""
     compiled = build_agent_graph(db)
@@ -1018,14 +1411,12 @@ def run_agent(
         values = getattr(compiled.get_state(config), "values", None) or {}
         prompt = _interrupt_to_prompt(pending, values)
         kind = pending.get("approval_kind")
-        skill = values.get("pending_skill") or {}
-        name = pending.get("skill_name") or skill.get("name")
-        description = pending.get("skill_description") or skill.get("description")
+        name, description = _approval_display_names(kind, pending, values)
         return AgentOutcome(
             status=STATUS_APPROVAL,
             reply=prompt,
-            skill_name=name if kind == APPROVAL_KIND_EXECUTE else None,
-            skill_description=description if kind == APPROVAL_KIND_EXECUTE else None,
+            skill_name=name,
+            skill_description=description,
             approval_kind=kind,
         )
 
@@ -1035,6 +1426,7 @@ def run_agent(
                 "session_id": sid,
                 "user_message": user_message,
                 "speed_mode": resolved_speed_mode,
+                "user_id": user_id,
                 "history": [],
                 "retrieved_docs": [],
                 "query_embedding": [],
@@ -1046,6 +1438,9 @@ def run_agent(
                 "attachments": [],
                 "approval_kind": None,
                 "download_approved": None,
+                "pending_google_tool": None,
+                "google_approved": None,
+                "pre_assist_done": False,
             },
             config,
         )
@@ -1059,14 +1454,10 @@ def run_agent(
     values = getattr(snapshot, "values", None) or {}
 
     if interrupt_payload:
-        skill = values.get("pending_skill") or {}
         kind = interrupt_payload.get("approval_kind")
         prompt = _interrupt_to_prompt(interrupt_payload, values)
-        name = interrupt_payload.get("skill_name") or skill.get("name")
-        description = (
-            interrupt_payload.get("skill_description") or skill.get("description")
-        )
-        _persist_message(db, sid, "user", user_message)
+        name, description = _approval_display_names(kind, interrupt_payload, values)
+        _persist_message(db, sid, "user", user_message, user_id=user_id)
         _persist_message(
             db,
             sid,
@@ -1079,12 +1470,13 @@ def run_agent(
                 "skill_name": name,
                 "skill_description": description,
             },
+            user_id=user_id,
         )
         return AgentOutcome(
             status=STATUS_APPROVAL,
             reply=prompt,
-            skill_name=name if kind == APPROVAL_KIND_EXECUTE else None,
-            skill_description=description if kind == APPROVAL_KIND_EXECUTE else None,
+            skill_name=name,
+            skill_description=description,
             approval_kind=kind,
         )
 
@@ -1095,14 +1487,39 @@ def run_agent(
     )
     attachments = values.get("attachments") or []
     embedding = values.get("query_embedding") or []
-    _persist_message(db, sid, "user", user_message)
+    _persist_message(db, sid, "user", user_message, user_id=user_id)
     assistant_meta: dict[str, Any] | None = None
     if attachments:
         assistant_meta = {"attachments": attachments}
-    _persist_message(db, sid, "assistant", reply, assistant_meta)
-    if embedding:
+    _persist_message(db, sid, "assistant", reply, assistant_meta, user_id=user_id)
+    if (
+        embedding
+        and not values.get("pre_assist_done")
+        and not looks_like_save_context_intent(user_message)
+        and not detect_google_intent(user_message)
+    ):
         save_to_semantic_cache(db, user_message, embedding, reply)
     return AgentOutcome(status=STATUS_OK, reply=reply, attachments=attachments or None)
+
+
+def _approval_display_names(
+    kind: str | None,
+    payload: dict[str, Any],
+    values: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    if kind == APPROVAL_KIND_GOOGLE_TOOL:
+        pending = values.get("pending_google_tool") or {}
+        return (
+            payload.get("skill_name") or pending.get("name") or pending.get("tool_id"),
+            payload.get("skill_description") or pending.get("description"),
+        )
+    if kind == APPROVAL_KIND_EXECUTE:
+        skill = values.get("pending_skill") or {}
+        return (
+            payload.get("skill_name") or skill.get("name"),
+            payload.get("skill_description") or skill.get("description"),
+        )
+    return None, None
 
 
 def _is_graph_interrupt(exc: BaseException) -> bool:
@@ -1138,9 +1555,7 @@ def resume_agent(db: Session, session_id: UUID | str, approved: bool) -> AgentOu
     if interrupt_payload:
         prompt = _interrupt_to_prompt(interrupt_payload, values)
         kind = interrupt_payload.get("approval_kind")
-        skill = values.get("pending_skill") or {}
-        name = interrupt_payload.get("skill_name") or skill.get("name")
-        description = interrupt_payload.get("skill_description") or skill.get("description")
+        name, description = _approval_display_names(kind, interrupt_payload, values)
         _persist_message(
             db,
             sid,
@@ -1157,8 +1572,8 @@ def resume_agent(db: Session, session_id: UUID | str, approved: bool) -> AgentOu
         return AgentOutcome(
             status=STATUS_APPROVAL,
             reply=prompt,
-            skill_name=name if kind == APPROVAL_KIND_EXECUTE else None,
-            skill_description=description if kind == APPROVAL_KIND_EXECUTE else None,
+            skill_name=name,
+            skill_description=description,
             approval_kind=kind,
         )
 
@@ -1172,12 +1587,15 @@ def resume_agent(db: Session, session_id: UUID | str, approved: bool) -> AgentOu
     audit = (skill_result or {}).get("audit") if isinstance(skill_result, dict) else None
     user_message = values.get("user_message") or ""
     embedding = values.get("query_embedding") or []
+    kind = pending.get("approval_kind")
 
     meta: dict[str, Any] = {
         "kind": "skill_result" if approved else "skill_denied",
         "approved": approved,
         "audit": audit,
     }
+    if kind == APPROVAL_KIND_GOOGLE_TOOL:
+        meta["kind"] = "google_tool_result" if approved else "google_tool_denied"
     if attachments:
         meta["attachments"] = attachments
     if reply:
@@ -1188,14 +1606,15 @@ def resume_agent(db: Session, session_id: UUID | str, approved: bool) -> AgentOu
             reply,
             meta,
         )
-    if approved and embedding and reply:
+    if approved and embedding and reply and kind != APPROVAL_KIND_GOOGLE_TOOL:
         save_to_semantic_cache(db, user_message, embedding, reply)
 
+    name, description = _approval_display_names(kind, pending, values)
     return AgentOutcome(
         status="executed" if approved else "denied",
         reply=reply,
-        skill_name=pending.get("skill_name"),
-        skill_description=pending.get("skill_description"),
+        skill_name=name,
+        skill_description=description,
         audit=audit,
         attachments=attachments or None,
         approval_kind=None,

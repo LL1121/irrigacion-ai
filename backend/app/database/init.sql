@@ -1,5 +1,34 @@
 -- Extensión pgvector para embeddings
 CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- Usuarios (login Google)
+CREATE TABLE IF NOT EXISTS users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    google_sub TEXT NOT NULL UNIQUE,
+    email TEXT NOT NULL,
+    name TEXT,
+    picture TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_users_email ON users (email);
+
+-- Tokens OAuth cifrados (Google Calendar / Gmail / Drive)
+CREATE TABLE IF NOT EXISTS oauth_tokens (
+    id BIGSERIAL PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL DEFAULT 'google',
+    access_token_enc TEXT NOT NULL,
+    refresh_token_enc TEXT,
+    token_expiry TIMESTAMPTZ,
+    scopes TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (user_id, provider)
+);
+
+CREATE INDEX IF NOT EXISTS idx_oauth_tokens_user ON oauth_tokens (user_id);
 
 -- Fragmentos de documentos indexados para RAG
 CREATE TABLE IF NOT EXISTS document_chunks (
@@ -7,13 +36,22 @@ CREATE TABLE IF NOT EXISTS document_chunks (
     document_name VARCHAR(255) NOT NULL,
     content TEXT NOT NULL,
     embedding VECTOR(768),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    scope TEXT NOT NULL DEFAULT 'irrigacion',
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    source TEXT NOT NULL DEFAULT 'upload',
+    title TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT document_chunks_scope_chk CHECK (scope IN ('irrigacion', 'personal')),
+    CONSTRAINT document_chunks_personal_user_chk CHECK (
+        scope <> 'personal' OR user_id IS NOT NULL
+    )
 );
 
 -- Historial de mensajes por sesión de chat
 CREATE TABLE IF NOT EXISTS chat_messages (
     id BIGSERIAL PRIMARY KEY,
     session_id UUID NOT NULL,
+    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
     role VARCHAR(50) NOT NULL,
     message TEXT NOT NULL,
     metadata JSONB,
@@ -34,6 +72,12 @@ CREATE INDEX IF NOT EXISTS idx_document_chunks_embedding_hnsw
     ON document_chunks
     USING hnsw (embedding vector_cosine_ops);
 
+CREATE INDEX IF NOT EXISTS idx_document_chunks_scope
+    ON document_chunks (scope);
+
+CREATE INDEX IF NOT EXISTS idx_document_chunks_user_scope
+    ON document_chunks (user_id, scope);
+
 CREATE INDEX IF NOT EXISTS idx_semantic_cache_query_embedding_hnsw
     ON semantic_cache
     USING hnsw (query_embedding vector_cosine_ops);
@@ -41,6 +85,9 @@ CREATE INDEX IF NOT EXISTS idx_semantic_cache_query_embedding_hnsw
 -- Índice B-Tree para recuperar historial por sesión
 CREATE INDEX IF NOT EXISTS idx_chat_messages_session_created
     ON chat_messages (session_id, created_at ASC);
+
+CREATE INDEX IF NOT EXISTS idx_chat_messages_user
+    ON chat_messages (user_id);
 
 -- Skills auditadas por Gemini: skip HITL en próximas ejecuciones (mismo código)
 CREATE TABLE IF NOT EXISTS skill_whitelist (
@@ -58,5 +105,13 @@ CREATE TABLE IF NOT EXISTS skill_whitelist (
 CREATE INDEX IF NOT EXISTS idx_skill_whitelist_skill_id
     ON skill_whitelist (skill_id);
 
--- Auditoría (triggers): ver 02_audit.sql / app/database/audit.sql
+-- Whitelist de tools Google por usuario (escritura ya autorizada)
+CREATE TABLE IF NOT EXISTS tool_whitelist (
+    id BIGSERIAL PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    tool_id TEXT NOT NULL,
+    whitelisted_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (user_id, tool_id)
+);
 
+-- Auditoría (triggers): ver 02_audit.sql / app/database/audit.sql

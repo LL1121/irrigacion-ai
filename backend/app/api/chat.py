@@ -8,7 +8,7 @@ from uuid import UUID
 
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -22,10 +22,12 @@ from app.services.agent import (
     get_pending_approval,
     run_agent,
 )
+from app.services.auth_session import get_optional_user
 from app.services.cache import check_semantic_cache
+from app.services.context_memory import looks_like_save_context_intent
+from app.services.google_assistant import APPROVAL_KIND_GOOGLE_TOOL, detect_google_intent
 from app.services.skill_marketplace import (
     APPROVAL_KIND_DOWNLOAD,
-    APPROVAL_KIND_EXECUTE,
     download_remote_prompt,
     looks_like_skill_intent,
 )
@@ -62,6 +64,14 @@ def _pending_reply(pending: dict[str, Any]) -> tuple[str, str | None, str | None
     kind = pending.get("approval_kind") or pending.get("intent")
     if kind == APPROVAL_KIND_DOWNLOAD:
         return download_remote_prompt(), None, None
+    if kind == APPROVAL_KIND_GOOGLE_TOOL:
+        name = pending.get("skill_name") or pending.get("tool_id") or "Google"
+        description = pending.get("skill_description")
+        return (
+            f"Acción Google pendiente: {name}. ¿Autorizás?",
+            name,
+            description,
+        )
     name = pending.get("skill_name") or "desconocida"
     description = pending.get("skill_description")
     return (
@@ -80,16 +90,24 @@ def _persist_chat_message(
     role: str,
     message: str,
     metadata: dict[str, Any] | None = None,
+    user_id: str | None = None,
 ) -> None:
     db.execute(
         text(
             """
-            INSERT INTO chat_messages (session_id, role, message, metadata)
-            VALUES (:session_id, :role, :message, CAST(:metadata AS jsonb))
+            INSERT INTO chat_messages (session_id, user_id, role, message, metadata)
+            VALUES (
+                :session_id,
+                CAST(:user_id AS uuid),
+                :role,
+                :message,
+                CAST(:metadata AS jsonb)
+            )
             """
         ),
         {
             "session_id": str(session_id),
+            "user_id": user_id,
             "role": role,
             "message": message,
             "metadata": json.dumps(metadata, ensure_ascii=False) if metadata else None,
@@ -113,7 +131,14 @@ def _metadata_dict(raw: Any) -> dict[str, Any]:
 
 
 @router.post("/chat", response_model=ChatResponse)
-def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
+def chat(
+    payload: ChatRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> ChatResponse:
+    user = get_optional_user(request, db)
+    user_id = user["id"] if user else None
+
     pending = get_pending_approval(db, payload.session_id)
     if pending:
         reply, name, description = _pending_reply(pending)
@@ -128,11 +153,20 @@ def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
         )
 
     cached = None
-    if not looks_like_skill_intent(payload.message):
+    skip_cache = (
+        looks_like_skill_intent(payload.message)
+        or looks_like_save_context_intent(payload.message)
+        or detect_google_intent(payload.message) is not None
+    )
+    if not skip_cache:
         cached = check_semantic_cache(db, payload.message)
     if cached is not None:
-        _persist_chat_message(db, payload.session_id, "user", payload.message)
-        _persist_chat_message(db, payload.session_id, "assistant", cached)
+        _persist_chat_message(
+            db, payload.session_id, "user", payload.message, user_id=user_id
+        )
+        _persist_chat_message(
+            db, payload.session_id, "assistant", cached, user_id=user_id
+        )
         return ChatResponse(
             session_id=payload.session_id,
             reply=cached,
@@ -142,7 +176,11 @@ def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
 
     try:
         outcome = run_agent(
-            db, payload.session_id, payload.message, speed_mode=payload.speed_mode
+            db,
+            payload.session_id,
+            payload.message,
+            speed_mode=payload.speed_mode,
+            user_id=user_id,
         )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"Error del agente: {exc}") from exc
