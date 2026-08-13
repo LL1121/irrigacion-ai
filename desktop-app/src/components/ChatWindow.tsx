@@ -78,6 +78,15 @@ function isPendingApproval(msg: ChatMessage, isLast: boolean): boolean {
   return isLast && msg.status === "REQUIRES_APPROVAL" && msg.role !== "user";
 }
 
+const COMPOSER_MAX_PX = 160;
+const SCROLL_EDGE_PX = 56;
+
+function autosizeTextarea(el: HTMLTextAreaElement | null) {
+  if (!el) return;
+  el.style.height = "auto";
+  el.style.height = `${Math.min(el.scrollHeight, COMPOSER_MAX_PX)}px`;
+}
+
 function formatTime(iso: string | null | undefined): string | null {
   if (!iso) return null;
   const date = new Date(iso);
@@ -153,8 +162,11 @@ export function ChatWindow({
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
   const [editingText, setEditingText] = useState("");
   const [viewerAttachment, setViewerAttachment] = useState<ChatAttachment | null>(null);
+  const listRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const stickToBottomRef = useRef(true);
+  const selectingRef = useRef(false);
 
   const last = messages[messages.length - 1];
   const waitingApproval = Boolean(
@@ -168,8 +180,71 @@ export function ChatWindow({
     [messages],
   );
 
+  function scrollListToBottom() {
+    const el = listRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }
+
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    autosizeTextarea(textareaRef.current);
+  }, [draft, editingText, editingIndex]);
+
+  useEffect(() => {
+    const el = listRef.current;
+    if (!el) return;
+
+    const onScroll = () => {
+      stickToBottomRef.current =
+        el.scrollHeight - el.scrollTop - el.clientHeight < 96;
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+
+    const inner = el.firstElementChild;
+    const ro =
+      inner &&
+      new ResizeObserver(() => {
+        if (stickToBottomRef.current) scrollListToBottom();
+      });
+    if (inner && ro) ro.observe(inner);
+
+    const onMouseDown = (event: MouseEvent) => {
+      if (event.button === 0) selectingRef.current = true;
+    };
+    const onMouseUp = () => {
+      selectingRef.current = false;
+    };
+    const onMouseMove = (event: MouseEvent) => {
+      if (!selectingRef.current || event.buttons !== 1) return;
+      const rect = el.getBoundingClientRect();
+      if (event.clientY > rect.bottom - SCROLL_EDGE_PX) {
+        el.scrollTop += Math.min(
+          36,
+          event.clientY - (rect.bottom - SCROLL_EDGE_PX) + 12,
+        );
+      } else if (event.clientY < rect.top + SCROLL_EDGE_PX) {
+        el.scrollTop -= Math.min(
+          36,
+          rect.top + SCROLL_EDGE_PX - event.clientY + 12,
+        );
+      }
+    };
+
+    el.addEventListener("mousedown", onMouseDown);
+    window.addEventListener("mouseup", onMouseUp);
+    window.addEventListener("mousemove", onMouseMove);
+
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+      el.removeEventListener("mousedown", onMouseDown);
+      window.removeEventListener("mouseup", onMouseUp);
+      window.removeEventListener("mousemove", onMouseMove);
+      ro?.disconnect();
+    };
+  }, [messages.length === 0]);
+
+  useEffect(() => {
+    if (stickToBottomRef.current) scrollListToBottom();
   }, [messages, loading, approving, editingIndex]);
 
   async function handleSubmit(event: FormEvent) {
@@ -323,7 +398,7 @@ export function ChatWindow({
           </div>
         </div>
       ) : (
-        <div className="min-h-0 flex-1 overflow-y-auto">
+        <div ref={listRef} className="min-h-0 flex-1 overflow-y-auto">
           <div className="mx-auto w-full px-3 py-4 sm:px-6 sm:py-6 lg:px-10 xl:px-16">
             {messages.map((msg, index) => {
               const isUser = msg.role === "user";
@@ -555,9 +630,10 @@ export function ChatWindow({
                   : "Escribí tu consulta técnica…"
             }
             disabled={inputLocked && editingIndex === null}
-            className="max-h-40 min-h-9 flex-1 resize-none bg-transparent py-1 text-sm text-foreground outline-none placeholder:text-muted-foreground/60 disabled:opacity-50 sm:min-h-8"
-            style={{ lineHeight: "1.5" }}
+            className="max-h-40 min-h-9 flex-1 resize-none overflow-y-auto bg-transparent py-1 text-sm text-foreground outline-none placeholder:text-muted-foreground/60 disabled:opacity-50 sm:min-h-8"
+            style={{ lineHeight: "1.5", height: "36px" }}
             onKeyDown={handleDraftKeyDown}
+            onInput={(e) => autosizeTextarea(e.currentTarget)}
           />
 
           {showStop ? (

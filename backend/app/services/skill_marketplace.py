@@ -916,6 +916,27 @@ def match_catalog_by_keywords(text: str) -> dict[str, Any] | None:
     return search_catalog(best["name"], infer_arguments(best["id"], text))
 
 
+# Palabras que aparecen en muchas tareas (no identifican una skill de riego).
+_WEAK_CATALOG_TOKENS = {
+    "velocidad",
+    "tiempo",
+    "test",
+    "valor",
+    "dato",
+    "datos",
+    "area",
+    "área",
+    "hacer",
+    "calculo",
+    "calcular",
+    "calcula",
+    "unidades",
+    "conversion",
+    "conversión",
+    "internet",
+}
+
+
 def rank_catalog_skills(task: str) -> list[tuple[SkillRecord, int]]:
     """Puntúa todas las skills del catálogo (mayor = más pertinente)."""
     tokens = _tokenize(task)
@@ -961,17 +982,25 @@ def rank_catalog_skills(task: str) -> list[tuple[SkillRecord, int]]:
         haystack = " ".join(
             [skill["id"], skill["name"], skill["description"], " ".join(skill["tags"])]
         ).lower()
+        explained = {t for t in tokens if t in haystack}
+        distinctive = explained - _WEAK_CATALOG_TOKENS
+        coverage = (len(explained) / len(tokens)) if tokens else 0.0
+        # Una palabra genérica compartida no es esa skill (ej. "velocidad" ≠ caudal).
+        if not distinctive and coverage < 0.45:
+            continue
+        if coverage < 0.22 and not distinctive:
+            continue
         score = sum(1 for token in tokens if token in haystack)
         if skill["id"] in lowered_task or skill["name"].lower() in lowered_task:
             score += 5
         for keyword in _SKILL_KEYWORDS.get(skill["id"], ()):
             if keyword in lowered_task:
-                score += 3
+                score += 1 if keyword.strip().lower() in _WEAK_CATALOG_TOKENS else 3
         # Tags exactos (palabra completa) pesan más que substring accidental.
         for tag in skill["tags"]:
             if len(tag) >= 4 and re.search(rf"\b{re.escape(tag)}\b", lowered_task):
-                score += 2
-        if score > 0:
+                score += 1 if tag.lower() in _WEAK_CATALOG_TOKENS else 2
+        if score > 0 and (distinctive or coverage >= 0.45):
             ranked.append((skill, score))
     ranked.sort(key=lambda item: item[1], reverse=True)
     return ranked
@@ -1968,11 +1997,11 @@ def detect_response_style(user_message: str) -> str:
     if not hints:
         if is_casual_chat(user_message):
             return (
-                "Es charla. Contestá natural, 1-3 líneas, como un asistente "
-                "de chat. Sin menú ni 'estoy funcionando'."
+                "Es charla. Contestá cálido y natural, 1-3 líneas, como un "
+                "asistente de chat. Sin menú ni 'estoy funcionando'."
             )
         return (
-            "Hablá como un asistente de chat (natural, claro). "
+            "Hablá como un asistente de chat (cálido, claro). "
             "Si hay varios números, usá tabla o viñetas."
         )
     return " ".join(hints)

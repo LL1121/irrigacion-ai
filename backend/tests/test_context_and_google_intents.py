@@ -224,6 +224,26 @@ def test_followup_datos_sigue_la_tarea_abierta():
     assert "lámina" not in dumped.lower()
 
 
+def test_una_palabra_compartida_no_es_la_skill_del_catalogo():
+    """La tarea nueva manda: 'velocidad de internet' no es cálculo de caudal."""
+    from app.services.skill_marketplace import (
+        find_local_skill,
+        resolve_skill_decision,
+    )
+
+    msg = "Todo en orden! Escuchame, podrías hacer un test de velocidad de internet?"
+    found = find_local_skill(msg)
+    assert not found.get("found")
+    assert found.get("id") != "caudal_canal"
+    dec = resolve_skill_decision(msg)
+    assert dec["action"] in {"download", "clarify"}
+    assert "caudal" not in (dec.get("reply") or "").lower()
+
+    real = find_local_skill("calculá el caudal con área 2 m2 y velocidad 0.5 m/s")
+    assert real.get("found")
+    assert real.get("id") == "caudal_canal"
+
+
 def test_orden_generica_wol_con_horario():
     from app.services.order_parse import extract_order_parts, looks_like_do_task
     from app.services.skill_marketplace import should_try_skill_marketplace
