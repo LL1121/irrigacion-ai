@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import type { AuthUser, SessionSummary } from "../services/api";
 import { getApiBaseUrl } from "../services/config";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 type SidebarProps = {
   sessions: SessionSummary[];
@@ -70,6 +71,7 @@ export function Sidebar({
 }: SidebarProps) {
   const [search, setSearch] = useState("");
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<SessionSummary | null>(null);
 
   const filtered = useMemo(
     () =>
@@ -80,6 +82,25 @@ export function Sidebar({
   );
 
   const { today, yesterday, week, older } = groupByDate(filtered);
+
+  function requestDelete(session: SessionSummary) {
+    setPendingDelete(session);
+  }
+
+  function cancelDelete() {
+    if (deletingId) return;
+    setPendingDelete(null);
+  }
+
+  function confirmDelete() {
+    if (!pendingDelete || deletingId) return;
+    const sessionId = pendingDelete.session_id;
+    setDeletingId(sessionId);
+    void Promise.resolve(onDeleteSession(sessionId)).finally(() => {
+      setDeletingId(null);
+      setPendingDelete(null);
+    });
+  }
 
   function Section({ label, items }: { label: string; items: SessionSummary[] }) {
     if (items.length === 0) return null;
@@ -133,17 +154,7 @@ export function Sidebar({
                   disabled={deleting}
                   onClick={(e) => {
                     e.stopPropagation();
-                    if (
-                      !window.confirm(
-                        "¿Borrar esta conversación? No se puede deshacer.",
-                      )
-                    ) {
-                      return;
-                    }
-                    setDeletingId(session.session_id);
-                    void Promise.resolve(onDeleteSession(session.session_id)).finally(
-                      () => setDeletingId(null),
-                    );
+                    requestDelete(session);
                   }}
                   className={`absolute right-2 top-2.5 flex h-6 w-6 items-center justify-center rounded-lg text-muted-foreground transition-all hover:bg-destructive/10 hover:text-destructive disabled:opacity-40 ${
                     active || deleting
@@ -316,6 +327,19 @@ export function Sidebar({
         </p>
       </div>
       </aside>
+
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        title="¿Borrar esta conversación?"
+        description="Se elimina el hilo completo. No se puede deshacer."
+        confirmLabel="Borrar"
+        cancelLabel="Cancelar"
+        destructive
+        busy={deletingId !== null}
+        icon={<Trash2 size={20} className="text-destructive" />}
+        onConfirm={confirmDelete}
+        onCancel={cancelDelete}
+      />
     </>
   );
 }
