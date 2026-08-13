@@ -35,9 +35,17 @@ from app.services.document_export import (
 )
 from app.services.command_router import (
     GOOGLE_ACTIONS,
+    infer_google_action,
     missing_google_slots,
     save_user_context,
+    should_use_native_google,
     use_google,
+)
+from app.services.order_parse import (
+    extract_order_parts,
+    looks_like_do_task,
+    merge_args_with_order,
+    OrderParts,
 )
 from app.services.google_assistant import (
     APPROVAL_KIND_GOOGLE_TOOL,
@@ -112,7 +120,7 @@ Tu objetivo es ayudar al personal de la oficina a resolver dudas sobre normativa
 
 ### PERSONALIZACIÓN (MUY IMPORTANTE):
 1. **Seguí el formato pedido:** Si pide tabla, viñetas, pasos numerados, “breve”, “formal” o “en criollo”, obedecé eso en la respuesta.
-2. **Inferí intención con cuidado:** Interpretá el pedido completo (verbo + objeto), no una palabra suelta. Si es ambiguo, NO adivines la herramienta. Preguntá qué dato falta.
+2. **Toda la orden cuenta:** Leé CADA parte (qué, a quién, qué decir, a qué hora, en qué formato). Si el usuario dijo varias cosas, cumplilas todas. Nunca tires un dato (horario, destinatario, asunto, “en 5 minutos”, “armame un word”). Si no podés cumplir una parte, decilo; no la ignores.
 3. **Pedí solo lo imprescindible:** Si faltan datos para un cálculo, pedí únicamente esos datos (con unidades), no un cuestionario largo.
 4. **Consistencia en la conversación:** Si el usuario ya eligió un estilo o unidad, mantenelo salvo que diga lo contrario.
 5. **Skills con criterio:** Cuando uses herramientas/skills, pasá bien los números/unidades. Si no estás seguro de la skill, preguntá antes de ejecutar.
@@ -128,22 +136,21 @@ Tu objetivo es ayudar al personal de la oficina a resolver dudas sobre normativa
 - Operás por defecto con permisos de nivel ADMINISTRATIVO ALTO. Tenés acceso a herramientas de redacción de documentos, búsquedas en base vectorial y cálculos técnicos.
 """.strip()
 
+NATIVE_TOOLS_HINT = (
+    "PRIORIDAD: interpretá la orden COMPLETA (qué, a quién, cuándo, cómo). "
+    "Si pidió un horario ('en 5 minutos'), confirmalo y no lo hagas ahora. "
+    "Mail/Gmail/Calendar/Drive → use_google. NUNCA una skill para un mail."
+)
+
 SKILL_TOOLING_HINT = (
-    "Herramientas: TODA acción concreta se decide con una tool, no por una palabra suelta. "
-    "Google (mail/agenda/Drive): DEBÉS llamar a use_google con la action correcta. "
-    "El objeto manda: mail/correo/email → gmail_send o gmail_list; "
-    "evento/agenda/reunión → calendar_create o calendar_list; archivo Drive → drive_*. "
-    "'Programar el envío de un mail' es gmail_send, NUNCA calendar_create. "
-    "Si falta destinatario, título o fecha, NO llames use_google: preguntá. "
-    "Anotar/guardar/recordar contexto: llamá save_user_context. "
-    "Cálculo, Word, URL/telemetría u otra automatización: DEBÉS llamar a "
-    "search_skill_marketplace. NUNCA digas que no podés acceder a internet: "
-    "buscá/descargá skill. Matching estricto: no asumas lámina/caudal/tiempo "
-    "solo por un número suelto. Si el pedido es ambiguo o faltan datos, "
-    "NO elijas una skill al azar ni inventes valores: preguntá. "
-    "Extraé URLs, puntos y unidades del HILO COMPLETO. "
-    "Si el usuario confirma ('sí, descargá') o pega una URL, continuá la tarea "
-    "abierta; no armes una skill meta de 'descargar skill'."
+    "Sos un asistente que CUMPLE la orden completa. "
+    "Cualquier tarea del mundo real (prender una PC con Wake-on-LAN, "
+    "armar un Word, automatizar, configurar) → search_skill_marketplace. "
+    "Si no hay skill local, se descarga/genera. NUNCA digas 'no puedo'. "
+    "Si falta setup (BIOS/WOL, MAC, cable), explicá cómo activarlo Y "
+    "igual programá/ejecutá la acción. "
+    "Si pidió espera, confirmá: 'Dale, en 5 minutos lo hacemos'. "
+    "Google mail/agenda/Drive: use_google. Contexto: save_user_context."
 )
 
 # Alias retrocompatible: el resto del módulo referenciaba SYSTEM_PROMPT.
@@ -187,6 +194,8 @@ class AgentState(TypedDict):
     pending_google_tool: NotRequired[dict[str, Any] | None]
     google_approved: NotRequired[bool | None]
     pre_assist_done: NotRequired[bool]
+    run_at: NotRequired[str | None]
+    order_ack: NotRequired[str | None]
 
 
 @dataclass
@@ -456,6 +465,51 @@ def _parse_tool_arguments(raw_args: dict[str, Any], user_message: str) -> tuple[
     return task, arguments
 
 
+def _annotate_plan_result(
+    result: dict[str, Any],
+    parts: OrderParts,
+    *,
+    llm_reply: str = "",
+) -> dict[str, Any]:
+    """No se pierde horario ni recap, sin importar si es Google, skill o descarga."""
+    out = dict(result)
+    if parts.when_iso:
+        out["run_at"] = parts.when_iso
+        skill = out.get("pending_skill")
+        if isinstance(skill, dict):
+            out["pending_skill"] = {**skill, "run_at": parts.when_iso}
+        pending = out.get("pending_google_tool")
+        if isinstance(pending, dict):
+            args = {
+                **(pending.get("arguments") or {}),
+                "send_at": parts.when_iso,
+                "run_at": parts.when_iso,
+            }
+            out["pending_google_tool"] = {**pending, "arguments": args}
+    ack = parts.commit_ack()
+    if ack:
+        out["order_ack"] = ack
+    reply = (out.get("reply") or "").strip()
+    setup = (llm_reply or "").strip()
+    if out.get("needs_approval"):
+        bits = [bit for bit in (ack, setup) if bit]
+        if bits and not reply:
+            out["reply"] = "\n\n".join(bits)
+        elif bits and reply and ack.lower() not in reply.lower():
+            out["reply"] = f"{ack}\n\n{reply}"
+        return out
+    chunks: list[str] = []
+    if ack and ack.lower() not in reply.lower():
+        chunks.append(ack)
+    if reply:
+        chunks.append(reply)
+    elif setup and "no puedo" not in setup.lower():
+        chunks.append(setup)
+    if chunks:
+        out["reply"] = "\n\n".join(chunks)
+    return out
+
+
 def _auto_execute_skill_state(skill: dict[str, Any]) -> dict[str, Any]:
     """Skill en whitelist: ejecutar sin HITL."""
     return {
@@ -651,6 +705,7 @@ def _plan_google_action(state: AgentState, db: Session, args: dict[str, Any]) ->
             "reply": "Google OAuth todavía no está configurado en el servidor.",
         }
     query = str(args.get("query") or state["user_message"])
+    parts = extract_order_parts(state["user_message"], _conversation_text(state), query)
     pending = build_pending_google_tool(
         {"tool_id": meta["tool_id"], "action": action, "write": meta["write"]},
         query,
@@ -666,13 +721,26 @@ def _plan_google_action(state: AgentState, db: Session, args: dict[str, Any]) ->
             "end_iso",
             "search",
             "file_id",
+            "send_at",
+            "run_at",
         )
         if args.get(key)
     }
-    pending["arguments"] = {**(pending.get("arguments") or {}), **overlay}
-    ask = missing_google_slots(action, query, pending.get("arguments"))
+    pending["arguments"] = merge_args_with_order(
+        {**(pending.get("arguments") or {}), **overlay},
+        parts,
+    )
+    pending["arguments"]["session_id"] = state.get("session_id")
+    pending["arguments"]["query"] = query
+    recap = parts.recap()
+    ask = missing_google_slots(
+        action,
+        f"{query}\n{_conversation_text(state)}",
+        pending.get("arguments"),
+    )
     if ask:
-        return {**empty, "reply": ask}
+        prefix = f"{recap}\n\n" if recap else ""
+        return {**empty, "reply": prefix + ask}
     if pending.get("action") == "drive_index":
         result = _handle_drive_index_to_context(
             db,
@@ -698,9 +766,22 @@ def _plan_google_action(state: AgentState, db: Session, args: dict[str, Any]) ->
     return {**empty, "reply": reply}
 
 
+def _plan_native_google(state: AgentState, db: Session, args: dict[str, Any]) -> dict:
+    action = str(args.get("action") or "").strip() or infer_google_action(
+        str(args.get("query") or state["user_message"])
+    )
+    if not action:
+        action = infer_google_action(_conversation_text(state)) or ""
+    merged = {**args, "action": action, "query": args.get("query") or state["user_message"]}
+    return _plan_google_action(state, db, merged)
+
+
 def _plan_node(state: AgentState, db: Session) -> dict:
     llm = _llm(tools=True)
+    ctx = _conversation_text(state)
+    parts = extract_order_parts(state["user_message"], ctx)
     system = fit_system_prompt(SYSTEM_PROMPT_IRRIGACION)
+    native = fit_system_prompt(NATIVE_TOOLS_HINT)
     tooling = fit_system_prompt(SKILL_TOOLING_HINT + "\n" + CATALOG_HINT)
     rag = "Contexto documental recuperado (RAG):\n\n" + _context_block(
         state.get("retrieved_docs") or []
@@ -711,25 +792,35 @@ def _plan_node(state: AgentState, db: Session) -> dict:
         "Preferencia de formato para esta respuesta: "
         + detect_response_style(state["user_message"])
     )
-    ctx = _conversation_text(state)
+    order_hint = fit_system_prompt(
+        "Orden parseada (cumplí TODAS las partes; no tires ninguna): "
+        + (parts.recap() or state["user_message"])
+        + (f" Horario: {parts.when_label}." if parts.when_label else "")
+    )
     thread_hint = fit_system_prompt(
         thread_brief_for_prompt(state["user_message"], state.get("history") or [])
     )
 
-    system, tooling, rag, style_hint, thread_hint, user_text = enforce_request_budget(
-        [
-            ("system", system),
-            ("tooling", tooling),
-            ("rag", rag),
-            ("style", style_hint),
-            ("thread", thread_hint),
-            ("user", user_text),
-        ]
+    system, native, tooling, order_hint, rag, style_hint, thread_hint, user_text = (
+        enforce_request_budget(
+            [
+                ("system", system),
+                ("native", native),
+                ("tooling", tooling),
+                ("order", order_hint),
+                ("rag", rag),
+                ("style", style_hint),
+                ("thread", thread_hint),
+                ("user", user_text),
+            ]
+        )
     )
 
     messages: list = [
         SystemMessage(content=system),
+        SystemMessage(content=native),
         SystemMessage(content=tooling),
+        SystemMessage(content=order_hint),
         SystemMessage(content=thread_hint),
         SystemMessage(content=rag),
         SystemMessage(content=style_hint),
@@ -740,6 +831,11 @@ def _plan_node(state: AgentState, db: Session) -> dict:
         response = llm.invoke(messages)
     except Exception as exc:
         logger.exception("Fallo el plan LLM (posible límite de tokens)")
+        if should_use_native_google(state["user_message"], ctx):
+            return _annotate_plan_result(
+                _plan_native_google(state, db, {"query": state["user_message"]}),
+                parts,
+            )
         resolved = _resolve_skill_plan(
             state["user_message"],
             {"query": state["user_message"]},
@@ -747,7 +843,12 @@ def _plan_node(state: AgentState, db: Session) -> dict:
             context_text=ctx,
         )
         if resolved:
-            return resolved
+            return _annotate_plan_result(resolved, parts)
+        if looks_like_do_task(state["user_message"]):
+            return _annotate_plan_result(
+                _force_skill_or_download(state["user_message"], context_text=ctx),
+                parts,
+            )
         return {
             "pending_skill": None,
             "needs_approval": False,
@@ -761,14 +862,43 @@ def _plan_node(state: AgentState, db: Session) -> dict:
         (call for call in tool_calls if _tool_call_name(call) == "use_google"),
         None,
     )
-    if google_call:
-        return _plan_google_action(state, db, _tool_call_args(google_call))
     save_call = next(
         (call for call in tool_calls if _tool_call_name(call) == "save_user_context"),
         None,
     )
+    if is_result_challenge_or_correction(state["user_message"]) and (
+        google_call
+        or should_use_native_google(state["user_message"], ctx, tool_called=False)
+    ):
+        reply = (getattr(response, "content", None) or "").strip() or (
+            "Tenés razón. Si el mail ya salió, no lo deshago. "
+            "Si pedís un horario, lo programo y no lo mando al toque."
+        )
+        return _annotate_plan_result(
+            {
+                "pending_skill": None,
+                "pending_google_tool": None,
+                "needs_approval": False,
+                "approval_kind": None,
+                "reply": reply,
+            },
+            parts,
+        )
+    if should_use_native_google(
+        state["user_message"],
+        ctx,
+        tool_called=bool(google_call),
+    ):
+        args = _tool_call_args(google_call) if google_call else {}
+        return _annotate_plan_result(
+            _plan_native_google(state, db, args),
+            parts,
+        )
     if save_call:
-        return _plan_save_context(state, db, _tool_call_args(save_call))
+        return _annotate_plan_result(
+            _plan_save_context(state, db, _tool_call_args(save_call)),
+            parts,
+        )
 
     for call in tool_calls:
         if _tool_call_name(call) != "search_skill_marketplace":
@@ -782,8 +912,9 @@ def _plan_node(state: AgentState, db: Session) -> dict:
         resolved = _resolve_skill_plan(
             task, arguments, state["user_message"], context_text=ctx
         )
+        llm_bits = (getattr(response, "content", None) or "").strip()
         if resolved:
-            return resolved
+            return _annotate_plan_result(resolved, parts, llm_reply=llm_bits)
         # Re-evaluar con el mensaje completo (el task del tool a veces es pobre).
         forced = _force_skill_or_download(state["user_message"], context_text=ctx)
         if (
@@ -791,19 +922,23 @@ def _plan_node(state: AgentState, db: Session) -> dict:
             or forced.get("needs_approval")
             or forced.get("pending_skill")
         ):
-            return forced
+            return _annotate_plan_result(forced, parts, llm_reply=llm_bits)
         available = ", ".join(
             s["name"] for s in search_catalog(task, arguments).get("available") or []
         )
-        return {
-            "pending_skill": None,
-            "needs_approval": False,
-            "reply": (
-                "No encontré una skill en el catálogo para esa tarea. "
-                f"Disponibles: {available or '(ninguna)'}. "
-                "¿Me aclarás qué resultado querés y con qué datos?"
-            ),
-        }
+        return _annotate_plan_result(
+            {
+                "pending_skill": None,
+                "needs_approval": False,
+                "reply": (
+                    "No encontré una skill en el catálogo para esa tarea. "
+                    f"Disponibles: {available or '(ninguna)'}. "
+                    "¿Me aclarás qué resultado querés y con qué datos?"
+                ),
+            },
+            parts,
+            llm_reply=llm_bits,
+        )
 
     reply = (getattr(response, "content", None) or "").strip()
 
@@ -815,29 +950,40 @@ def _plan_node(state: AgentState, db: Session) -> dict:
                 "página/API, decime y lo reconsultamos con la skill de telemetría "
                 "(API fullDto) usando el mismo punto/URL del hilo."
             )
-        return {
-            "pending_skill": None,
-            "needs_approval": False,
-            "reply": reply,
-        }
+        return _annotate_plan_result(
+            {
+                "pending_skill": None,
+                "needs_approval": False,
+                "reply": reply,
+            },
+            parts,
+        )
 
-    # Web/externo o negativa de capacidad → buscar skill / ofrecer descarga.
-    # (No forzar ante cualquier "podés…": podría ser solo una pregunta RAG.)
-    if looks_like_web_or_external_request(state["user_message"]) or reply_is_capability_refusal(
-        reply
+    # Hacer algo en el mundo / web / "no puedo" → skill o descarga.
+    if (
+        looks_like_do_task(state["user_message"])
+        or looks_like_web_or_external_request(state["user_message"])
+        or reply_is_capability_refusal(reply)
     ):
-        return _force_skill_or_download(state["user_message"], context_text=ctx)
+        return _annotate_plan_result(
+            _force_skill_or_download(state["user_message"], context_text=ctx),
+            parts,
+            llm_reply=reply,
+        )
 
     if not reply:
         reply = (
             "No pude generar una respuesta a partir del contexto disponible. "
             "Verificá que haya documentos indexados o reformulá la consulta."
         )
-    return {
-        "pending_skill": None,
-        "needs_approval": False,
-        "reply": reply,
-    }
+    return _annotate_plan_result(
+        {
+            "pending_skill": None,
+            "needs_approval": False,
+            "reply": reply,
+        },
+        parts,
+    )
 
 
 def _route_after_plan(
@@ -894,40 +1040,67 @@ def _approval_prompt(skill: dict[str, Any]) -> str:
     return (
         f"Encontré la skill '{name}' en el catálogo. "
         "¿Autorizás a Gemini a auditarla y ejecutarla?"
+        " Si pediste un horario, la corro a esa hora (no ahora)."
     )
 
 
 def _google_tool_prompt(pending: dict[str, Any]) -> str:
     tool_id = pending.get("tool_id") or pending.get("name") or "google"
     args = pending.get("arguments") or {}
+    parts = extract_order_parts(str(args.get("query") or ""), str(args.get("body") or ""))
+    recap = parts.recap()
+    extra = f" {recap}" if recap else ""
     if tool_id == "calendar.create":
         return (
             f"Voy a crear el evento **{args.get('summary') or 'sin título'}** "
             f"({args.get('start_iso')} → {args.get('end_iso')}) en tu Calendar. "
-            "¿Autorizás?"
+            f"{extra} ¿Autorizás?"
         )
     if tool_id == "gmail.send":
+        when = args.get("send_at") or args.get("run_at") or parts.when_iso
+        dest = args.get("to") or parts.to or "(sin destinatario)"
+        subject = args.get("subject") or parts.subject or ""
+        if when or parts.when_label:
+            label = parts.when_label or str(when)
+            try:
+                from datetime import datetime
+
+                label = datetime.fromisoformat(str(when)).astimezone().strftime("%H:%M")
+            except (TypeError, ValueError):
+                pass
+            return (
+                f"Voy a **programar** un mail a **{dest}** "
+                f"con asunto «{subject}» para **{label}** "
+                f"(no sale ahora).{extra} ¿Autorizás?"
+            )
         return (
-            f"Voy a enviar un mail a **{args.get('to') or '(sin destinatario)'}** "
-            f"con asunto «{args.get('subject')}». ¿Autorizás?"
+            f"Voy a enviar un mail a **{dest}** "
+            f"con asunto «{subject}».{extra} ¿Autorizás?"
         )
-    return f"Voy a ejecutar **{tool_id}** en tu cuenta Google. ¿Autorizás?"
+    return f"Voy a ejecutar **{tool_id}** en tu cuenta Google.{extra} ¿Autorizás?"
 
 
 def _interrupt_to_prompt(payload: dict[str, Any], values: dict[str, Any]) -> str:
     kind = payload.get("approval_kind") or payload.get("intent")
+    lead = (values.get("reply") or values.get("order_ack") or "").strip()
     if kind == APPROVAL_KIND_DOWNLOAD:
-        return download_remote_prompt()
+        body = download_remote_prompt()
+        if lead and lead.lower() not in body.lower():
+            return f"{lead}\n\n{body}"
+        return body
     if kind == APPROVAL_KIND_GOOGLE_TOOL:
         pending = values.get("pending_google_tool") or {}
         return _google_tool_prompt(pending)
     skill = values.get("pending_skill") or {}
-    return _approval_prompt(
+    body = _approval_prompt(
         {
             "name": payload.get("skill_name") or skill.get("name"),
             "source": skill.get("source"),
         }
     )
+    if lead and lead.split("\n", 1)[0].lower() not in body.lower():
+        return f"{lead}\n\n{body}"
+    return body
 
 
 def _human_gate_download_node(state: AgentState) -> dict:
@@ -1082,7 +1255,7 @@ def _run_google_tool_node(state: AgentState, db: Session) -> dict:
     }
 
 
-def _run_skill_node(state: AgentState) -> dict:
+def _run_skill_node(state: AgentState, db: Session) -> dict:
     if not state.get("skill_approved"):
         return {
             "skill_result": None,
@@ -1094,6 +1267,50 @@ def _run_skill_node(state: AgentState) -> dict:
 
     skill = dict(state.get("pending_skill") or {})
     ctx = _conversation_text(state)
+    skill["arguments"] = prepare_skill_arguments(
+        skill,
+        state["user_message"],
+        context_text=ctx,
+    )
+    parts = extract_order_parts(state.get("user_message") or "", ctx)
+    when_iso = parts.when_iso or state.get("run_at")
+    if when_iso:
+        from datetime import datetime
+
+        from app.services.scheduled_jobs import enqueue_job
+
+        try:
+            when = datetime.fromisoformat(str(when_iso))
+            enqueue_job(
+                db,
+                user_id=state.get("user_id"),
+                session_id=str(state.get("session_id") or "") or None,
+                kind="skill_execute",
+                payload={
+                    "skill": {
+                        "id": skill.get("id"),
+                        "name": skill.get("name"),
+                        "code": skill.get("code"),
+                        "source": skill.get("source"),
+                        "arguments": skill.get("arguments"),
+                    },
+                    "user_message": state.get("user_message"),
+                    "context": ctx,
+                },
+                run_at=when,
+            )
+            recap = parts.recap()
+            label = parts.when_label or "el horario pedido"
+            return {
+                "skill_result": None,
+                "reply": (
+                    f"{recap}\n\nQuedó **programado** para **{label}**. "
+                    "No lo hago ahora; a esa hora lo ejecuto y te dejo el resultado acá."
+                ),
+                "pending_skill": None,
+            }
+        except Exception:
+            logger.exception("No pude programar la skill; la ejecuto ahora")
     try:
         validate_remote_skill(skill, ctx or state["user_message"])
     except Exception as exc:
@@ -1108,11 +1325,6 @@ def _run_skill_node(state: AgentState) -> dict:
             "needs_approval": False,
             "approval_kind": None,
         }
-    skill["arguments"] = prepare_skill_arguments(
-        skill,
-        state["user_message"],
-        context_text=ctx,
-    )
     code = skill.get("code") or ""
     arguments = skill.get("arguments") or {}
     try:
@@ -1411,6 +1623,9 @@ def build_agent_graph(db: Session):
     def plan(state: AgentState) -> dict:
         return _plan_node(state, db)
 
+    def run_skill(state: AgentState) -> dict:
+        return _run_skill_node(state, db)
+
     graph.add_node("retrieve", retrieve)
     graph.add_node("fetch_history", fetch_history)
     graph.add_node("pre_assist", pre_assist)
@@ -1420,7 +1635,7 @@ def build_agent_graph(db: Session):
     graph.add_node("human_gate_execute", _human_gate_execute_node)
     graph.add_node("human_gate_google", _human_gate_google_node)
     graph.add_node("run_google", run_google)
-    graph.add_node("run_skill", _run_skill_node)
+    graph.add_node("run_skill", run_skill)
     graph.add_node("compose_skill_reply", _compose_skill_reply_node)
 
     graph.add_edge(START, "retrieve")
@@ -1525,6 +1740,8 @@ def run_agent(
                 "pending_google_tool": None,
                 "google_approved": None,
                 "pre_assist_done": False,
+                "run_at": None,
+                "order_ack": None,
             },
             config,
         )

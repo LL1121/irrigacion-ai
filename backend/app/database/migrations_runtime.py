@@ -166,3 +166,29 @@ def apply_schema_migrations(conn: Connection) -> None:
     conn.execute(
         text("ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS metadata JSONB")
     )
+
+    conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS scheduled_jobs (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                session_id UUID,
+                kind TEXT NOT NULL,
+                payload JSONB NOT NULL,
+                run_at TIMESTAMPTZ NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                error TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                done_at TIMESTAMPTZ
+            )
+            """
+        )
+    )
+    conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_due "
+            "ON scheduled_jobs (status, run_at)"
+        )
+    )
+    conn.execute(text("ALTER TABLE scheduled_jobs ALTER COLUMN user_id DROP NOT NULL"))

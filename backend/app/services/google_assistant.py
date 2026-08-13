@@ -39,6 +39,12 @@ def detect_google_intent(text: str) -> dict[str, Any] | None:
     return decision.as_google_intent()
 
 
+def parse_send_at(text: str, explicit_iso: str | None = None) -> str | None:
+    from app.services.order_parse import parse_run_at
+
+    return parse_run_at(text, explicit_iso)
+
+
 def _parse_simple_event(text: str) -> dict[str, Any]:
     """Heurística mínima: título + mañana 10:00 (1h) si no hay datos."""
     title_match = re.search(
@@ -66,10 +72,27 @@ def _parse_simple_event(text: str) -> dict[str, Any]:
 def _parse_email(text: str) -> dict[str, Any]:
     to_match = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", text)
     to = to_match.group(0) if to_match else ""
-    subj_match = re.search(r"(?:asunto|subject)\s*[:\-]\s*(.+)$", text, re.I | re.M)
-    subject = subj_match.group(1).strip()[:120] if subj_match else "Mensaje desde Irrigación AI"
-    body = text
-    return {"to": to, "subject": subject, "body": body}
+    subj_match = re.search(
+        r"(?:asunto|subject)\s*(?:es|:|-)\s*[«\"']?(.+?)[»\"']?(?:\s+y\s+|\s*$)",
+        text,
+        re.I,
+    )
+    subject = (
+        subj_match.group(1).strip()[:120]
+        if subj_match
+        else "Mensaje desde Irrigación AI"
+    )
+    body_match = re.search(
+        r"(?:decile|decí|dice|cuerpo|mensaje(?:\s+es)?)\s*[:\-]?\s*(.+)$",
+        text,
+        re.I | re.S,
+    )
+    body = (body_match.group(1).strip() if body_match else text)[:4000]
+    send_at = parse_send_at(text)
+    result = {"to": to, "subject": subject, "body": body}
+    if send_at:
+        result["send_at"] = send_at
+    return result
 
 
 def build_pending_google_tool(
@@ -124,7 +147,16 @@ def humanize_google_result(action: str, data: Any) -> str:
             )
         return "\n".join(lines)
     if action == "gmail_send":
-        return f"Listo: mandé el mail a **{data.get('to')}** con asunto «{data.get('subject')}»."
+        if data.get("scheduled_for"):
+            return (
+                f"Quedó **programado** para **{data.get('scheduled_for')}**: "
+                f"mail a **{data.get('to')}** con asunto «{data.get('subject')}». "
+                "No lo mando ahora; sale solo a esa hora."
+            )
+        return (
+            f"Listo: mandé el mail a **{data.get('to')}** "
+            f"con asunto «{data.get('subject')}»."
+        )
     if action == "drive_search":
         items = data or []
         if not items:
@@ -174,12 +206,39 @@ def execute_google_tool(
         to = str(args.get("to") or "").strip()
         if not to:
             return "Me falta el destinatario (un email) para mandar el correo."
+        subject = str(args.get("subject") or "Mensaje")
+        body = str(args.get("body") or "")
+        send_at = parse_send_at(
+            " ".join(
+                str(args.get(key) or "")
+                for key in ("query", "send_at", "run_at", "body", "subject")
+            ),
+            str(args.get("send_at") or args.get("run_at") or "") or None,
+        )
+        if send_at:
+            from app.services.scheduled_jobs import enqueue_job
+
+            when = datetime.fromisoformat(send_at)
+            enqueue_job(
+                db,
+                user_id=user_id,
+                session_id=str(args.get("session_id") or "") or None,
+                kind="gmail_send",
+                payload={"to": to, "subject": subject, "body": body},
+                run_at=when,
+            )
+            add_tool_whitelist(db, user_id, "gmail.send")
+            pretty = when.astimezone().strftime("%H:%M")
+            return humanize_google_result(
+                action,
+                {"to": to, "subject": subject, "scheduled_for": pretty},
+            )
         data = gmail_send_message(
             db,
             user_id,
             to=to,
-            subject=str(args.get("subject") or "Mensaje"),
-            body=str(args.get("body") or ""),
+            subject=subject,
+            body=body,
         )
         add_tool_whitelist(db, user_id, "gmail.send")
         return humanize_google_result(action, data)

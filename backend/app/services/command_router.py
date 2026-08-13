@@ -106,6 +106,65 @@ def looks_like_command(text: str) -> bool:
     return bool(_COMMAND_RE.search(text or ""))
 
 
+def looks_like_native_google(text: str) -> bool:
+    """Mail / Calendar / Drive: tools nativas, nunca una skill descargada."""
+    blob = text or ""
+    return (
+        _has_mail_object(blob) or _has_cal_object(blob) or _has_drive_object(blob)
+    )
+
+
+def should_use_native_google(
+    message: str,
+    context: str = "",
+    *,
+    tool_called: bool = False,
+) -> bool:
+    if tool_called:
+        return True
+    if looks_like_native_google(message):
+        return True
+    if not looks_like_native_google(context or ""):
+        return False
+    if re.search(
+        r"\b(?:caudal|padr[oó]n|l[aá]mina|punto\s+\d|riego|expediente)\b",
+        message or "",
+        re.I,
+    ) and not looks_like_native_google(message):
+        return False
+    return bool(
+        looks_like_command(message)
+        or _EMAIL_RE.search(message or "")
+        or re.search(
+            r"asunto|decile|faltan|datos|minuto|hora|program|autoriz",
+            message or "",
+            re.I,
+        )
+    )
+
+
+def infer_google_action(text: str) -> str | None:
+    heuristic = heuristic_route(text)
+    if heuristic and heuristic.action in GOOGLE_ACTIONS:
+        return heuristic.action
+    blob = text or ""
+    if _has_mail_object(blob):
+        if _SEND_RE.search(blob) or re.search(r"program", blob, re.I):
+            return "gmail_send"
+        return "gmail_list"
+    if _has_cal_object(blob):
+        if _CAL_CREATE_RE.search(blob) or re.search(r"agend", blob, re.I):
+            return "calendar_create"
+        return "calendar_list"
+    if _has_drive_object(blob):
+        if _DRIVE_INDEX_RE.search(blob):
+            return "drive_index"
+        if _DRIVE_READ_RE.search(blob):
+            return "drive_read"
+        return "drive_search"
+    return None
+
+
 def _has_mail_object(text: str) -> bool:
     return bool(_MAIL_OBJ_RE.search(text or ""))
 
@@ -136,8 +195,27 @@ def missing_google_slots(
                 "Dale, te armo el mail. Necesito: **a quién** (email), "
                 "**asunto** y **qué tiene que decir**. "
                 "Si lo querés para más tarde, decime el día y la hora: "
-                "ahora mismo puedo mandarlo cuando me confirmes, "
-                "no lo dejo programado solo."
+                "si no me decís horario, no lo mando."
+            )
+        wants_later = bool(
+            re.search(
+                r"program|más\s+tarde|mas\s+tarde|en\s+\d+|a\s+las",
+                combined,
+                re.I,
+            )
+        )
+        has_when = bool(extra.get("send_at")) or bool(
+            re.search(
+                r"(?:en|dentro\s+de)\s+\d+\s+(?:min|hora|d[ií]a)|"
+                r"a\s+las\s+\d|ahora|ya\s+mismo",
+                combined,
+                re.I,
+            )
+        )
+        if wants_later and not has_when:
+            return (
+                "¿Lo mando **ahora** o lo programo? Si es programado, "
+                "decime en cuánto (ej. en 5 minutos) o a qué hora."
             )
     if action == "calendar_create":
         if not _has_cal_object(combined) and not str(extra.get("summary") or "").strip():
@@ -350,17 +428,19 @@ def use_google(
     end_iso: str = "",
     search: str = "",
     file_id: str = "",
+    send_at: str = "",
 ) -> str:
     """Usá Calendar, Gmail o Drive de la cuenta Google del usuario.
 
-    Llamá esta tool SOLO si el pedido es claramente correo, calendario o Drive.
-    El objeto del verbo manda: mail/correo/email → gmail_*; evento/agenda/reunión
-    → calendar_*; archivo de Drive → drive_*.
-    'Programar el envío de un mail' es gmail_send, NUNCA calendar_create.
-    Si falta un dato imprescindible (destinatario, título y fecha), NO llames
-    la tool: preguntá en el mensaje.
+    PRIORIDAD: mail/correo/Gmail, agenda/evento o Drive SIEMPRE van acá.
+    NUNCA uses search_skill_marketplace para enviar o programar un mail.
+    El objeto manda: mail → gmail_send/gmail_list; evento → calendar_*;
+    Drive → drive_*. 'Programar el envío de un mail' es gmail_send.
+    Si pidió espera (en 5 minutos, a las 18), pasá send_at en ISO-8601
+    y NO lo mandes como si fuera ahora.
+    Si falta destinatario o el horario de un envío programado, preguntá.
 
-    Acciones válidas: calendar_list, calendar_create, gmail_list, gmail_send,
+    Acciones: calendar_list, calendar_create, gmail_list, gmail_send,
     drive_search, drive_read, drive_index.
     """
     return json.dumps(
@@ -375,6 +455,7 @@ def use_google(
             "end_iso": end_iso,
             "search": search,
             "file_id": file_id,
+            "send_at": send_at,
         },
         ensure_ascii=False,
     )

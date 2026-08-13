@@ -545,6 +545,11 @@ def is_result_challenge_or_correction(text: str) -> bool:
         r"pero\s+en\s+la\s+p[aá]gina",
         r"sacaste\s+mal",
         r"te\s+equivocaste",
+        r"te\s+dije\s+que",
+        r"te\s+ped[ií]\s+que",
+        r"no\s+era\s+ahora",
+        r"no\s+lo\s+mandes\s+ahora",
+        r"ten[ií]a\s+que\s+ser\s+m[aá]s\s+tarde",
     )
     return any(re.search(p, lowered) for p in patterns)
 
@@ -658,6 +663,10 @@ def should_try_skill_marketplace(text: str, assistant_reply: str | None = None) 
         return True
 
     if assistant_reply and reply_is_capability_refusal(assistant_reply):
+        return True
+    from app.services.order_parse import looks_like_do_task
+
+    if looks_like_do_task(text):
         return True
     return False
 

@@ -74,3 +74,65 @@ def test_llm_tools_expuestos():
 
     assert use_google.name == "use_google"
     assert save_user_context.name == "save_user_context"
+
+
+def test_mail_es_google_nativo_no_skill():
+    from app.services.command_router import (
+        infer_google_action,
+        should_use_native_google,
+    )
+
+    msg = "Que onda crack! Podés programar un envío de mail?"
+    assert should_use_native_google(msg) is True
+    assert infer_google_action(msg) == "gmail_send"
+
+
+def test_parse_send_at_en_minutos():
+    from datetime import datetime, timedelta
+
+    from app.services.google_assistant import parse_send_at
+
+    iso = parse_send_at("programalo para que se envíe en 5 minutos")
+    assert iso is not None
+    when = datetime.fromisoformat(iso)
+    delta = when - datetime.now().astimezone()
+    assert timedelta(minutes=4) < delta < timedelta(minutes=6)
+    assert parse_send_at("mandalo ahora") is None
+
+
+def test_extract_order_takes_every_part():
+    from app.services.order_parse import extract_order_parts
+
+    text = (
+        "Mira es para el mail lautiplopez2@gmail.com, el asunto es prueba "
+        "y decile hola estoy testeando! Y programalo para que se envíe en 5 minutos"
+    )
+    parts = extract_order_parts(text)
+    assert parts.wants_mail
+    assert parts.to == "lautiplopez2@gmail.com"
+    assert parts.subject and "prueba" in parts.subject.lower()
+    assert parts.body and "testeando" in parts.body.lower()
+    assert parts.when_iso
+    recap = parts.recap()
+    assert "mail" in recap.lower()
+    assert "lautiplopez2@gmail.com" in recap
+    assert "5" in recap
+
+    word = extract_order_parts("en 5 minutos armame un word con el informe de caudales")
+    assert word.wants_word
+    assert word.when_iso
+    assert "word" in word.recap().lower()
+
+
+def test_orden_generica_wol_con_horario():
+    from app.services.order_parse import extract_order_parts, looks_like_do_task
+    from app.services.skill_marketplace import should_try_skill_marketplace
+
+    msg = "man en 5 minutos necesito que prendas mi PC"
+    assert looks_like_do_task(msg)
+    assert should_try_skill_marketplace(msg)
+    parts = extract_order_parts(msg)
+    assert parts.when_iso
+    ack = parts.commit_ack()
+    assert "5" in ack
+    assert "pc" in ack.lower() or "prend" in ack.lower()

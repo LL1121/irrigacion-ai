@@ -114,4 +114,20 @@ CREATE TABLE IF NOT EXISTS tool_whitelist (
     UNIQUE (user_id, tool_id)
 );
 
+CREATE TABLE IF NOT EXISTS scheduled_jobs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    session_id UUID,
+    kind TEXT NOT NULL,
+    payload JSONB NOT NULL,
+    run_at TIMESTAMPTZ NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    done_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_due
+    ON scheduled_jobs (status, run_at);
+
 -- Auditoría (triggers): ver 02_audit.sql / app/database/audit.sql

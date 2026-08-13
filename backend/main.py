@@ -13,6 +13,10 @@ from app.api import auth, chat, files, legal, skills
 from app.core.checkpointer import close_checkpointer, init_checkpointer
 from app.core.config import get_settings
 from app.core.database import ensure_runtime_schema
+from app.services.scheduled_jobs import (
+    start_scheduled_job_worker,
+    stop_scheduled_job_worker,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +28,9 @@ async def lifespan(_app: FastAPI):
         settings.assert_production_ready()
     ensure_runtime_schema()
     init_checkpointer()
+    start_scheduled_job_worker()
     yield
+    stop_scheduled_job_worker()
     close_checkpointer()
 
 
