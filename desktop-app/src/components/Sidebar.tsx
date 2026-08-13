@@ -183,7 +183,7 @@ export function Sidebar({
             Irrigación Bot
           </p>
           <p className="text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
-            Malargüe
+            Asistente institucional
           </p>
         </div>
         <button
