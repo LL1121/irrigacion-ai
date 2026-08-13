@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Literal, NotRequired, TypedDict
 from uuid import UUID
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 from sqlalchemy import text
@@ -37,9 +37,7 @@ from app.services.command_router import (
     GOOGLE_ACTIONS,
     infer_google_action,
     missing_google_slots,
-    save_user_context,
     should_use_native_google,
-    use_google,
 )
 from app.services.order_parse import (
     extract_order_parts,
@@ -72,18 +70,21 @@ from app.services.sandbox import execute_skill_sync
 from app.services.skill_marketplace import (
     APPROVAL_KIND_DOWNLOAD,
     APPROVAL_KIND_EXECUTE,
+    ask_inputs_for_open_task,
     conversation_context_text,
     detect_response_style,
     download_remote_prompt,
+    extract_open_task,
     find_local_skill,
+    has_concrete_task_inputs,
     is_action_request,
+    is_asking_for_needed_data,
     is_result_challenge_or_correction,
     looks_like_web_or_external_request,
     prepare_skill_arguments,
     reply_is_capability_refusal,
     resolve_skill_decision,
     search_catalog,
-    search_skill_marketplace,
     thread_brief_for_prompt,
 )
 from app.services.skill_remote import (
@@ -92,6 +93,12 @@ from app.services.skill_remote import (
     validate_remote_skill,
 )
 from app.services.skill_whitelist import can_auto_reuse_skill, is_whitelisted
+from app.services.llm_roles import chat_llm
+from app.services.thread_memory import (
+    load_thread_state,
+    recent_history_for_llm,
+    schedule_refresh,
+)
 from app.services.token_guard import (
     dumps_capped,
     enforce_request_budget,
@@ -124,7 +131,7 @@ Tu objetivo es ayudar al personal de la oficina a resolver dudas sobre normativa
 3. **Pedí solo lo imprescindible:** Si faltan datos para un cálculo, pedí únicamente esos datos (con unidades), no un cuestionario largo.
 4. **Consistencia en la conversación:** Si el usuario ya eligió un estilo o unidad, mantenelo salvo que diga lo contrario.
 5. **Skills con criterio:** Cuando uses herramientas/skills, pasá bien los números/unidades. Si no estás seguro de la skill, preguntá antes de ejecutar.
-6. **SEGUÍ EL HILO:** Cada mensaje es continuación del mismo chat. No trates el último mensaje como un pedido nuevo aislado. Si ya hay URL, punto o dato en el historial, usalos. Si el usuario corrige un resultado ("de dónde sacaste…", "en la página dice…"), respondé sobre ese resultado; no reinicies el cuestionario de skills.
+6. **SEGUÍ EL HILO:** Cada mensaje es continuación del mismo chat. No trates el último mensaje como un pedido nuevo aislado. Si hay una tarea abierta (da igual el tema), SEGUILA: si pregunta qué datos faltan, listá solo los de ESA tarea; si aporta un dato, usalo. Prohibido cambiar de tema, ofrecer el catálogo de riego u otra skill, salvo que la tarea abierta sea eso. Si ya hay URL, punto o dato en el historial, usalos. Si el usuario corrige un resultado, respondé sobre ese resultado; no reinicies el cuestionario.
 
 ### LÍMITES, HONESTIDAD Y MANEJO DE INFORMACIÓN:
 1. **Prioridad Contexto Local (RAG):** Evaluá primero la información proveniente de los documentos locales de la base de datos de Irrigación.
@@ -196,6 +203,7 @@ class AgentState(TypedDict):
     pre_assist_done: NotRequired[bool]
     run_at: NotRequired[str | None]
     order_ack: NotRequired[str | None]
+    thread_state: NotRequired[dict[str, Any]]
 
 
 @dataclass
@@ -218,19 +226,13 @@ def _embedding_literal(embedding: list[float]) -> str:
     return "[" + ",".join(str(float(v)) for v in embedding) + "]"
 
 
-def _llm(*, tools: bool = False) -> ChatOpenAI:
-    settings = get_settings()
-    llm = ChatOpenAI(
-        model=settings.chat_model,
-        api_key=settings.groq_api_key,
-        base_url=settings.groq_base_url,
-        temperature=0.2,
-    )
-    if tools:
-        return llm.bind_tools(
-            [use_google, save_user_context, search_skill_marketplace]
-        )
-    return llm
+def _llm(*, tools: bool = False):
+    return chat_llm(tools=tools, temperature=0.2)
+
+
+def _thread_state(state: AgentState | dict[str, Any] | None) -> dict[str, Any]:
+    raw = (state or {}).get("thread_state") if state else None
+    return raw if isinstance(raw, dict) else {}
 
 
 def _context_block(docs: list[str]) -> str:
@@ -240,9 +242,12 @@ def _context_block(docs: list[str]) -> str:
     return "(Sin documentos recuperados en la base vectorial.)"
 
 
-def _history_messages(history: list[dict]) -> list:
+def _history_messages(
+    history: list[dict],
+    thread_state: dict[str, Any] | None = None,
+) -> list:
     messages: list = []
-    for item in fit_history(history):
+    for item in fit_history(recent_history_for_llm(history, thread_state)):
         role = (item.get("role") or "").lower()
         content = item.get("message") or ""
         if role == "user":
@@ -446,7 +451,10 @@ def _fetch_history_node(state: AgentState, db: Session) -> dict:
         {"role": row["role"], "message": row["message"]}
         for row in reversed(list(rows))
     ]
-    return {"history": history}
+    return {
+        "history": history,
+        "thread_state": load_thread_state(db, state.get("session_id")),
+    }
 
 
 def _parse_tool_arguments(raw_args: dict[str, Any], user_message: str) -> tuple[str, dict]:
@@ -532,10 +540,15 @@ def _force_skill_or_download(
     user_message: str,
     *,
     context_text: str | None = None,
+    thread_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Resuelve skill con criterio estricto; si duda, pregunta."""
     return _plan_from_decision(
-        resolve_skill_decision(user_message, context_text=context_text),
+        resolve_skill_decision(
+            user_message,
+            context_text=context_text,
+            thread_state=thread_state,
+        ),
         user_message=user_message,
         context_text=context_text,
     )
@@ -610,12 +623,14 @@ def _resolve_skill_plan(
     user_message: str,
     *,
     context_text: str | None = None,
+    thread_state: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Evalúa skills con matching endurecido + aclaraciones."""
     decision = resolve_skill_decision(
         user_message,
         arguments,
         context_text=context_text or user_message,
+        thread_state=thread_state,
     )
     if decision.get("action") == "none":
         return None
@@ -779,15 +794,46 @@ def _plan_native_google(state: AgentState, db: Session, args: dict[str, Any]) ->
 def _plan_node(state: AgentState, db: Session) -> dict:
     llm = _llm(tools=True)
     ctx = _conversation_text(state)
+    thread_state = _thread_state(state)
     parts = extract_order_parts(state["user_message"], ctx)
+    if is_asking_for_needed_data(state["user_message"]) and (
+        ctx.strip() or state.get("history") or thread_state.get("open_task")
+    ):
+        return _annotate_plan_result(
+            {
+                "pending_skill": None,
+                "needs_approval": False,
+                "approval_kind": None,
+                "reply": ask_inputs_for_open_task(
+                    ctx,
+                    history=state.get("history") or [],
+                    thread_state=thread_state,
+                ),
+            },
+            parts,
+        )
     system = fit_system_prompt(SYSTEM_PROMPT_IRRIGACION)
     native = fit_system_prompt(NATIVE_TOOLS_HINT)
-    tooling = fit_system_prompt(SKILL_TOOLING_HINT + "\n" + CATALOG_HINT)
+    open_task = extract_open_task(
+        state["user_message"],
+        state.get("history") or [],
+        ctx,
+        thread_state=thread_state,
+    )
+    if open_task:
+        tooling = fit_system_prompt(
+            SKILL_TOOLING_HINT
+            + "\nTAREA ABIERTA (obligatorio continuar, no cambies de tema): "
+            + open_task[:400]
+            + "\nNo ofrezcas el catálogo de riego ni otra skill salvo que ESA sea la tarea."
+        )
+    else:
+        tooling = fit_system_prompt(SKILL_TOOLING_HINT + "\n" + CATALOG_HINT)
     rag = "Contexto documental recuperado (RAG):\n\n" + _context_block(
         state.get("retrieved_docs") or []
     )
     user_text = fit_user_message(state["user_message"])
-    history_msgs = _history_messages(state.get("history") or [])
+    history_msgs = _history_messages(state.get("history") or [], thread_state)
     style_hint = fit_system_prompt(
         "Preferencia de formato para esta respuesta: "
         + detect_response_style(state["user_message"])
@@ -798,23 +844,36 @@ def _plan_node(state: AgentState, db: Session) -> dict:
         + (f" Horario: {parts.when_label}." if parts.when_label else "")
     )
     thread_hint = fit_system_prompt(
-        thread_brief_for_prompt(state["user_message"], state.get("history") or [])
-    )
-
-    system, native, tooling, order_hint, rag, style_hint, thread_hint, user_text = (
-        enforce_request_budget(
-            [
-                ("system", system),
-                ("native", native),
-                ("tooling", tooling),
-                ("order", order_hint),
-                ("rag", rag),
-                ("style", style_hint),
-                ("thread", thread_hint),
-                ("user", user_text),
-            ]
+        thread_brief_for_prompt(
+            state["user_message"],
+            state.get("history") or [],
+            thread_state=thread_state,
         )
     )
+    memory_hint = fit_system_prompt(str(thread_state.get("summary_text") or "").strip())
+
+    packed = [
+        ("system", system),
+        ("native", native),
+        ("tooling", tooling),
+        ("order", order_hint),
+        ("memory", memory_hint),
+        ("rag", rag),
+        ("style", style_hint),
+        ("thread", thread_hint),
+        ("user", user_text),
+    ]
+    (
+        system,
+        native,
+        tooling,
+        order_hint,
+        memory_hint,
+        rag,
+        style_hint,
+        thread_hint,
+        user_text,
+    ) = enforce_request_budget(packed)
 
     messages: list = [
         SystemMessage(content=system),
@@ -822,6 +881,7 @@ def _plan_node(state: AgentState, db: Session) -> dict:
         SystemMessage(content=tooling),
         SystemMessage(content=order_hint),
         SystemMessage(content=thread_hint),
+        SystemMessage(content=memory_hint),
         SystemMessage(content=rag),
         SystemMessage(content=style_hint),
         *history_msgs,
@@ -841,12 +901,17 @@ def _plan_node(state: AgentState, db: Session) -> dict:
             {"query": state["user_message"]},
             state["user_message"],
             context_text=ctx,
+            thread_state=thread_state,
         )
         if resolved:
             return _annotate_plan_result(resolved, parts)
         if looks_like_do_task(state["user_message"]):
             return _annotate_plan_result(
-                _force_skill_or_download(state["user_message"], context_text=ctx),
+                _force_skill_or_download(
+                    state["user_message"],
+                    context_text=ctx,
+                    thread_state=thread_state,
+                ),
                 parts,
             )
         return {
@@ -910,13 +975,21 @@ def _plan_node(state: AgentState, db: Session) -> dict:
             task = ctx
             arguments = {**arguments, "query": ctx}
         resolved = _resolve_skill_plan(
-            task, arguments, state["user_message"], context_text=ctx
+            task,
+            arguments,
+            state["user_message"],
+            context_text=ctx,
+            thread_state=thread_state,
         )
         llm_bits = (getattr(response, "content", None) or "").strip()
         if resolved:
             return _annotate_plan_result(resolved, parts, llm_reply=llm_bits)
         # Re-evaluar con el mensaje completo (el task del tool a veces es pobre).
-        forced = _force_skill_or_download(state["user_message"], context_text=ctx)
+        forced = _force_skill_or_download(
+            state["user_message"],
+            context_text=ctx,
+            thread_state=thread_state,
+        )
         if (
             forced.get("reply")
             or forced.get("needs_approval")
@@ -966,7 +1039,11 @@ def _plan_node(state: AgentState, db: Session) -> dict:
         or reply_is_capability_refusal(reply)
     ):
         return _annotate_plan_result(
-            _force_skill_or_download(state["user_message"], context_text=ctx),
+            _force_skill_or_download(
+                state["user_message"],
+                context_text=ctx,
+                thread_state=thread_state,
+            ),
             parts,
             llm_reply=reply,
         )
@@ -1272,6 +1349,31 @@ def _run_skill_node(state: AgentState, db: Session) -> dict:
         state["user_message"],
         context_text=ctx,
     )
+    args = skill.get("arguments") or {}
+    useful = {
+        key: val
+        for key, val in args.items()
+        if key not in {"query", "pedido", "raw", "api_url"}
+        and val not in (None, "", {}, [])
+    }
+    is_remote = str(skill.get("source") or "") == "remote" or str(
+        skill.get("id") or ""
+    ).startswith("remote_")
+    if is_remote and not useful and not has_concrete_task_inputs(
+        f"{ctx}\n{state.get('user_message') or ''}"
+    ):
+        return {
+            "skill_result": None,
+            "reply": ask_inputs_for_open_task(
+                ctx or state.get("user_message") or "",
+                str(skill.get("name") or "") or None,
+                history=state.get("history") or [],
+                thread_state=_thread_state(state),
+            ),
+            "pending_skill": None,
+            "needs_approval": False,
+            "approval_kind": None,
+        }
     parts = extract_order_parts(state.get("user_message") or "", ctx)
     when_iso = parts.when_iso or state.get("run_at")
     if when_iso:
@@ -1429,7 +1531,20 @@ def _compose_skill_reply_node(state: AgentState) -> dict:
 
     if result.get("status") == "error":
         execution = result.get("execution") or {}
-        err = execution.get("error") or "error desconocido"
+        err = str(execution.get("error") or "error desconocido")
+        if re.search(
+            r"datos|data|falt|proporcion|argument|required|missing",
+            err,
+            re.I,
+        ):
+            return {
+                "reply": ask_inputs_for_open_task(
+                    user_message,
+                    str(name) if name != "skill" else None,
+                    history=state.get("history") or [],
+                    thread_state=_thread_state(state),
+                )
+            }
         return {
             "reply": (
                 f"No pude completar esa consulta: {err}. "
@@ -1742,6 +1857,7 @@ def run_agent(
                 "pre_assist_done": False,
                 "run_at": None,
                 "order_ack": None,
+                "thread_state": {},
             },
             config,
         )
@@ -1773,6 +1889,7 @@ def run_agent(
             },
             user_id=user_id,
         )
+        schedule_refresh(sid)
         return AgentOutcome(
             status=STATUS_APPROVAL,
             reply=prompt,
@@ -1793,6 +1910,7 @@ def run_agent(
     if attachments:
         assistant_meta = {"attachments": attachments}
     _persist_message(db, sid, "assistant", reply, assistant_meta, user_id=user_id)
+    schedule_refresh(sid)
     if (
         embedding
         and not values.get("pre_assist_done")
@@ -1870,6 +1988,7 @@ def resume_agent(db: Session, session_id: UUID | str, approved: bool) -> AgentOu
                 "skill_description": description,
             },
         )
+        schedule_refresh(sid)
         return AgentOutcome(
             status=STATUS_APPROVAL,
             reply=prompt,
@@ -1907,6 +2026,7 @@ def resume_agent(db: Session, session_id: UUID | str, approved: bool) -> AgentOu
             reply,
             meta,
         )
+        schedule_refresh(sid)
     if approved and embedding and reply and kind != APPROVAL_KIND_GOOGLE_TOOL:
         save_to_semantic_cache(db, user_message, embedding, reply)
 

@@ -130,4 +130,13 @@ CREATE TABLE IF NOT EXISTS scheduled_jobs (
 CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_due
     ON scheduled_jobs (status, run_at);
 
+-- Estado resumido del hilo (Gemini); se inyecta al LLM principal
+CREATE TABLE IF NOT EXISTS chat_thread_state (
+    session_id UUID PRIMARY KEY,
+    summary_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    summary_text TEXT NOT NULL DEFAULT '',
+    last_message_id BIGINT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Auditoría (triggers): ver 02_audit.sql / app/database/audit.sql

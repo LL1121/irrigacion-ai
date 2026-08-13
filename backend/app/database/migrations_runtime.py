@@ -192,3 +192,17 @@ def apply_schema_migrations(conn: Connection) -> None:
         )
     )
     conn.execute(text("ALTER TABLE scheduled_jobs ALTER COLUMN user_id DROP NOT NULL"))
+
+    conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS chat_thread_state (
+                session_id UUID PRIMARY KEY,
+                summary_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                summary_text TEXT NOT NULL DEFAULT '',
+                last_message_id BIGINT,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+    )

@@ -554,28 +554,160 @@ def is_result_challenge_or_correction(text: str) -> bool:
     return any(re.search(p, lowered) for p in patterns)
 
 
-def is_thread_followup(text: str, context_text: str | None = None) -> bool:
-    """Mensaje corto que continúa una tarea ya abierta en el historial."""
+def is_thread_followup(
+    text: str,
+    context_text: str | None = None,
+    thread_state: dict[str, Any] | None = None,
+) -> bool:
+    """Mensaje que continúa la tarea ya abierta (cualquier tema), no un pedido nuevo."""
     if is_download_confirmation_only(text):
         return True
     if is_result_challenge_or_correction(text):
         return True
+    if is_asking_for_needed_data(text):
+        ctx = (context_text or "").strip()
+        from app.services.thread_memory import open_task_from_state
+
+        return bool(
+            (ctx and ctx != (text or "").strip()) or open_task_from_state(thread_state)
+        )
     ctx = (context_text or "").strip()
     if not ctx or ctx == (text or "").strip():
-        return False
+        from app.services.thread_memory import open_task_from_state
+
+        if not open_task_from_state(thread_state):
+            return False
     cleaned = (text or "").strip()
     if not cleaned:
         return False
-    # URL o punto sueltos, o respuesta parcial a un clarify previo.
+    open_task = extract_open_task(text, context_text=ctx, thread_state=thread_state)
+    if not open_task:
+        return False
+    from app.services.order_parse import looks_like_do_task
+
+    # Pedido nuevo y distinto: no es follow-up.
+    if looks_like_do_task(cleaned) and not is_asking_for_needed_data(cleaned):
+        same = open_task.lower() in cleaned.lower() or cleaned.lower() in open_task.lower()
+        if not same and len(_tokenize(cleaned)) >= 6:
+            return False
     if contains_url(cleaned) and len(cleaned) < 220:
         return True
     args = extract_web_skill_args(cleaned)
     if args.get("punto") and len(_tokenize(cleaned)) <= 10:
         return True
-    if len(cleaned) <= 160 and len(_tokenize(cleaned)) <= 12:
-        if has_actionable_remote_task(ctx) or looks_like_web_or_external_request(ctx):
-            return True
+    if len(cleaned) <= 200 and len(_tokenize(cleaned)) <= 18:
+        return True
     return False
+
+
+_DATA_ASK_RE = re.compile(
+    r"(?:qu[eé]\s+datos|qu[eé]\s+te\s+falta|qu[eé]\s+necesit(?:[aá]|as|o)|"
+    r"faltan\s+datos|con\s+qu[eé]\s+datos|qu[eé]\s+me\s+ten[eé]s\s+que\s+pasar|"
+    r"qu[eé]\s+info(?:rmaci[oó]n)?)",
+    re.I,
+)
+
+
+def is_asking_for_needed_data(text: str) -> bool:
+    """El usuario pregunta qué datos hacen falta para la tarea ya abierta."""
+    return bool(_DATA_ASK_RE.search(text or ""))
+
+
+def has_concrete_task_inputs(text: str) -> bool:
+    """Hay un dato usable (IP, rango, URL, MAC, email, magnitudes)."""
+    blob = text or ""
+    return bool(
+        re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}(?:/\d{1,2})?\b", blob)
+        or re.search(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", blob, re.I)
+        or contains_url(blob)
+        or re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", blob)
+        or re.search(
+            r"\b\d+(?:[.,]\d+)?\s*(?:ha|m2|m²|l/s|m3|m³)",
+            blob,
+            re.I,
+        )
+    )
+
+
+def extract_open_task(
+    user_message: str = "",
+    history: list[dict[str, Any]] | None = None,
+    context_text: str | None = None,
+    thread_state: dict[str, Any] | None = None,
+) -> str:
+    """Tarea activa del hilo (cualquier tema), no el último chiste ni un 'qué datos'."""
+    from app.services.order_parse import looks_like_do_task
+    from app.services.thread_memory import open_task_from_state
+
+    history = history or []
+    current = (user_message or "").strip()
+    if (
+        current
+        and looks_like_do_task(current)
+        and not is_asking_for_needed_data(current)
+        and not is_download_confirmation_only(current)
+    ):
+        return re.sub(r"\s+", " ", current).strip()[:300]
+    persisted = open_task_from_state(thread_state)
+    if persisted:
+        return persisted[:300]
+    for item in reversed(history):
+        role = (item.get("role") or "").lower()
+        msg = (item.get("message") or "").strip()
+        if role not in {"assistant", "ai"} or not msg:
+            continue
+        named = re.search(
+            r"skill\s+['«\"]([^'»\"]+)['»\"]|"
+            r"seguimos con\s+\*\*([^*]+)\*\*|"
+            r"para (?:usar\s+)?\*\*([^*]+)\*\*",
+            msg,
+            re.I,
+        )
+        if named:
+            return next(g.strip() for g in named.groups() if g)
+    user_msgs: list[str] = []
+    for item in history:
+        if (item.get("role") or "").lower() == "user":
+            msg = (item.get("message") or "").strip()
+            if msg:
+                user_msgs.append(msg)
+    if not user_msgs and context_text:
+        user_msgs = [
+            block.strip()
+            for block in re.split(r"\n\s*\n", context_text)
+            if block.strip()
+        ]
+    if current and (not user_msgs or user_msgs[-1] != current):
+        user_msgs.append(current)
+    for msg in reversed(user_msgs):
+        if is_asking_for_needed_data(msg) or is_download_confirmation_only(msg):
+            continue
+        if looks_like_do_task(msg) or has_actionable_remote_task(msg):
+            return re.sub(r"\s+", " ", msg).strip()[:300]
+    return ""
+
+
+def ask_inputs_for_open_task(
+    context: str,
+    skill_name: str | None = None,
+    *,
+    history: list[dict[str, Any]] | None = None,
+    thread_state: dict[str, Any] | None = None,
+) -> str:
+    """Seguí la tarea ABIERTA del hilo, sea cual sea. No cambies de tema."""
+    task = (skill_name or "").strip() or extract_open_task(
+        "", history, context, thread_state=thread_state
+    )
+    task = re.sub(r"\s+", " ", task).strip()[:220]
+    if not task:
+        task = "lo que veníamos haciendo en este chat"
+    return (
+        f"Seguimos con **{task}** — no cambio de tema.\n\n"
+        "Para ejecutar *esa* tarea necesito los datos concretos que apliquen "
+        "(destino, archivo, rango, URL, parámetros, lo que sea de ese pedido).\n"
+        "Pasame lo que tengas. Si no sabés qué mandar, decime qué tenés a mano "
+        "y te digo qué falta. No arrancamos otra cosa."
+    )
 
 
 def missing_web_clarify_fields(context_text: str) -> list[str]:
@@ -602,6 +734,7 @@ def missing_web_clarify_fields(context_text: str) -> list[str]:
 def thread_brief_for_prompt(
     user_message: str,
     history: list[dict[str, Any]] | None = None,
+    thread_state: dict[str, Any] | None = None,
 ) -> str:
     """Resumen corto del hilo para que el LLM no trate cada mensaje como chat nuevo."""
     history = history or []
@@ -616,13 +749,21 @@ def thread_brief_for_prompt(
             if last_assistant:
                 break
     args = extract_web_skill_args(effective)
+    open_task = extract_open_task(
+        user_message, history, thread_state=thread_state
+    )
+    persisted_text = str((thread_state or {}).get("summary_text") or "").strip()
     lines = [
         "CONTINUIDAD DEL HILO (obligatorio respetar):",
         "- Este mensaje es continuación del mismo chat, no un pedido aislado.",
         "- No vuelvas a pedir URL/punto/dato si ya están en el historial.",
         "- Si el usuario corrige un resultado, explicá la fuente o reconsultá; no reinicies el cuestionario.",
+        "- Si pregunta qué datos faltan o aporta un dato, SEGUÍ la tarea abierta. "
+        "Prohibido ofrecer el catálogo de riego u otra skill salvo que esa sea la tarea.",
     ]
-    if effective and effective.strip() != (user_message or "").strip():
+    if open_task:
+        lines.append(f"- TAREA ABIERTA (no la abandones): {open_task[:500]}")
+    elif effective and effective.strip() != (user_message or "").strip():
         lines.append(f"- Tarea activa del hilo: {effective[:500]}")
     if args.get("url"):
         lines.append(f"- URL ya conocida: {args['url']}")
@@ -634,6 +775,8 @@ def thread_brief_for_prompt(
         lines.append(
             "- El usuario cuestiona/corrige el resultado anterior: respondé sobre ese hilo."
         )
+    if persisted_text:
+        lines.append(persisted_text)
     return "\n".join(lines)
 
 
@@ -923,12 +1066,18 @@ def clarifying_question_for_unknown(
     user_message: str,
     *,
     context_text: str | None = None,
+    thread_state: dict[str, Any] | None = None,
 ) -> str:
     """Cuando el pedido es acción pero no hay match claro ni conviene adivinar."""
     probe = (context_text or user_message or "").strip() or (user_message or "")
-    if looks_like_web_or_external_request(probe) or looks_like_web_or_external_request(
+    open_task = extract_open_task(
+        user_message or "", context_text=probe, thread_state=thread_state
+    )
+    if open_task and not looks_like_web_or_external_request(open_task):
+        return ask_inputs_for_open_task(probe, thread_state=thread_state)
+    if looks_like_web_or_external_request(open_task or probe) or looks_like_web_or_external_request(
         user_message
-    ) or is_telemetria_request(probe):
+    ) or is_telemetria_request(open_task or probe):
         missing = missing_web_clarify_fields(probe)
         label = {
             "url": "¿Qué URL/API exacta? (pegá el link)",
@@ -972,6 +1121,7 @@ def resolve_skill_decision(
     arguments: dict[str, Any] | None = None,
     *,
     context_text: str | None = None,
+    thread_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Decisión endurecida de skills.
@@ -996,6 +1146,17 @@ def resolve_skill_decision(
             "action": "none",
             "confidence": 0.2,
             "reason": "thread_challenge",
+        }
+
+    open_task = extract_open_task(
+        text, context_text=context, thread_state=thread_state
+    )
+    if is_asking_for_needed_data(text) and open_task:
+        return {
+            "action": "clarify",
+            "confidence": 0.8,
+            "reply": ask_inputs_for_open_task(context, thread_state=thread_state),
+            "reason": "user_asked_needed_data",
         }
 
     # Confirmación explícita de descarga tras una aclaración previa.
@@ -1042,17 +1203,22 @@ def resolve_skill_decision(
         is_action_request(text)
         or should_try_skill_marketplace(text)
         or looks_like_web_or_external_request(context)
-        or is_thread_followup(text, context)
+        or is_thread_followup(text, context, thread_state)
     ):
         return {"action": "none", "confidence": 0.0}
 
-    # Web/URL: evaluar claridad sobre el CONTEXTO (historial), no solo el último mensaje.
+    # Web/URL/telemetría: según la TAREA ABIERTA, no por keywords viejas del chat.
+    web_probe = open_task or text
     if (
         looks_like_web_or_external_request(text)
-        or looks_like_web_or_external_request(context)
-        or (is_thread_followup(text, context) and has_actionable_remote_task(context))
+        or looks_like_web_or_external_request(web_probe)
+        or is_telemetria_request(web_probe)
     ):
-        probe = context if len(context) >= len(text) else text
+        probe = (
+            context
+            if (open_task and (open_task in context)) or len(context) >= len(text)
+            else text
+        )
         missing = missing_web_clarify_fields(probe)
         if not missing:
             return {
@@ -1070,7 +1236,9 @@ def resolve_skill_decision(
         return {
             "action": "clarify",
             "confidence": 0.4,
-            "reply": clarifying_question_for_unknown(text, context_text=probe),
+            "reply": clarifying_question_for_unknown(
+                text, context_text=probe, thread_state=thread_state
+            ),
             "reason": "web_request_unclear",
         }
 
@@ -1111,6 +1279,23 @@ def resolve_skill_decision(
             "reason": "local_match",
         }
 
+    # Follow-up de la tarea ya abierta: continuar (no resetear al catálogo).
+    if is_thread_followup(text, context, thread_state) and open_task:
+        if has_concrete_task_inputs(text) or has_concrete_task_inputs(context):
+            return {
+                "action": "download",
+                "confidence": 0.8,
+                "reason": "followup_continue_open_task",
+            }
+        return {
+            "action": "clarify",
+            "confidence": 0.7,
+            "reply": ask_inputs_for_open_task(
+                context, thread_state=thread_state
+            ),
+            "reason": "followup_missing_inputs",
+        }
+
     # Acción clara sin match: ofrecer descarga, no inventar skill local.
     if is_action_request(text) or should_try_skill_marketplace(text):
         # Si es muy vago ("podés hacer algo?"), preguntar.
@@ -1119,7 +1304,9 @@ def resolve_skill_decision(
             return {
                 "action": "clarify",
                 "confidence": 0.35,
-                "reply": clarifying_question_for_unknown(text, context_text=context),
+                "reply": clarifying_question_for_unknown(
+                    text, context_text=context, thread_state=thread_state
+                ),
                 "reason": "vague_action",
             }
         return {
@@ -1223,6 +1410,10 @@ def has_actionable_remote_task(text: str) -> bool:
             "word",
             "documento",
             "calcular",
+            "análisis de red",
+            "analisis de red",
+            "wake-on-lan",
+            "wake on lan",
         )
     ):
         return True

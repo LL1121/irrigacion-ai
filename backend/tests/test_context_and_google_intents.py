@@ -124,6 +124,62 @@ def test_extract_order_takes_every_part():
     assert "word" in word.recap().lower()
 
 
+def test_followup_datos_sigue_la_tarea_abierta():
+    """El hilo manda: un 'qué datos?' no puede saltar a otra skill/catálogo."""
+    from app.services.skill_marketplace import (
+        ask_inputs_for_open_task,
+        extract_open_task,
+        is_asking_for_needed_data,
+        resolve_skill_decision,
+    )
+
+    assert is_asking_for_needed_data("Que datos necesitas crack?")
+
+    red_ctx = (
+        "Que onda mi crack! Escuchame, podés hacer un análisis de red?\n\n"
+        "Que datos necesitas crack?"
+    )
+    assert "análisis de red" in extract_open_task("", context_text=red_ctx).lower()
+    red_ask = ask_inputs_for_open_task(red_ctx)
+    assert "red" in red_ask.lower()
+    assert "caudal" not in red_ask.lower()
+    red_dec = resolve_skill_decision(
+        "Que datos necesitas crack?",
+        context_text=red_ctx,
+    )
+    assert red_dec["action"] == "clarify"
+    assert "red" in (red_dec.get("reply") or "").lower()
+    assert "caudal" not in (red_dec.get("reply") or "").lower()
+
+    backup_ctx = (
+        "podés hacerme un backup de la base postgres de irrigación?\n\n"
+        "qué datos necesitás?"
+    )
+    backup_ask = ask_inputs_for_open_task(backup_ctx)
+    assert "backup" in backup_ask.lower() or "postgres" in backup_ask.lower()
+    assert "caudal" not in backup_ask.lower()
+    backup_dec = resolve_skill_decision("qué datos necesitás?", context_text=backup_ctx)
+    assert backup_dec["action"] == "clarify"
+    assert "backup" in (backup_dec.get("reply") or "").lower() or "postgres" in (
+        backup_dec.get("reply") or ""
+    ).lower()
+    assert "lámina" not in (backup_dec.get("reply") or "").lower()
+
+    from app.services.skill_marketplace import (
+        clarifying_question_for_unknown,
+        is_thread_followup,
+    )
+
+    assert is_thread_followup("qué datos necesitás?", backup_ctx)
+    dumped = clarifying_question_for_unknown(
+        "qué datos necesitás?",
+        context_text=backup_ctx,
+    )
+    assert "postgres" in dumped.lower() or "backup" in dumped.lower()
+    assert "caudal" not in dumped.lower()
+    assert "lámina" not in dumped.lower()
+
+
 def test_orden_generica_wol_con_horario():
     from app.services.order_parse import extract_order_parts, looks_like_do_task
     from app.services.skill_marketplace import should_try_skill_marketplace

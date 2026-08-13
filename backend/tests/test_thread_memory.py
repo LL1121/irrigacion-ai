@@ -1,0 +1,112 @@
+"""Memoria de hilo: resumen estructurado + no resetear al catálogo."""
+
+from unittest.mock import patch
+
+from app.services.llm_roles import (
+    format_summary_text,
+    normalize_thread_summary,
+    summarize_thread,
+)
+from app.services.skill_marketplace import (
+    extract_open_task,
+    is_asking_for_needed_data,
+    resolve_skill_decision,
+)
+from app.services.thread_memory import (
+    RECENT_TURNS_WITH_SUMMARY,
+    open_task_from_state,
+    recent_history_for_llm,
+)
+
+
+def _backup_state() -> dict:
+    summary = normalize_thread_summary(
+        {
+            "open_task": "backup de la base postgres de irrigación",
+            "status": "waiting_inputs",
+            "missing": ["destino", "horario"],
+            "known": {},
+            "facts": ["El usuario pidió un backup de Postgres"],
+            "not_this": "catálogo de riego (caudal, lámina)",
+        }
+    )
+    return {
+        **summary,
+        "summary_json": summary,
+        "summary_text": format_summary_text(summary),
+    }
+
+
+def test_normalize_y_texto_del_resumen():
+    previous = {"open_task": "vieja", "status": "in_progress", "facts": ["dato"]}
+    data = normalize_thread_summary(
+        {"open_task": "", "status": "no-existe", "facts": "malo"},
+        previous=previous,
+    )
+    assert data["open_task"] == "vieja"
+    assert data["status"] == "in_progress"
+    assert data["facts"] == ["dato"]
+    text = format_summary_text(
+        {
+            "open_task": "backup de la base postgres",
+            "status": "waiting_inputs",
+            "not_this": "catálogo de riego",
+        }
+    )
+    assert "postgres" in text.lower()
+    assert "waiting_inputs" in text
+    assert "catálogo de riego" in text.lower()
+
+
+def test_summarize_sin_gemini_no_rompe():
+    with patch("app.services.llm_roles.gemini_configured", return_value=False):
+        assert summarize_thread("user: hola\nassistant: qué tal") is None
+
+
+def test_historial_corto_si_hay_resumen():
+    history = [{"role": "user", "message": str(i)} for i in range(20)]
+    trimmed = recent_history_for_llm(
+        history, {"open_task": "x", "summary_text": "ESTADO DEL HILO"}
+    )
+    assert len(trimmed) == RECENT_TURNS_WITH_SUMMARY
+    assert trimmed[0]["message"] == str(20 - RECENT_TURNS_WITH_SUMMARY)
+    full = recent_history_for_llm(history, {})
+    assert len(full) == 20
+
+
+def test_followup_usa_tarea_persistida_no_catalogo():
+    state = _backup_state()
+    assert is_asking_for_needed_data("qué datos necesitás?")
+    assert "postgres" in extract_open_task(
+        "qué datos necesitás?", thread_state=state
+    ).lower()
+    decision = resolve_skill_decision(
+        "qué datos necesitás?",
+        thread_state=state,
+    )
+    assert decision["action"] == "clarify"
+    reply = (decision.get("reply") or "").lower()
+    assert "postgres" in reply or "backup" in reply
+    assert "caudal" not in reply
+    assert "lámina" not in reply
+    assert "lamina" not in reply
+
+
+def test_pedido_nuevo_pisa_resumen_viejo():
+    state = _backup_state()
+    task = extract_open_task(
+        "podés hacer un análisis de red?",
+        thread_state=state,
+    )
+    assert "red" in task.lower()
+    assert "backup" not in task.lower()
+
+
+def test_sin_resumen_sigue_heuristico():
+    ctx = (
+        "podés hacerme un backup de la base postgres de irrigación?\n\n"
+        "qué datos necesitás?"
+    )
+    assert "postgres" in extract_open_task("", context_text=ctx).lower()
+    assert not open_task_from_state({})
+    assert not open_task_from_state(None)
