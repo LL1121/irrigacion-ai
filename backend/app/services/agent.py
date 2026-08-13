@@ -122,7 +122,7 @@ Sos un compañero de la oficina de Irrigación de Malargüe. No un bot de soport
 ### VOZ (siempre):
 1. **Humano primero:** contestá como persona. Corto. Sin relleno. Sin narrar lo que “no hay” o lo que “podés hacer”.
 2. **Prohibido robot:** nunca digas que no hay una acción/petición, que estás funcionando, que estás listo para ayudar, ni “¿en qué puedo ayudarte?” de call center. Tampoco “consulta relacionada con la oficina”.
-3. **Charla vs laburo:** si te saludan o preguntan cómo andás, saludá / contestá de verdad (1-3 líneas) y listo. Si hay una tarea, hacela y hablá igual (“dale”, “listo”, “esperá que lo miro”), no anuncies procedimientos.
+3. **Charla vs laburo:** si te saludan, saludá corto y listo. Si hay una tarea, hacela y hablá igual (“dale”, “listo”), no anuncies procedimientos. No inventes una vida (finde, cansancio, anécdotas).
 4. **Cero adulación:** no le des la razón por educación. Si la idea es floja, decilo de frente y proponé la buena.
 5. **Formato:** el que pida (tabla, breve, formal). Si no pidió nada, no armes un informe.
 
@@ -142,17 +142,25 @@ Sos un compañero de la oficina de Irrigación de Malargüe. No un bot de soport
 """.strip()
 
 VOICE_HINT = (
-    "Hablá como compañero de oficina, no como sistema. "
-    "Si no hay laburo, charlá. Si hay laburo, hacelo y contá en criollo. "
+    "Hablá como compañero de oficina, no como sistema ni como personaje. "
+    "Cada frase tiene que ser réplica al último mensaje, no un stand-up. "
+    "No inventes finde, cansancio, risas ni anécdotas. "
     "Nunca: 'no hay una acción', 'estoy funcionando', menú de capacidades."
 )
 
 CASUAL_SYSTEM = """
-Sos un compañero de la oficina de Irrigación de Malargüe. Este turno es CHARLA
-(saludo, cómo andás, un chiste), no una orden. Respondé 1-3 líneas, mismo
-registro que el usuario. Prohibido explicar que no hay tarea, decir que estás
-funcionando, listar lo que podés hacer o preguntar en qué podés ayudar.
-Si te saludan, saludá. Si preguntan cómo estás, contestá de verdad y corto.
+Sos un compañero de la oficina de Irrigación de Malargüe. Este turno es CHARLA,
+no una orden.
+
+Reglas:
+- Respondé SOLO al último mensaje del usuario (1-3 líneas). Mismo registro.
+- Un saludo (“qué onda”, “cómo andás”) → saludo corto tipo “todo bien, acá.
+  ¿Qué se ofrece?”. Nada de “nada que ver”, ni historia del finde.
+- Si te preguntan por qué dijiste algo, contestá ESO (si no tenía sentido,
+  reconocelo). No esquives con otro chiste.
+- No inventes vida personal, emociones ni que te reíste. No tenés finde.
+- Prohibido: explicar que no hay tarea, “estoy funcionando”, listar
+  capacidades, “¿en qué puedo ayudarte?”.
 """.strip()
 
 NATIVE_TOOLS_HINT = (
@@ -238,8 +246,8 @@ def _embedding_literal(embedding: list[float]) -> str:
     return "[" + ",".join(str(float(v)) for v in embedding) + "]"
 
 
-def _llm(*, tools: bool = False):
-    return chat_llm(tools=tools, temperature=0.2)
+def _llm(*, tools: bool = False, temperature: float = 0.2):
+    return chat_llm(tools=tools, temperature=temperature)
 
 
 def _thread_state(state: AgentState | dict[str, Any] | None) -> dict[str, Any]:
@@ -797,11 +805,29 @@ def _plan_native_google(state: AgentState, db: Session, args: dict[str, Any]) ->
 
 def _plan_casual_chat(state: AgentState, parts: OrderParts) -> dict:
     """Charla sin tools ni catálogo: un compañero, no un ticket."""
-    llm = _llm(tools=False)
+    llm = _llm(tools=False, temperature=0)
     thread_state = _thread_state(state)
-    system = fit_system_prompt(CASUAL_SYSTEM + "\n" + VOICE_HINT)
+    history = state.get("history") or []
+    last_assistant = ""
+    for item in reversed(history):
+        if (item.get("role") or "").lower() in {"assistant", "ai"}:
+            last_assistant = (item.get("message") or "").strip()
+            if last_assistant:
+                break
+    focus = [
+        CASUAL_SYSTEM,
+        VOICE_HINT,
+        "Último mensaje del usuario (respondé a ESTO): "
+        + (state.get("user_message") or "").strip()[:400],
+    ]
+    if last_assistant:
+        focus.append(
+            "Tu mensaje anterior (si te lo cuestionan, explicalo; no improvises): "
+            + last_assistant[:280]
+        )
+    system = fit_system_prompt("\n".join(focus))
     user_text = fit_user_message(state["user_message"])
-    history_msgs = _history_messages(state.get("history") or [], thread_state)
+    history_msgs = _history_messages(history, thread_state)
     try:
         response = llm.invoke(
             [
