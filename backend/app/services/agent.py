@@ -22,6 +22,15 @@ from app.services.document_export import (
     artifact_info,
     save_artifact_from_base64,
 )
+from app.services.response_normalize import (
+    classify_skill_payload,
+    fallback_skill_reply,
+    humanize_skill_payload,
+    llm_skill_narration_prompt,
+    looks_raw_technical,
+    normalize_assistant_reply,
+    unwrap_result,
+)
 from app.services.sandbox import execute_skill_sync
 from app.services.skill_marketplace import (
     APPROVAL_KIND_DOWNLOAD,
@@ -743,33 +752,6 @@ def _sanitize_for_llm(value: Any, *, depth: int = 0) -> Any:
     return sanitize_json_for_llm(value, depth=depth)
 
 
-def _fallback_skill_reply(
-    *,
-    name: str,
-    user_message: str,
-    skill_data: dict[str, Any] | None,
-    sanitized_payload: Any,
-    attachments: list[dict[str, Any]],
-) -> str:
-    if attachments:
-        names = ", ".join(a["filename"] for a in attachments)
-        title = ""
-        if skill_data:
-            title = str(skill_data.get("titulo") or skill_data.get("title") or "")
-        extra = f" ({title})" if title else ""
-        return (
-            f"Listo: ejecuté '{name}'{extra} y generé el archivo: {names}. "
-            "Podés abrirlo desde el visor debajo."
-        )
-    summary = json.dumps(sanitized_payload, ensure_ascii=False, indent=2)
-    if len(summary) > 3500:
-        summary = summary[:3500] + "\n…[truncado]"
-    return (
-        f"Ejecuté '{name}' para: {user_message.strip()[:200]}\n\n"
-        f"Resultado:\n{summary}"
-    )
-
-
 def _compose_skill_reply_node(state: AgentState) -> dict:
     if state.get("reply"):
         return {}
@@ -777,13 +759,15 @@ def _compose_skill_reply_node(state: AgentState) -> dict:
     result = state.get("skill_result") or {}
     skill = state.get("pending_skill") or {}
     name = skill.get("name") or "skill"
+    user_message = state.get("user_message") or ""
 
     if result.get("status") == "rejected":
         audit = result.get("audit") or {}
         reason = audit.get("reason") or "riesgo detectado"
         return {
             "reply": (
-                f"Gemini rechazó la skill '{name}' (auditoría de seguridad): {reason}"
+                f"No pude usar esa automatización: la auditoría de seguridad la frenó "
+                f"({reason})."
             )
         }
 
@@ -792,9 +776,8 @@ def _compose_skill_reply_node(state: AgentState) -> dict:
         err = execution.get("error") or "error desconocido"
         return {
             "reply": (
-                f"No pude ejecutar la skill '{name}': {err}. "
-                "Si falta la imagen del sandbox, en el servidor corré: "
-                "docker build -t skill-sandbox-image backend/sandbox_env"
+                f"No pude completar esa consulta: {err}. "
+                "Si hace falta, reformulá el pedido o pedime otro dato."
             )
         }
 
@@ -806,83 +789,108 @@ def _compose_skill_reply_node(state: AgentState) -> dict:
     raw_payload = parsed if parsed is not None else execution
     sanitized = sanitize_json_for_llm(raw_payload)
     payload = dumps_capped(sanitized, max_tokens=token_budget()["skill_result_max"])
+    style = detect_response_style(user_message)
 
-    # Si ya hay archivo generado, narrar breve respetando el estilo pedido.
-    style = detect_response_style(state["user_message"])
-    if attachments:
-        reply = ""
-        try:
-            llm = _llm(tools=False)
+    human = humanize_skill_payload(
+        user_message=user_message,
+        skill_name=str(name),
+        skill_data=skill_data,
+        sanitized_payload=sanitized,
+        attachments=attachments,
+    )
+
+    reply = ""
+    try:
+        llm = _llm(tools=False)
+        if attachments:
             response = llm.invoke(
                 [
                     SystemMessage(
                         content=(
-                            "Sos el asistente técnico de Irrigación de Malargüe. "
-                            "Confirmá que generaste el archivo y, si aplica, resumí "
-                            "qué contiene (título/secciones) sin inventar. "
+                            "Sos un colega de la oficina de Irrigación de Malargüe. "
+                            "Confirmá en 1-3 frases que generaste el archivo, con lenguaje "
+                            "humano y directo. Sin JSON ni jerga técnica. "
                             f"Estilo: {style}"
                         )
                     ),
                     HumanMessage(
                         content=(
-                            f"Pedido: {fit_user_message(state['user_message'])}\n"
-                            f"Skill: {name}\n"
+                            f"Pedido: {fit_user_message(user_message)}\n"
                             f"Archivos: {', '.join(a['filename'] for a in attachments)}\n"
                             f"Meta: {dumps_capped(sanitize_json_for_llm(skill_data or {}), max_tokens=400)}"
                         )
                     ),
                 ]
             )
-            reply = (getattr(response, "content", None) or "").strip()
-        except Exception:
-            logger.exception("Fallo al narrar archivo de skill; uso fallback")
-        if not reply:
-            reply = _fallback_skill_reply(
-                name=name,
-                user_message=state["user_message"],
-                skill_data=skill_data,
-                sanitized_payload=sanitized,
-                attachments=attachments,
+        else:
+            response = llm.invoke(
+                [
+                    SystemMessage(content=llm_skill_narration_prompt(style)),
+                    HumanMessage(
+                        content=(
+                            f"Pedido del usuario: {fit_user_message(user_message)}\n"
+                            f"Datos obtenidos (JSON interno, NO lo copies):\n{payload}\n\n"
+                            "Respondé al usuario con el dato masticado."
+                        )
+                    ),
+                ]
             )
-        return {"reply": reply, "attachments": attachments}
-
-    reply = ""
-    try:
-        llm = _llm(tools=False)
-        user_prompt = (
-            f"El usuario pidió: {fit_user_message(state['user_message'])}\n"
-            f"Skill ejecutada: {name}\n"
-            f"Argumentos: {dumps_capped(skill.get('arguments') or {}, max_tokens=300)}\n"
-            f"Resultado del sandbox:\n{payload}"
-        )
-        response = llm.invoke(
-            [
-                SystemMessage(
-                    content=(
-                        "Sos el asistente técnico de Irrigación de Malargüe. "
-                        "Presentá el resultado de la skill de forma clara. "
-                        "No inventes valores que no estén en el JSON. "
-                        "Si ok=false o hay error, explicá el error sin inventar datos. "
-                        "Usá exactamente las unidades del resultado (cm, l/s, etc.). "
-                        f"Estilo de presentación: {style}"
-                    )
-                ),
-                HumanMessage(content=user_prompt),
-            ]
-        )
         reply = (getattr(response, "content", None) or "").strip()
     except Exception:
-        logger.exception("Fallo al narrar resultado de skill con LLM; uso fallback")
+        logger.exception("Fallo al narrar resultado de skill con LLM; uso normalización")
 
+    reply = normalize_assistant_reply(
+        reply,
+        user_message=user_message,
+        skill_name=str(name),
+        skill_data=skill_data,
+        sanitized_payload=sanitized,
+        attachments=attachments,
+    )
     if not reply:
-        reply = _fallback_skill_reply(
-            name=name,
-            user_message=state["user_message"],
+        reply = fallback_skill_reply(
+            name=str(name),
+            user_message=user_message,
             skill_data=skill_data,
             sanitized_payload=sanitized,
             attachments=attachments,
         )
+
+    # Tipos conocidos: plantilla humana determinística (dato masticado, siempre igual).
+    data = skill_data if isinstance(skill_data, dict) else unwrap_result(sanitized)
+    kind = classify_skill_payload(data) if isinstance(data, dict) else "generico"
+    if human and (kind != "generico" or looks_raw_technical(reply)):
+        reply = human
     return {"reply": reply, "attachments": attachments}
+
+
+def _finalize_user_facing_reply(
+    reply: str,
+    *,
+    user_message: str = "",
+    values: dict[str, Any] | None = None,
+) -> str:
+    """Última red de normalización antes de persistir/devolver al usuario."""
+    values = values or {}
+    skill = values.get("pending_skill") or {}
+    skill_result = values.get("skill_result") or {}
+    execution = (
+        skill_result.get("execution") if isinstance(skill_result, dict) else None
+    ) or {}
+    parsed = execution.get("parsed") if isinstance(execution, dict) else None
+    sanitized = sanitize_json_for_llm(parsed if parsed is not None else execution)
+    skill_data = None
+    if isinstance(parsed, dict):
+        inner = parsed.get("result")
+        skill_data = inner if isinstance(inner, dict) else parsed
+    return normalize_assistant_reply(
+        reply,
+        user_message=user_message or values.get("user_message") or "",
+        skill_name=str(skill.get("name") or ""),
+        skill_data=skill_data,
+        sanitized_payload=sanitized,
+        attachments=values.get("attachments") or [],
+    )
 
 
 def _persist_message(
@@ -1080,7 +1088,11 @@ def run_agent(
             approval_kind=kind,
         )
 
-    reply = values.get("reply") or ""
+    reply = _finalize_user_facing_reply(
+        values.get("reply") or "",
+        user_message=user_message,
+        values=values,
+    )
     attachments = values.get("attachments") or []
     embedding = values.get("query_embedding") or []
     _persist_message(db, sid, "user", user_message)
@@ -1150,7 +1162,11 @@ def resume_agent(db: Session, session_id: UUID | str, approved: bool) -> AgentOu
             approval_kind=kind,
         )
 
-    reply = values.get("reply") or ""
+    reply = _finalize_user_facing_reply(
+        values.get("reply") or "",
+        user_message=values.get("user_message") or "",
+        values=values,
+    )
     attachments = values.get("attachments") or []
     skill_result = values.get("skill_result") or {}
     audit = (skill_result or {}).get("audit") if isinstance(skill_result, dict) else None
