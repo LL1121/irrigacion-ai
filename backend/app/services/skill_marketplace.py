@@ -554,6 +554,52 @@ def is_result_challenge_or_correction(text: str) -> bool:
     return any(re.search(p, lowered) for p in patterns)
 
 
+_DOMAIN_CHAT_RE = re.compile(
+    r"\b(?:altura|caudal|padr[oó]n|expediente|norma|l[aá]mina|"
+    r"prorrateo|telemetr|punto\s+\d|m3|l/s|hect[aá]rea|turno\s+de\s+riego)\b",
+    re.I,
+)
+
+
+def is_casual_chat(
+    text: str,
+    *,
+    history: list[dict[str, Any]] | None = None,
+    context_text: str | None = None,
+    thread_state: dict[str, Any] | None = None,
+) -> bool:
+    """Charla (saludo, cómo andás). No es orden, ni dato de riego, ni follow-up."""
+    from app.services.context_memory import looks_like_save_context_intent
+    from app.services.google_assistant import detect_google_intent
+    from app.services.order_parse import looks_like_do_task
+
+    blob = (text or "").strip()
+    if not blob:
+        return False
+    if looks_like_do_task(blob) or looks_like_save_context_intent(blob):
+        return False
+    if detect_google_intent(blob) is not None:
+        return False
+    if should_try_skill_marketplace(blob):
+        return False
+    if looks_like_web_or_external_request(blob) or contains_url(blob):
+        return False
+    if is_asking_for_needed_data(blob) or is_result_challenge_or_correction(blob):
+        return False
+    if is_download_confirmation_only(blob):
+        return False
+    ctx = context_text or conversation_context_text(blob, history)
+    if is_thread_followup(blob, ctx, thread_state) and extract_open_task(
+        blob, history, ctx, thread_state=thread_state
+    ):
+        return False
+    if _DOMAIN_CHAT_RE.search(blob):
+        return False
+    if len(blob) > 160 and "?" in blob:
+        return False
+    return True
+
+
 def is_thread_followup(
     text: str,
     context_text: str | None = None,
@@ -702,11 +748,10 @@ def ask_inputs_for_open_task(
     if not task:
         task = "lo que veníamos haciendo en este chat"
     return (
-        f"Seguimos con **{task}** — no cambio de tema.\n\n"
-        "Para ejecutar *esa* tarea necesito los datos concretos que apliquen "
-        "(destino, archivo, rango, URL, parámetros, lo que sea de ese pedido).\n"
-        "Pasame lo que tengas. Si no sabés qué mandar, decime qué tenés a mano "
-        "y te digo qué falta. No arrancamos otra cosa."
+        f"Seguimos con lo de **{task}**, no arranco otra cosa.\n\n"
+        "Tirame los datos concretos que apliquen (destino, archivo, rango, "
+        "URL, lo que sea) y lo hago. Si no sabés cuáles, mandá lo que tengas "
+        "y te digo qué falta."
     )
 
 
@@ -1921,8 +1966,13 @@ def detect_response_style(user_message: str) -> str:
     if any(k in lowered for k in ("simple", "para un peón", "como si fuera", "en criollo")):
         hints.append("Lenguaje simple y directo, sin jerga innecesaria.")
     if not hints:
+        if is_casual_chat(user_message):
+            return (
+                "Es charla, no un informe. 1-3 líneas de colega. "
+                "Nada de menú de capacidades ni 'no hay una acción'."
+            )
         return (
-            "Adaptá el formato al pedido: preferí claridad. "
+            "Hablá como compañero de oficina (vos, corto). "
             "Si hay varios números, usá tabla o viñetas."
         )
     return " ".join(hints)

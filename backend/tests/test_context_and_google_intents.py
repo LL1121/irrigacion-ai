@@ -20,6 +20,18 @@ def test_save_context_intent_variants():
     assert not looks_like_save_context_intent("qué datos necesitás?")
 
 
+def test_casual_chat_no_es_trabajo():
+    from app.services.skill_marketplace import is_casual_chat
+
+    assert is_casual_chat("Que onda crack! Como estas?")
+    assert is_casual_chat("cómo andás")
+    assert is_casual_chat("todo bien bld")
+    assert not is_casual_chat("podés hacer un análisis de red?")
+    assert not is_casual_chat("qué altura tiene el punto 10009")
+    assert not is_casual_chat("recordá que mañana hay corte")
+    assert not is_casual_chat("programame un mail a ana@x.com")
+
+
 def test_parse_context_scope():
     assert parse_context_scope("personal") == "personal"
     assert parse_context_scope("irrigación") == "irrigacion"
