@@ -9,12 +9,19 @@ from sqlalchemy.orm import Session
 
 from app.services.ingest import generate_embeddings
 
-# Respuestas de un turno (alcance, aprobación): no son hechos reutilizables.
-_SESSION_BOUND_REPLY_RE = re.compile(
+# No son hechos de riego: prompts de un turno o status de “bot de soporte”.
+_NON_KNOWLEDGE_REPLY_RE = re.compile(
     r"contexto personal.{0,120}contexto de irrigaci|"
     r"contexto de irrigaci.{0,120}contexto personal|"
     r"\bautoriz[aá]s\b|"
-    r"qu[eé] quer[eé]s que anote",
+    r"qu[eé] quer[eé]s que anote|"
+    r"no hay ninguna acci[oó]n|"
+    r"no hay una acci[oó]n|"
+    r"petici[oó]n espec[ií]fica en tu mensaje|"
+    r"estoy funcionando|"
+    r"listo para ayudarte|"
+    r"en qu[eé] puedo ayudarte|"
+    r"consulta relacionada con la oficina",
     re.I | re.S,
 )
 
@@ -48,11 +55,11 @@ def should_use_semantic_cache(user_message: str) -> bool:
 
 
 def is_reusable_knowledge_reply(reply: str) -> bool:
-    """Un prompt de decisión del hilo no se reutiliza en otro mensaje."""
+    """HITL o status de bot no se reutilizan como si fueran un dato."""
     blob = (reply or "").strip()
     if not blob:
         return False
-    return not bool(_SESSION_BOUND_REPLY_RE.search(blob))
+    return not bool(_NON_KNOWLEDGE_REPLY_RE.search(blob))
 
 
 def cacheable_exchange(user_message: str, reply: str | None = None) -> bool:

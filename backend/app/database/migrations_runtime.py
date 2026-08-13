@@ -215,7 +215,12 @@ def apply_schema_migrations(conn: Connection) -> None:
                 DELETE FROM semantic_cache
                 WHERE ai_response ~* 'contexto personal'
                    OR ai_response ~* 'autoriz[aá]s'
-                   OR ai_response ~* 'qu[eé] quer[eé]s que anote';
+                   OR ai_response ~* 'qu[eé] quer[eé]s que anote'
+                   OR ai_response ~* 'no hay ninguna acci'
+                   OR ai_response ~* 'estoy funcionando'
+                   OR ai_response ~* 'listo para ayudarte'
+                   OR ai_response ~* 'en qu[eé] puedo ayudarte'
+                   OR ai_response ~* 'consulta relacionada con la oficina';
             EXCEPTION
                 WHEN undefined_table THEN NULL;
             END $$

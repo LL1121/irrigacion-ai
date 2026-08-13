@@ -52,6 +52,11 @@ def test_charla_y_prompts_hitl_no_van_al_cache():
     assert not is_reusable_knowledge_reply(
         "Se encontró la skill 'red'. ¿Autorizás a Gemini a auditarla?"
     )
+    assert not is_reusable_knowledge_reply(
+        "No hay ninguna acción o petición específica en tu mensaje, "
+        "así que solo te devuelvo el saludo. Estoy funcionando correctamente."
+    )
+    assert not should_use_semantic_cache("Hola crack! Como estas?")
     assert is_reusable_knowledge_reply("El caudal del canal 12 es 80 l/s.")
 
 

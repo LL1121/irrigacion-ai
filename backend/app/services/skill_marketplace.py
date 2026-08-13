@@ -1968,11 +1968,11 @@ def detect_response_style(user_message: str) -> str:
     if not hints:
         if is_casual_chat(user_message):
             return (
-                "Es charla, no un informe. 1-3 líneas de colega. "
-                "Nada de menú de capacidades ni 'no hay una acción'."
+                "Es charla. Contestá natural, 1-3 líneas, como un asistente "
+                "de chat. Sin menú ni 'estoy funcionando'."
             )
         return (
-            "Hablá como compañero de oficina (vos, corto). "
+            "Hablá como un asistente de chat (natural, claro). "
             "Si hay varios números, usá tabla o viñetas."
         )
     return " ".join(hints)
