@@ -218,9 +218,25 @@ _PRIVACY_HTML = f"""<!DOCTYPE html>
 """
 
 
+_PRIVACY_HEADERS = {
+    "Cache-Control": "no-store, max-age=0",
+    "X-Robots-Tag": "index,follow",
+}
+
+
+def _privacy_response() -> HTMLResponse:
+    return HTMLResponse(content=_PRIVACY_HTML, status_code=200, headers=_PRIVACY_HEADERS)
+
+
 @router.get("/politicas-privacidad", response_class=HTMLResponse)
 def privacy_policy_es() -> HTMLResponse:
-    return HTMLResponse(content=_PRIVACY_HTML, status_code=200)
+    return _privacy_response()
+
+
+@router.get("/api/legal/privacidad", response_class=HTMLResponse)
+def privacy_policy_api_alias() -> HTMLResponse:
+    """Alias que el service worker de la PWA no intercepta (denylist /api/)."""
+    return _privacy_response()
 
 
 @router.get("/privacy-policy")

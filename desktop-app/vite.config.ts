@@ -47,11 +47,21 @@ export default defineConfig(async () => ({
         ],
       },
       workbox: {
-        // La API vive en otro origen/puerto (FastAPI); nunca cachear /api/*.
-        navigateFallbackDenylist: [/^\/api\//],
+        // No interceptar API, health, updates ni páginas legales (Google OAuth).
+        navigateFallbackDenylist: [
+          /^\/api\//,
+          /^\/health(?:\/|$)/,
+          /^\/updates\//,
+          /^\/politicas-privacidad(?:\/|$)/,
+          /^\/privacy(?:-policy)?(?:\/|$)/,
+        ],
         runtimeCaching: [
           {
             urlPattern: /\/api\/.*/,
+            handler: "NetworkOnly",
+          },
+          {
+            urlPattern: /\/politicas-privacidad(?:\/|$)/,
             handler: "NetworkOnly",
           },
         ],
