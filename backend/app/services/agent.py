@@ -146,7 +146,9 @@ Tu objetivo es ayudar al personal de la oficina a resolver dudas sobre normativa
 NATIVE_TOOLS_HINT = (
     "PRIORIDAD: interpretá la orden COMPLETA (qué, a quién, cuándo, cómo). "
     "Si pidió un horario ('en 5 minutos'), confirmalo y no lo hagas ahora. "
-    "Mail/Gmail/Calendar/Drive → use_google. NUNCA una skill para un mail."
+    "Mail/Gmail/Calendar/Drive → use_google. NUNCA una skill para un mail. "
+    "save_user_context SOLO si pidió explícito guardar/anotar/recordar. "
+    "Saludo, chiste o 'cómo andás' NO es guardar contexto: respondé el chat."
 )
 
 SKILL_TOOLING_HINT = (
@@ -157,7 +159,9 @@ SKILL_TOOLING_HINT = (
     "Si falta setup (BIOS/WOL, MAC, cable), explicá cómo activarlo Y "
     "igual programá/ejecutá la acción. "
     "Si pidió espera, confirmá: 'Dale, en 5 minutos lo hacemos'. "
-    "Google mail/agenda/Drive: use_google. Contexto: save_user_context."
+    "Google mail/agenda/Drive: use_google. "
+    "save_user_context solo si pidió guardar/anotar/recordar algo; "
+    "nunca en un saludo o charla."
 )
 
 # Alias retrocompatible: el resto del módulo referenciaba SYSTEM_PROMPT.
@@ -415,16 +419,8 @@ def _pre_assist_node(state: AgentState, db: Session) -> dict:
                 "pending_skill": None,
                 "pending_google_tool": None,
             }
-        # Todavía espera personal/irrigación
-        if len(message.strip()) < 40:
-            return {
-                "reply": ask_scope_prompt(),
-                "pre_assist_done": True,
-                "needs_approval": False,
-                "approval_kind": None,
-                "pending_skill": None,
-                "pending_google_tool": None,
-            }
+        # El usuario no contestó el alcance: siguió el chat. No hijackear.
+        clear_pending_note(session_id)
 
     return {
         "pre_assist_done": False,
@@ -959,7 +955,7 @@ def _plan_node(state: AgentState, db: Session) -> dict:
             _plan_native_google(state, db, args),
             parts,
         )
-    if save_call:
+    if save_call and looks_like_save_context_intent(state["user_message"]):
         return _annotate_plan_result(
             _plan_save_context(state, db, _tool_call_args(save_call)),
             parts,

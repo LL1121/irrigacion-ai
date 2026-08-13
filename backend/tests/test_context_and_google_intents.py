@@ -14,6 +14,10 @@ def test_save_context_intent_variants():
     assert looks_like_save_context_intent("anotá esto, es importante")
     assert looks_like_save_context_intent("recordá que mañana hay corte")
     assert not looks_like_save_context_intent("qué altura tiene el punto 10009")
+    assert not looks_like_save_context_intent("Que onda crack! Como andas bld")
+    assert not looks_like_save_context_intent("cómo andás")
+    assert not looks_like_save_context_intent("todo bien?")
+    assert not looks_like_save_context_intent("qué datos necesitás?")
 
 
 def test_parse_context_scope():

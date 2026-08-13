@@ -463,9 +463,13 @@ def use_google(
 
 @tool
 def save_user_context(note: str, scope: str = "") -> str:
-    """Guardá una nota persistente para recordarla en chats futuros.
+    """Guardá una nota persistente SOLO si el usuario lo pidió explícito.
 
-    Usala cuando el usuario pide anotar, guardar o recordar algo como contexto.
+    Ejemplos válidos: 'guardá esto como contexto', 'anotá que…',
+    'recordá que mañana hay corte'.
+    NUNCA la uses en saludos, 'cómo andás', chistes, preguntas, ni
+    follow-ups de otra tarea. Si no hay verbo de guardar/anotar/recordar,
+    no llames esta tool: respondé el chat.
     scope: 'personal', 'irrigacion', o '' si todavía no lo dijo.
     """
     return json.dumps({"note": note, "scope": scope}, ensure_ascii=False)

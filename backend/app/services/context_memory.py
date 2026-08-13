@@ -10,10 +10,15 @@ from sqlalchemy.orm import Session
 from app.services.ingest import ingest_text_note
 
 _SAVE_INTENT_RE = re.compile(
-    r"(?:guard(?:á|a|ar)|anot(?:á|a|ar)|salv(?:á|a|ar)|record(?:á|a|ar)|memor(?:izá|iza|izar))"
-    r".{0,40}(?:como\s+)?(?:contexto|importante|dato\s+clave|nota)"
+    r"(?:guard(?:á|a|ar)|anot(?:á|a|ar)|salv(?:á|a|ar))\s+"
+    r"(?:esto|eso|lo|como\s+contexto|en\s+(?:el\s+)?contexto)"
+    r"|(?:guard(?:á|a|ar)|anot(?:á|a|ar)|salv(?:á|a|ar)|record(?:á|a|ar)|"
+    r"memor(?:izá|iza|izar)).{0,40}(?:como\s+)?(?:contexto|importante|"
+    r"dato\s+clave|nota)"
     r"|(?:esto\s+es\s+importante|anotá\s+esto|guarda\s+esto|guardá\s+esto"
-    r"|quiero\s+que\s+(?:lo\s+)?recuerdes?|para\s+que\s+lo\s+recuerdes?)",
+    r"|record(?:á|a|ar)\s+que\b"
+    r"|quiero\s+que\s+(?:lo\s+)?recuerdes?"
+    r"|para\s+que\s+lo\s+recuerdes?)",
     re.I,
 )
 
@@ -34,7 +39,11 @@ _SCOPE_ONLY_RE = re.compile(
 
 
 def looks_like_save_context_intent(text: str) -> bool:
-    return bool(_SAVE_INTENT_RE.search(text or ""))
+    """Solo si el usuario PIDIÓ guardar/recordar. Un saludo no es contexto."""
+    blob = (text or "").strip()
+    if not blob:
+        return False
+    return bool(_SAVE_INTENT_RE.search(blob))
 
 
 def parse_context_scope(text: str) -> str | None:
