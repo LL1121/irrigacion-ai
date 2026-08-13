@@ -10,8 +10,20 @@ from sqlalchemy.engine import Connection
 
 def apply_schema_migrations(conn: Connection) -> None:
     """ALTER/CREATE idempotentes para installs existentes."""
-    # gen_random_uuid (PG 13+ suele traerlo en pgcrypto / core)
-    conn.execute(text('CREATE EXTENSION IF NOT EXISTS "pgcrypto"'))
+    # gen_random_uuid (PG 13+ core / pgcrypto). IF NOT EXISTS igual puede
+    # chocar entre workers uvicorn concurrentes → tolerar unique_violation.
+    conn.execute(
+        text(
+            """
+            DO $$ BEGIN
+                CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+            EXCEPTION
+                WHEN unique_violation THEN NULL;
+                WHEN duplicate_object THEN NULL;
+            END $$;
+            """
+        )
+    )
 
     conn.execute(
         text(

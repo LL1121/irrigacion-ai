@@ -60,6 +60,14 @@ services:
       # Generalo antes del deploy con: cd desktop-app && npm run build
       FRONTEND_DIST_DIR: /app/static/dist
       UPDATES_DIR: /app/static/updates
+      # Google OAuth (login + Calendar / Gmail / Drive)
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-https://ia.irrigacionmalargue.net/api/auth/google/callback}
+      TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:-}
+      APP_JWT_SECRET: ${APP_JWT_SECRET:-}
+      APP_JWT_TTL_HOURS: ${APP_JWT_TTL_HOURS:-168}
+      FRONTEND_PUBLIC_URL: ${FRONTEND_PUBLIC_URL:-https://ia.irrigacionmalargue.net}
     ports:
       - "${API_HOST_BIND:-0.0.0.0}:${API_PORT:-8000}:8000"
     volumes:
