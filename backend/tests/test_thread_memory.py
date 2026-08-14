@@ -140,3 +140,41 @@ def test_sin_resumen_sigue_heuristico():
     assert "postgres" in extract_open_task("", context_text=ctx).lower()
     assert not open_task_from_state({})
     assert not open_task_from_state(None)
+
+
+def test_open_task_ninguna_es_estado_limpio():
+    from app.services.llm_roles import normalize_thread_summary, sanitize_open_task
+    from app.services.skill_marketplace import (
+        ask_inputs_for_open_task,
+        should_try_skill_marketplace,
+    )
+
+    assert sanitize_open_task("Ninguna") == ""
+    assert sanitize_open_task("None") == ""
+    assert sanitize_open_task("null") == ""
+    assert sanitize_open_task("  ") == ""
+    assert sanitize_open_task("backup postgres") == "backup postgres"
+
+    state = {
+        "open_task": "Ninguna",
+        "summary_json": {"open_task": "Ninguna", "status": "waiting_inputs"},
+        "summary_text": "Tarea abierta: Ninguna",
+    }
+    assert open_task_from_state(state) == ""
+    assert extract_open_task("cómo andás?", thread_state=state) == ""
+    reply = ask_inputs_for_open_task(
+        "cómo andás?", thread_state=state
+    ).lower()
+    assert "ninguna" not in reply
+    assert "seguimos con lo de" not in reply
+
+    cleaned = normalize_thread_summary(
+        {"open_task": "Ninguna", "status": "waiting_inputs"},
+        previous={"open_task": "None"},
+    )
+    assert cleaned["open_task"] == ""
+
+    assert should_try_skill_marketplace(
+        "podrías buscar una skill para hacer un test de velocidad?"
+    )
+    assert should_try_skill_marketplace("buscar una skill para medir la red")

@@ -220,7 +220,37 @@ def apply_schema_migrations(conn: Connection) -> None:
                    OR ai_response ~* 'estoy funcionando'
                    OR ai_response ~* 'listo para ayudarte'
                    OR ai_response ~* 'en qu[eé] puedo ayudarte'
-                   OR ai_response ~* 'consulta relacionada con la oficina';
+                   OR ai_response ~* 'consulta relacionada con la oficina'
+                   OR ai_response ~* 'seguimos con lo de \\*\\*ninguna';
+            EXCEPTION
+                WHEN undefined_table THEN NULL;
+            END $$
+            """
+        )
+    )
+
+    # open_task placeholder ("Ninguna"/"None") = estado limpio.
+    conn.execute(
+        text(
+            """
+            DO $$ BEGIN
+                UPDATE chat_thread_state
+                SET
+                    summary_json = jsonb_set(
+                        COALESCE(summary_json, '{}'::jsonb),
+                        '{open_task}',
+                        '""'::jsonb,
+                        true
+                    ),
+                    summary_text = regexp_replace(
+                        COALESCE(summary_text, ''),
+                        'Tarea abierta:\\s*(Ninguna|None|null|N/A)\\s*',
+                        '',
+                        'gi'
+                    ),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE lower(trim(both from COALESCE(summary_json->>'open_task', '')))
+                      IN ('ninguna', 'ninguno', 'none', 'null', 'n/a', 'na', '-', 'sin tarea');
             EXCEPTION
                 WHEN undefined_table THEN NULL;
             END $$

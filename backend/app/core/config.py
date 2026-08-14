@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     # Groq (chat principal — API compatible con OpenAI SDK)
     groq_api_key: str = ""
     groq_base_url: str = "https://api.groq.com/openai/v1"
-    chat_model: str = "llama-3.3-70b-versatile"
+    chat_model: str = "openai/gpt-oss-120b"
 
     # Gemini (OCR, embeddings y centinela de skills)
     gemini_api_key: str = ""
@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     updates_dir: str = ""
 
     # Presupuestos de tokens (aproximados) para no reventar límites Groq TPM.
-    # llama-3.3-70b-versatile free/on_demand suele tener ~12k TPM: dejamos margen.
+    # openai/gpt-oss-120b: dejamos margen por rate limits on_demand.
     llm_request_max_tokens: int = 9000
     llm_system_max_tokens: int = 1800
     llm_rag_max_tokens: int = 3500

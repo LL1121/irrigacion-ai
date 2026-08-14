@@ -29,6 +29,36 @@ _STATUS_VALUES = frozenset(
     {"waiting_inputs", "in_progress", "blocked", "done"}
 )
 
+_BLANK_OPEN_TASK = frozenset(
+    {
+        "",
+        "ninguna",
+        "ninguno",
+        "none",
+        "null",
+        "n/a",
+        "na",
+        "-",
+        "—",
+        "sin tarea",
+        "sin tareas",
+        "no hay",
+        "no aplica",
+        "n/d",
+        "nd",
+    }
+)
+
+
+def sanitize_open_task(value: Any) -> str:
+    """None / '' / 'Ninguna' / 'None' → sin tarea abierta."""
+    task = re.sub(r"\s+", " ", str(value or "").strip())
+    if not task:
+        return ""
+    if task.lower().strip(" .") in _BLANK_OPEN_TASK:
+        return ""
+    return task[:400]
+
 SUMMARIZE_SYSTEM = (
     "Sos un extractor de estado de conversación. "
     "No charlés con el usuario. "
@@ -40,7 +70,9 @@ SUMMARIZE_SYSTEM = (
     "Reglas:\n"
     "- open_task: la última orden REAL "
     "(qué hay que hacer), no un 'qué datos?' "
-    "ni un chiste.\n"
+    "ni un chiste. Si no hay orden activa, usá "
+    '"" (string vacío). NUNCA pongas '
+    '"Ninguna", "None", "null" ni placeholders.\n'
     "- status: waiting_inputs si faltan datos; "
     "in_progress si se está haciendo; "
     "blocked si falló; done si ya se cumplió "
@@ -99,9 +131,10 @@ def normalize_thread_summary(
     """Contrato estable del resumidor (Gemini u otro)."""
     data = raw if isinstance(raw, dict) else {}
     prev = previous if isinstance(previous, dict) else {}
-    open_task = str(data.get("open_task") or "").strip() or str(
-        prev.get("open_task") or ""
-    ).strip()
+    open_task = sanitize_open_task(
+        str(data.get("open_task") or "").strip()
+        or str(prev.get("open_task") or "").strip()
+    )
     status = str(data.get("status") or "").strip().lower()
     if status not in _STATUS_VALUES:
         status = str(prev.get("status") or "in_progress").strip().lower()

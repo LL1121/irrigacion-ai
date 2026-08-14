@@ -150,7 +150,7 @@ Eso corre `npm run build` y reinicia el API (la PWA va montada en volumen; no re
 
 | Uso | Proveedor | Modelo default |
 |-----|-----------|----------------|
-| Chat / agente RAG | Groq | `llama-3.3-70b-versatile` |
+| Chat / agente RAG | Groq | `openai/gpt-oss-120b` |
 | OCR (PDF escaneado / imágenes) | Gemini | `gemini-flash-latest` |
 | Embeddings RAG + caché | Gemini | `gemini-embedding-001` (768 dims) |
 | Centinela de skills | Gemini | `gemini-flash-latest` |

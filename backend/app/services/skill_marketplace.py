@@ -856,7 +856,12 @@ def extract_open_task(
             re.I,
         )
         if named:
-            return next(g.strip() for g in named.groups() if g)
+            captured = next((g.strip() for g in named.groups() if g), "")
+            from app.services.llm_roles import sanitize_open_task
+
+            captured = sanitize_open_task(captured)
+            if captured:
+                return captured[:300]
     user_msgs: list[str] = []
     for item in history:
         if (item.get("role") or "").lower() == "user":
@@ -887,12 +892,17 @@ def ask_inputs_for_open_task(
     thread_state: dict[str, Any] | None = None,
 ) -> str:
     """Seguí la tarea ABIERTA del hilo, sea cual sea. No cambies de tema."""
-    task = (skill_name or "").strip() or extract_open_task(
+    from app.services.llm_roles import sanitize_open_task
+
+    task = sanitize_open_task(skill_name) or extract_open_task(
         "", history, context, thread_state=thread_state
     )
-    task = re.sub(r"\s+", " ", task).strip()[:220]
+    task = sanitize_open_task(re.sub(r"\s+", " ", task).strip()[:220])
     if not task:
-        task = "lo que veníamos haciendo en este chat"
+        return (
+            "Decime qué necesitás hacer y te digo qué datos hacen falta. "
+            "No arranco un trámite viejo si no hay uno abierto."
+        )
     return (
         f"Seguimos con lo de **{task}**, no arranco otra cosa.\n\n"
         "Tirame los datos concretos que apliquen (destino, archivo, rango, "
@@ -995,6 +1005,15 @@ def should_try_skill_marketplace(text: str, assistant_reply: str | None = None) 
     if not lowered.strip():
         return False
 
+    if re.search(
+        r"\b(?:skills?|habilidades?|herramientas?|scripts?)\b.{0,40}"
+        r"(?:para|de|que|buscar|busc|encontr|instal|descarg|gener)"
+        r"|(?:buscar|busc(?:á|a|ar)|encontr(?:á|a|ar)|instal(?:á|a|ar)|"
+        r"descarg(?:á|a|ar)|gener(?:á|a|ar)).{0,40}"
+        r"\b(?:skills?|habilidades?|herramientas?|scripts?)\b",
+        lowered,
+    ):
+        return True
     if looks_like_web_or_external_request(text):
         return True
     if any(kw in lowered for keywords in _SKILL_KEYWORDS.values() for kw in keywords):
@@ -2210,11 +2229,13 @@ def _parse_arguments(raw: Any) -> dict[str, Any]:
 
 @tool
 def search_skill_marketplace(task: str, arguments_json: str = "{}") -> str:
-    """Busca en el catálogo institucional una skill (herramienta Python) para la tarea.
+    """Busca en el marketplace local/catálogo de skills una herramienta o script Python
+    ejecutable para realizar tareas técnicas solicitadas por el usuario.
 
     Usala cuando el usuario pide un cálculo, conversión, prorrateo, lámina o tiempo de riego,
-    generación de documentos Word (con formato), o cualquier automatización que no puedas
-    resolver solo con el contexto RAG. No inventes números: primero buscá la skill.
+    generación de documentos Word (con formato), test de red/velocidad, o cualquier
+    automatización / "buscar una skill". NUNCA interpretes "skill" como Alexa, Google
+    Assistant, Siri o Cortana. No inventes números: primero buscá la skill.
 
     Args:
         task: descripción breve de la tarea (ej. 'calcular caudal con área y velocidad').

@@ -10,7 +10,11 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.services.llm_roles import format_summary_text, summarize_thread
+from app.services.llm_roles import (
+    format_summary_text,
+    sanitize_open_task,
+    summarize_thread,
+)
 from app.services.token_guard import truncate_to_tokens
 
 logger = logging.getLogger(__name__)
@@ -35,6 +39,18 @@ def empty_thread_state() -> dict[str, Any]:
     }
 
 
+def open_task_from_state(thread_state: dict[str, Any] | None) -> str:
+    if not thread_state:
+        return ""
+    task = sanitize_open_task(thread_state.get("open_task"))
+    if task:
+        return task
+    raw = thread_state.get("summary_json")
+    if isinstance(raw, dict):
+        return sanitize_open_task(raw.get("open_task"))
+    return ""
+
+
 def _row_to_state(row: dict[str, Any] | None) -> dict[str, Any]:
     state = empty_thread_state()
     if not row:
@@ -49,13 +65,16 @@ def _row_to_state(row: dict[str, Any] | None) -> dict[str, Any]:
         raw = {}
     state.update(
         {
-            "open_task": str(raw.get("open_task") or ""),
+            "open_task": sanitize_open_task(raw.get("open_task")),
             "status": str(raw.get("status") or ""),
             "missing": raw.get("missing") if isinstance(raw.get("missing"), list) else [],
             "known": raw.get("known") if isinstance(raw.get("known"), dict) else {},
             "facts": raw.get("facts") if isinstance(raw.get("facts"), list) else [],
             "not_this": str(raw.get("not_this") or ""),
-            "summary_json": raw,
+            "summary_json": {
+                **raw,
+                "open_task": sanitize_open_task(raw.get("open_task")),
+            },
             "summary_text": str(row.get("summary_text") or "")
             or format_summary_text(raw),
             "last_message_id": row.get("last_message_id"),
@@ -243,20 +262,8 @@ def recent_history_for_llm(
         return items
     has_summary = bool(
         (thread_state or {}).get("summary_text")
-        or (thread_state or {}).get("open_task")
+        or sanitize_open_task((thread_state or {}).get("open_task"))
     )
     if has_summary and len(items) > RECENT_TURNS_WITH_SUMMARY:
         return items[-RECENT_TURNS_WITH_SUMMARY:]
     return items
-
-
-def open_task_from_state(thread_state: dict[str, Any] | None) -> str:
-    if not thread_state:
-        return ""
-    task = str(thread_state.get("open_task") or "").strip()
-    if task:
-        return task
-    raw = thread_state.get("summary_json")
-    if isinstance(raw, dict):
-        return str(raw.get("open_task") or "").strip()
-    return ""
