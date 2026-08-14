@@ -102,6 +102,36 @@ def test_pedido_nuevo_pisa_resumen_viejo():
     assert "backup" not in task.lower()
 
 
+def test_context_switch_abandona_tarea_abierta():
+    """Un comando nuevo autónomo no sigue pidiendo datos de la tarea vieja."""
+    from app.services.skill_marketplace import (
+        is_context_switch,
+        is_thread_followup,
+    )
+
+    state = {
+        "open_task": "Atender consulta",
+        "summary_json": {"open_task": "Atender consulta", "status": "waiting_inputs"},
+        "summary_text": "Tarea abierta: Atender consulta",
+    }
+    msg = "hacé una prueba de velocidad de internet"
+    assert is_context_switch(msg, thread_state=state)
+    assert not is_thread_followup(msg, thread_state=state)
+    task = extract_open_task(msg, thread_state=state)
+    assert "velocidad" in task.lower() or "internet" in task.lower()
+    assert "atender consulta" not in task.lower()
+    decision = resolve_skill_decision(msg, thread_state=state)
+    assert decision["action"] in {"download", "clarify"}
+    reply = (decision.get("reply") or "").lower()
+    assert "atender consulta" not in reply
+    assert "destino, archivo" not in reply
+    if decision["action"] == "clarify":
+        assert "velocidad" in reply or "internet" in reply or "skill" in reply
+
+    assert not is_context_switch("qué datos necesitás?", thread_state=state)
+    assert is_thread_followup("qué datos necesitás?", thread_state=state)
+
+
 def test_sin_resumen_sigue_heuristico():
     ctx = (
         "podés hacerme un backup de la base postgres de irrigación?\n\n"

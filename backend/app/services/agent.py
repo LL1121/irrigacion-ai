@@ -79,6 +79,7 @@ from app.services.skill_marketplace import (
     has_concrete_task_inputs,
     is_action_request,
     is_asking_for_needed_data,
+    is_context_switch,
     is_result_challenge_or_correction,
     looks_like_web_or_external_request,
     prepare_skill_arguments,
@@ -550,6 +551,42 @@ def _conversation_text(state: AgentState) -> str:
     )
 
 
+def _apply_context_switch(
+    thread_state: dict[str, Any],
+    user_message: str,
+    *,
+    history: list[dict[str, Any]] | None = None,
+    context_text: str | None = None,
+) -> dict[str, Any]:
+    """Si el mensaje es una solicitud nueva, reemplaza open_task y no arrastra la vieja."""
+    if not is_context_switch(
+        user_message,
+        context_text=context_text,
+        history=history,
+        thread_state=thread_state,
+    ):
+        return thread_state
+    new_task = (
+        extract_open_task(user_message, history, user_message, thread_state=None)
+        or (user_message or "").strip()[:300]
+    )
+    switched = dict(thread_state or {})
+    switched["open_task"] = new_task
+    summary = (
+        dict(switched["summary_json"])
+        if isinstance(switched.get("summary_json"), dict)
+        else {}
+    )
+    summary["open_task"] = new_task
+    summary["status"] = "in_progress"
+    switched["summary_json"] = summary
+    switched["summary_text"] = (
+        "CAMBIO DE TAREA: el usuario dejó lo anterior. "
+        f"Tarea actual: {new_task}"
+    )
+    return switched
+
+
 def _force_skill_or_download(
     user_message: str,
     *,
@@ -857,7 +894,19 @@ def _plan_casual_chat(state: AgentState, parts: OrderParts) -> dict:
 
 def _plan_node(state: AgentState, db: Session) -> dict:
     ctx = _conversation_text(state)
-    thread_state = _thread_state(state)
+    history = state.get("history") or []
+    thread_state = _apply_context_switch(
+        _thread_state(state),
+        state["user_message"],
+        history=history,
+        context_text=ctx,
+    )
+    switched = is_context_switch(
+        state["user_message"],
+        context_text=ctx,
+        history=history,
+        thread_state=_thread_state(state),
+    )
     parts = extract_order_parts(state["user_message"], ctx)
     if is_casual_chat(
         state["user_message"],
@@ -867,8 +916,10 @@ def _plan_node(state: AgentState, db: Session) -> dict:
     ):
         return _plan_casual_chat(state, parts)
     llm = _llm(tools=True)
-    if is_asking_for_needed_data(state["user_message"]) and (
-        ctx.strip() or state.get("history") or thread_state.get("open_task")
+    if (
+        not switched
+        and is_asking_for_needed_data(state["user_message"])
+        and (ctx.strip() or history or thread_state.get("open_task"))
     ):
         return _annotate_plan_result(
             {
@@ -877,7 +928,7 @@ def _plan_node(state: AgentState, db: Session) -> dict:
                 "approval_kind": None,
                 "reply": ask_inputs_for_open_task(
                     ctx,
-                    history=state.get("history") or [],
+                    history=history,
                     thread_state=thread_state,
                 ),
             },
@@ -887,11 +938,19 @@ def _plan_node(state: AgentState, db: Session) -> dict:
     native = fit_system_prompt(VOICE_HINT + "\n" + NATIVE_TOOLS_HINT)
     open_task = extract_open_task(
         state["user_message"],
-        state.get("history") or [],
+        history,
         ctx,
         thread_state=thread_state,
     )
-    if open_task:
+    if switched and open_task:
+        tooling = fit_system_prompt(
+            SKILL_TOOLING_HINT
+            + "\nCAMBIO DE TAREA (obligatorio): "
+            + open_task[:400]
+            + "\nAbandoná lo anterior. No pidas datos de la tarea vieja. "
+            "Si no hay skill local, search_skill_marketplace / descarga."
+        )
+    elif open_task:
         tooling = fit_system_prompt(
             SKILL_TOOLING_HINT
             + "\nTAREA ABIERTA (obligatorio continuar, no cambies de tema): "
@@ -1041,8 +1100,11 @@ def _plan_node(state: AgentState, db: Session) -> dict:
             continue
         raw_args = _tool_call_args(call)
         task, arguments = _parse_tool_arguments(raw_args or {}, state["user_message"])
-        # Preferir la tarea del hilo completo si el tool mandó un task pobre.
-        if ctx and (not task or len(task) < 40 or task == state["user_message"]):
+        # Pedido nuevo: no mezclar con el hilo viejo. Si no, enriquecer task pobre.
+        if switched:
+            task = state["user_message"]
+            arguments = {**arguments, "query": state["user_message"]}
+        elif ctx and (not task or len(task) < 40 or task == state["user_message"]):
             task = ctx
             arguments = {**arguments, "query": ctx}
         resolved = _resolve_skill_plan(

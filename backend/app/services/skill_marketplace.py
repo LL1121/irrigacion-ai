@@ -589,7 +589,9 @@ def is_casual_chat(
     if is_download_confirmation_only(blob):
         return False
     ctx = context_text or conversation_context_text(blob, history)
-    if is_thread_followup(blob, ctx, thread_state) and extract_open_task(
+    if is_thread_followup(
+        blob, ctx, thread_state, history=history
+    ) and extract_open_task(
         blob, history, ctx, thread_state=thread_state
     ):
         return False
@@ -600,12 +602,147 @@ def is_casual_chat(
     return True
 
 
+_SWITCH_STOP = {
+    "para",
+    "como",
+    "qué",
+    "que",
+    "una",
+    "unos",
+    "unas",
+    "los",
+    "las",
+    "del",
+    "con",
+    "por",
+    "me",
+    "te",
+    "se",
+    "le",
+    "de",
+    "la",
+    "el",
+    "en",
+    "un",
+    "al",
+    "lo",
+    "y",
+    "o",
+    "a",
+    "hace",
+    "hacé",
+    "hacer",
+    "podes",
+    "podés",
+    "podrias",
+    "podrías",
+    "necesito",
+    "quiero",
+    "escuchame",
+    "mira",
+    "che",
+    "bld",
+    "crack",
+    "todo",
+    "bien",
+    "orden",
+}
+
+
+def _content_tokens(text: str) -> set[str]:
+    return {t for t in _tokenize(text) if t not in _SWITCH_STOP and len(t) > 2}
+
+
+def previous_open_task(
+    *,
+    context_text: str | None = None,
+    history: list[dict[str, Any]] | None = None,
+    thread_state: dict[str, Any] | None = None,
+    current_text: str | None = None,
+) -> str:
+    """Tarea YA abierta (sin pisar con el mensaje actual)."""
+    from app.services.thread_memory import open_task_from_state
+
+    persisted = open_task_from_state(thread_state)
+    if persisted:
+        return persisted[:300]
+    ctx = (context_text or "").strip()
+    current = (current_text or "").strip()
+    if current and ctx.endswith(current):
+        ctx = ctx[: -len(current)].strip()
+    return extract_open_task("", history, ctx or None, thread_state=None)[:300]
+
+
+def is_context_switch(
+    text: str,
+    *,
+    context_text: str | None = None,
+    history: list[dict[str, Any]] | None = None,
+    thread_state: dict[str, Any] | None = None,
+) -> bool:
+    """Pedido nuevo autónomo: no es dato ni respuesta de la tarea abierta."""
+    from app.services.context_memory import looks_like_save_context_intent, parse_context_scope
+    from app.services.google_assistant import detect_google_intent
+    from app.services.order_parse import looks_like_do_task
+
+    blob = (text or "").strip()
+    if not blob:
+        return False
+    if is_download_confirmation_only(blob) or is_asking_for_needed_data(blob):
+        return False
+    if is_result_challenge_or_correction(blob) or parse_context_scope(blob):
+        return False
+    previous = previous_open_task(
+        context_text=context_text,
+        history=history,
+        thread_state=thread_state,
+        current_text=blob,
+    )
+    if not previous:
+        return False
+    # Dato suelto (URL, IP, mail) sin verbo de pedido nuevo → sigue el hilo.
+    if (
+        (has_concrete_task_inputs(blob) or contains_url(blob))
+        and not looks_like_do_task(blob)
+        and not is_action_request(blob)
+    ):
+        return False
+    autonomous = (
+        looks_like_do_task(blob)
+        or looks_like_save_context_intent(blob)
+        or detect_google_intent(blob) is not None
+        or should_try_skill_marketplace(blob)
+        or is_action_request(blob)
+    )
+    if not autonomous:
+        return False
+    prev_l = previous.lower().strip()
+    new_l = blob.lower()
+    if prev_l and (prev_l in new_l or new_l in prev_l):
+        return False
+    prev_toks = _content_tokens(previous)
+    new_toks = _content_tokens(blob)
+    if prev_toks and new_toks:
+        overlap = len(prev_toks & new_toks) / len(new_toks)
+        if overlap >= 0.5:
+            return False
+    return True
+
+
 def is_thread_followup(
     text: str,
     context_text: str | None = None,
     thread_state: dict[str, Any] | None = None,
+    history: list[dict[str, Any]] | None = None,
 ) -> bool:
     """Mensaje que continúa la tarea ya abierta (cualquier tema), no un pedido nuevo."""
+    if is_context_switch(
+        text,
+        context_text=context_text,
+        history=history,
+        thread_state=thread_state,
+    ):
+        return False
     if is_download_confirmation_only(text):
         return True
     if is_result_challenge_or_correction(text):
@@ -626,22 +763,31 @@ def is_thread_followup(
     cleaned = (text or "").strip()
     if not cleaned:
         return False
-    open_task = extract_open_task(text, context_text=ctx, thread_state=thread_state)
+    open_task = previous_open_task(
+        context_text=ctx,
+        history=history,
+        thread_state=thread_state,
+        current_text=cleaned,
+    )
     if not open_task:
         return False
     from app.services.order_parse import looks_like_do_task
 
-    # Pedido nuevo y distinto: no es follow-up.
     if looks_like_do_task(cleaned) and not is_asking_for_needed_data(cleaned):
         same = open_task.lower() in cleaned.lower() or cleaned.lower() in open_task.lower()
-        if not same and len(_tokenize(cleaned)) >= 6:
+        if not same:
             return False
     if contains_url(cleaned) and len(cleaned) < 220:
         return True
     args = extract_web_skill_args(cleaned)
     if args.get("punto") and len(_tokenize(cleaned)) <= 10:
         return True
-    if len(cleaned) <= 200 and len(_tokenize(cleaned)) <= 18:
+    if (
+        not looks_like_do_task(cleaned)
+        and not is_action_request(cleaned)
+        and len(cleaned) <= 200
+        and len(_tokenize(cleaned)) <= 18
+    ):
         return True
     return False
 
@@ -798,6 +944,17 @@ def thread_brief_for_prompt(
         user_message, history, thread_state=thread_state
     )
     persisted_text = str((thread_state or {}).get("summary_text") or "").strip()
+    if is_context_switch(
+        user_message, history=history, thread_state=thread_state
+    ):
+        return "\n".join(
+            [
+                "CAMBIO DE TAREA: el usuario empezó un pedido NUEVO.",
+                f"- Tarea actual: {(open_task or user_message)[:500]}",
+                "- No retomes la tarea anterior ni pidas sus datos "
+                "(destino, archivo, URL) salvo que ESTE pedido los necesite.",
+            ]
+        )
     lines = [
         "CONTINUIDAD DEL HILO (obligatorio respetar):",
         "- Este mensaje es continuación del mismo chat, no un pedido aislado.",
