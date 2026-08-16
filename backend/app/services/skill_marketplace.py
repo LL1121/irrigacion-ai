@@ -1271,6 +1271,36 @@ def missing_fields_for_skill(skill_id: str, args: dict[str, Any]) -> list[str]:
     return missing
 
 
+def skill_missing_required_inputs(
+    skill: dict[str, Any],
+    args: dict[str, Any] | None = None,
+    *,
+    context_text: str = "",
+    user_message: str = "",
+) -> list[str]:
+    """Qué falta de verdad. Vacío = se puede ejecutar (zero-arg OK, ej. speedtest)."""
+    skill = skill or {}
+    args = args or {}
+    skill_id = str(skill.get("id") or "")
+    if skill_id == "generar_documento_word":
+        return []
+    missing = missing_fields_for_skill(skill_id, args)
+    if missing:
+        return missing
+    if skill_id in SKILL_ARG_SCHEMAS:
+        return []
+    probe = f"{context_text or ''}\n{user_message or ''}".strip()
+    desc = str(skill.get("description") or "")
+    if is_telemetria_request(probe) or is_telemetria_request(desc):
+        web_missing = missing_web_clarify_fields(probe)
+        if args.get("punto"):
+            web_missing = [m for m in web_missing if m != "punto"]
+        if args.get("url") or args.get("api_url") or contains_url(probe):
+            web_missing = [m for m in web_missing if m != "url"]
+        return web_missing
+    return []
+
+
 def clarifying_question_for_skill(
     skill: dict[str, Any],
     missing: list[str],

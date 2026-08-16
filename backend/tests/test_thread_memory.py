@@ -178,3 +178,41 @@ def test_open_task_ninguna_es_estado_limpio():
         "podrías buscar una skill para hacer un test de velocidad?"
     )
     assert should_try_skill_marketplace("buscar una skill para medir la red")
+
+
+def test_hitl_y_zero_arg_skill_no_pide_datos_genericos():
+    from app.services.skill_marketplace import (
+        ask_inputs_for_open_task,
+        download_remote_prompt,
+        skill_missing_required_inputs,
+    )
+
+    # Zero-arg (speedtest): no pedir destino/archivo/URL genéricos.
+    speed_skill = {
+        "id": "remote_speedtest",
+        "name": "Test de velocidad",
+        "source": "remote",
+        "description": "Mide ping, download y upload de internet",
+    }
+    assert (
+        skill_missing_required_inputs(
+            speed_skill,
+            {"query": "hacé una prueba de velocidad"},
+            user_message="hacé una prueba de velocidad",
+        )
+        == []
+    )
+    # Caudal sí exige área/velocidad.
+    caudal = {
+        "id": "caudal_canal",
+        "name": "Cálculo de caudal",
+        "description": "Q = A·v",
+    }
+    assert skill_missing_required_inputs(caudal, {}) == ["area_m2", "velocidad_ms"]
+    assert not skill_missing_required_inputs(
+        caudal, {"area_m2": 2, "velocidad_ms": 0.5}
+    )
+    # Plantilla genérica no debe inventar "Ninguna".
+    soft = ask_inputs_for_open_task("", thread_state={"open_task": ""}).lower()
+    assert "ninguna" not in soft
+    assert download_remote_prompt()

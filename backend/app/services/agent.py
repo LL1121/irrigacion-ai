@@ -76,17 +76,18 @@ from app.services.skill_marketplace import (
     download_remote_prompt,
     extract_open_task,
     find_local_skill,
-    has_concrete_task_inputs,
     is_action_request,
     is_asking_for_needed_data,
     is_context_switch,
     is_result_challenge_or_correction,
     looks_like_skill_intent,
     looks_like_web_or_external_request,
+    clarifying_question_for_skill,
     prepare_skill_arguments,
     reply_is_capability_refusal,
     resolve_skill_decision,
     search_catalog,
+    skill_missing_required_inputs,
     thread_brief_for_prompt,
 )
 from app.services.skill_remote import (
@@ -531,11 +532,9 @@ def _annotate_plan_result(
     reply = (out.get("reply") or "").strip()
     setup = (llm_reply or "").strip()
     if out.get("needs_approval"):
-        bits = [bit for bit in (ack, setup) if bit]
-        if bits and not reply:
-            out["reply"] = "\n\n".join(bits)
-        elif bits and reply and ack.lower() not in reply.lower():
-            out["reply"] = f"{ack}\n\n{reply}"
+        # HITL estricto: un solo mensaje = la tarjeta de autorización.
+        # No mezclar prosa del LLM ni recaps largos en este turno.
+        out["reply"] = ""
         return out
     chunks: list[str] = []
     if ack and ack.lower() not in reply.lower():
@@ -1309,25 +1308,19 @@ def _google_tool_prompt(pending: dict[str, Any]) -> str:
 
 def _interrupt_to_prompt(payload: dict[str, Any], values: dict[str, Any]) -> str:
     kind = payload.get("approval_kind") or payload.get("intent")
-    lead = (values.get("reply") or values.get("order_ack") or "").strip()
+    # HITL estricto: únicamente el texto de autorización (sin prosa del plan).
     if kind == APPROVAL_KIND_DOWNLOAD:
-        body = download_remote_prompt()
-        if lead and lead.lower() not in body.lower():
-            return f"{lead}\n\n{body}"
-        return body
+        return download_remote_prompt()
     if kind == APPROVAL_KIND_GOOGLE_TOOL:
         pending = values.get("pending_google_tool") or {}
         return _google_tool_prompt(pending)
     skill = values.get("pending_skill") or {}
-    body = _approval_prompt(
+    return _approval_prompt(
         {
             "name": payload.get("skill_name") or skill.get("name"),
             "source": skill.get("source"),
         }
     )
-    if lead and lead.split("\n", 1)[0].lower() not in body.lower():
-        return f"{lead}\n\n{body}"
-    return body
 
 
 def _human_gate_download_node(state: AgentState) -> dict:
@@ -1391,10 +1384,14 @@ def _fetch_remote_skill_node(state: AgentState) -> dict:
         str(skill.get("id") or ""), str(skill.get("code") or "")
     ):
         return _auto_execute_skill_state(skill)
+    # El usuario ya autorizó "descargar y ejecutar" en human_gate_download.
+    # No pedir un segundo HITL: auditar + sandbox en este mismo resume.
     return {
         "pending_skill": skill,
-        "approval_kind": APPROVAL_KIND_EXECUTE,
-        "needs_approval": True,
+        "approval_kind": None,
+        "needs_approval": False,
+        "skill_approved": True,
+        "reply": "",
     }
 
 
@@ -1499,27 +1496,22 @@ def _run_skill_node(state: AgentState, db: Session) -> dict:
         state["user_message"],
         context_text=ctx,
     )
-    args = skill.get("arguments") or {}
-    useful = {
-        key: val
-        for key, val in args.items()
-        if key not in {"query", "pedido", "raw", "api_url"}
-        and val not in (None, "", {}, [])
-    }
-    is_remote = str(skill.get("source") or "") == "remote" or str(
-        skill.get("id") or ""
-    ).startswith("remote_")
-    if is_remote and not useful and not has_concrete_task_inputs(
-        f"{ctx}\n{state.get('user_message') or ''}"
-    ):
+    args = dict(skill.get("arguments") or {})
+    # Siempre pasar el pedido como query; skills zero-arg lo usan o lo ignoran.
+    if not args.get("query"):
+        args["query"] = state.get("user_message") or ""
+        skill["arguments"] = args
+
+    missing = skill_missing_required_inputs(
+        skill,
+        args,
+        context_text=ctx,
+        user_message=state.get("user_message") or "",
+    )
+    if missing:
         return {
             "skill_result": None,
-            "reply": ask_inputs_for_open_task(
-                ctx or state.get("user_message") or "",
-                str(skill.get("name") or "") or None,
-                history=state.get("history") or [],
-                thread_state=_thread_state(state),
-            ),
+            "reply": clarifying_question_for_skill(skill, missing),
             "pending_skill": None,
             "needs_approval": False,
             "approval_kind": None,
@@ -1687,12 +1679,24 @@ def _compose_skill_reply_node(state: AgentState) -> dict:
             err,
             re.I,
         ):
+            skill = state.get("pending_skill") or {}
+            missing = skill_missing_required_inputs(
+                skill if isinstance(skill, dict) else {},
+                (skill.get("arguments") if isinstance(skill, dict) else {}) or {},
+                context_text=_conversation_text(state),
+                user_message=user_message,
+            )
+            if missing:
+                return {
+                    "reply": clarifying_question_for_skill(
+                        skill if isinstance(skill, dict) else {},
+                        missing,
+                    )
+                }
             return {
-                "reply": ask_inputs_for_open_task(
-                    user_message,
-                    str(name) if name != "skill" else None,
-                    history=state.get("history") or [],
-                    thread_state=_thread_state(state),
+                "reply": (
+                    f"La skill pidió un dato concreto: {err}. "
+                    "Pasámelo y la reintento."
                 )
             }
         return {
