@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS document_chunks (
     user_id UUID REFERENCES users(id) ON DELETE CASCADE,
     source TEXT NOT NULL DEFAULT 'upload',
     title TEXT,
+    metadata JSONB,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT document_chunks_scope_chk CHECK (scope IN ('irrigacion', 'personal')),
     CONSTRAINT document_chunks_personal_user_chk CHECK (

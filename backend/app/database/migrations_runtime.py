@@ -79,6 +79,9 @@ def apply_schema_migrations(conn: Connection) -> None:
         )
     )
     conn.execute(text("ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS title TEXT"))
+    conn.execute(
+        text("ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS metadata JSONB")
+    )
     # FK best-effort (puede fallar si ya existe)
     conn.execute(
         text(

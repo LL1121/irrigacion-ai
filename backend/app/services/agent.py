@@ -10,13 +10,15 @@ from typing import Any, Literal, NotRequired, TypedDict
 from uuid import UUID
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.tools import tool
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.core.checkpointer import get_checkpointer
 from app.core.config import get_settings
+from app.core.irrigation_context import CORE_IRRIGATION_KNOWLEDGE
+from app.core.checkpointer import get_checkpointer
 from app.services.cache import cacheable_exchange, embed_query, save_to_semantic_cache
 from app.services.context_memory import (
     ask_scope_prompt,
@@ -110,6 +112,7 @@ from app.services.skill_remote import (
     validate_remote_skill,
 )
 from app.services.skill_whitelist import can_auto_reuse_skill, is_whitelisted
+from app.services.official_ingest import ingest_official_url_record
 from app.services.llm_roles import chat_llm
 from app.services.thread_memory import (
     load_thread_state,
@@ -133,7 +136,34 @@ logger = logging.getLogger(__name__)
 STATUS_OK = "agent"
 STATUS_APPROVAL = "REQUIRES_APPROVAL"
 
-SYSTEM_PROMPT_IRRIGACION = """
+
+@tool
+def ingest_official_url(url: str, title: str) -> str:
+    """Indexá en la base vectorial una resolución, ley o comunicado oficial desde su URL.
+
+    Usala cuando el usuario pida guardar/indexar/cargar documentación oficial
+    de Irrigación, DGI, HTG o normativa mendocina pasando un enlace.
+    Devuelve JSON con chunks_created y metadatos.
+    """
+    from app.core.database import SessionLocal
+
+    db = SessionLocal()
+    try:
+        result = ingest_official_url_record(db, url=url.strip(), title=title.strip())
+        return json.dumps(result, ensure_ascii=False)
+    except Exception as exc:
+        logger.exception("Fallo ingest_official_url url=%s", url)
+        return json.dumps(
+            {"error": str(exc), "url": url, "title": title},
+            ensure_ascii=False,
+        )
+    finally:
+        db.close()
+
+
+SYSTEM_PROMPT_IRRIGACION = f"""
+{CORE_IRRIGATION_KNOWLEDGE}
+
 Sos Irrigación Bot, el asistente técnico de la oficina de Irrigación de Malargüe.
 Hablás como un modelo de chat moderno (ChatGPT, Gemini): natural, directo, cálido y útil.
 Mismo registro que el usuario (rioplatense si habla así; más formal si viene formal).
@@ -170,6 +200,7 @@ Mismo registro que el usuario (rioplatense si habla así; más formal si viene f
 - Word, Excel, red, cálculos, scraping, automatizaciones → `search_skill_marketplace`
   (scripts Python del sandbox / marketplace interno).
 - Guardar nota tipada → solo si pidió explícito anotar/recordar (`save_user_context`).
+- Indexar resolución/comunicado oficial desde URL → `ingest_official_url`.
 
 ### CAPACIDADES EXTENDIDAS, SKILLS Y SANDBOX:
 1. **Concepto de Skill:** "skill", "herramienta" o "script" = extensiones Python del
@@ -204,7 +235,8 @@ NATIVE_TOOLS_HINT = (
     "Si hay orden: cumplí TODA (qué, a quién, cuándo, cómo). "
     "Horario ('en 5 minutos') → confirmalo, no lo hagas ahora. "
     "Mail/Gmail/Calendar/Drive → use_google. NUNCA una skill para un mail. "
-    "save_user_context SOLO si pidió explícito guardar/anotar/recordar."
+    "save_user_context SOLO si pidió explícito guardar/anotar/recordar. "
+    "ingest_official_url SOLO si pidió indexar/cargar documentación oficial desde URL."
 )
 
 SKILL_TOOLING_HINT = (
@@ -326,6 +358,8 @@ def _retrieve_node(state: AgentState, db: Session) -> dict:
                 document_name,
                 content,
                 scope,
+                title,
+                metadata,
                 (embedding <=> CAST(:embedding AS vector)) AS distance
             FROM document_chunks
             WHERE embedding IS NOT NULL
@@ -347,8 +381,12 @@ def _retrieve_node(state: AgentState, db: Session) -> dict:
     docs: list[str] = []
     for row in rows:
         scope = row.get("scope") or "irrigacion"
+        label = row.get("title") or row["document_name"]
+        meta = row.get("metadata")
+        if isinstance(meta, dict) and meta.get("category"):
+            label = f"{label} [{meta.get('category')}]"
         docs.append(
-            f"[{row['document_name']} | {scope} | dist={float(row['distance']):.4f}]\n"
+            f"[{label} | {scope} | dist={float(row['distance']):.4f}]\n"
             f"{row['content']}"
         )
 
@@ -786,6 +824,39 @@ def _plan_save_context(state: AgentState, db: Session, args: dict[str, Any]) -> 
     }
 
 
+def _plan_ingest_official(state: AgentState, db: Session, args: dict[str, Any]) -> dict:
+    empty = {
+        "pending_skill": None,
+        "pending_google_tool": None,
+        "needs_approval": False,
+        "approval_kind": None,
+    }
+    url = str(args.get("url") or "").strip()
+    title = str(args.get("title") or "").strip()
+    if not url or not title:
+        return {
+            **empty,
+            "reply": (
+                "Para indexar documentación oficial necesito la **URL** y un **título** "
+                "(ej. «Resolución 123/2024 — prorrateo turno verano»)."
+            ),
+        }
+    try:
+        result = ingest_official_url_record(db, url=url, title=title)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Fallo ingesta oficial desde chat url=%s", url)
+        return {**empty, "reply": f"No pude indexar «{title}»: {exc}"}
+    chunks = int(result.get("chunks_created") or 0)
+    return {
+        **empty,
+        "reply": (
+            f"Listo: indexé **{title}** en la base de Irrigación "
+            f"({chunks} fragmento{'s' if chunks != 1 else ''}). "
+            "Ya podés consultarlo en el chat."
+        ),
+    }
+
+
 def _plan_google_action(state: AgentState, db: Session, args: dict[str, Any]) -> dict:
     action = str(args.get("action") or "").strip()
     meta = GOOGLE_ACTIONS.get(action)
@@ -1109,6 +1180,10 @@ def _plan_node(state: AgentState, db: Session) -> dict:
         (call for call in tool_calls if _tool_call_name(call) == "save_user_context"),
         None,
     )
+    ingest_call = next(
+        (call for call in tool_calls if _tool_call_name(call) == "ingest_official_url"),
+        None,
+    )
     if is_result_challenge_or_correction(state["user_message"]) and (
         google_call
         or should_use_native_google(state["user_message"], ctx, tool_called=False)
@@ -1140,6 +1215,11 @@ def _plan_node(state: AgentState, db: Session) -> dict:
     if save_call and looks_like_save_context_intent(state["user_message"]):
         return _annotate_plan_result(
             _plan_save_context(state, db, _tool_call_args(save_call)),
+            parts,
+        )
+    if ingest_call:
+        return _annotate_plan_result(
+            _plan_ingest_official(state, db, _tool_call_args(ingest_call)),
             parts,
         )
 

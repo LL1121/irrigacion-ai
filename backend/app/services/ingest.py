@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import pymupdf as fitz
 from docx import Document
@@ -204,6 +206,7 @@ def persist_chunks(
     user_id: str | None = None,
     source: str = "upload",
     title: str | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> int:
     if len(chunks) != len(embeddings):
         raise ValueError("La cantidad de chunks y embeddings no coincide")
@@ -217,15 +220,17 @@ def persist_chunks(
     insert_sql = text(
         """
         INSERT INTO document_chunks (
-            document_name, content, embedding, scope, user_id, source, title
+            document_name, content, embedding, scope, user_id, source, title, metadata
         )
         VALUES (
             :document_name, :content, CAST(:embedding AS vector),
-            :scope, CAST(:user_id AS uuid), :source, :title
+            :scope, CAST(:user_id AS uuid), :source, :title,
+            CAST(:metadata AS jsonb)
         )
         """
     )
 
+    meta_json = json.dumps(metadata, ensure_ascii=False) if metadata else None
     for chunk, embedding in zip(chunks, embeddings, strict=True):
         embedding_literal = "[" + ",".join(str(float(v)) for v in embedding) + "]"
         db.execute(
@@ -238,6 +243,7 @@ def persist_chunks(
                 "user_id": user_id,
                 "source": source or "upload",
                 "title": title,
+                "metadata": meta_json,
             },
         )
     db.commit()
