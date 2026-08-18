@@ -29,7 +29,7 @@ export type ChatMessage = {
   skill_name?: string | null;
   skill_description?: string | null;
   attachments?: ChatAttachment[];
-  approval_kind?: "download_remote" | "execute_local" | "google_tool" | string | null;
+  approval_kind?: "download_remote" | "execute_local" | "google_tool" | "network_permission" | string | null;
 };
 
 export type ChatResponse = {
@@ -39,7 +39,7 @@ export type ChatResponse = {
   skill_name?: string | null;
   skill_description?: string | null;
   attachments?: ChatAttachment[] | null;
-  approval_kind?: "download_remote" | "execute_local" | "google_tool" | string | null;
+  approval_kind?: "download_remote" | "execute_local" | "google_tool" | "network_permission" | string | null;
 };
 
 export type SkillApproveResponse = {
@@ -49,7 +49,7 @@ export type SkillApproveResponse = {
   skill_description?: string | null;
   approved: boolean;
   attachments?: ChatAttachment[] | null;
-  approval_kind?: "download_remote" | "execute_local" | "google_tool" | string | null;
+  approval_kind?: "download_remote" | "execute_local" | "google_tool" | "network_permission" | string | null;
   audit?: {
     is_safe?: boolean;
     risk_score?: number;

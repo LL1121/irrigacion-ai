@@ -29,6 +29,10 @@ from app.services.skill_marketplace import (
     APPROVAL_KIND_DOWNLOAD,
     download_remote_prompt,
 )
+from app.services.skill_staging import (
+    APPROVAL_KIND_NETWORK,
+    network_permission_prompt,
+)
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
@@ -70,6 +74,10 @@ def _pending_reply(pending: dict[str, Any]) -> tuple[str, str | None, str | None
             name,
             description,
         )
+    if kind == APPROVAL_KIND_NETWORK:
+        name = pending.get("skill_name") or "skill"
+        label = pending.get("capability_label") or "Cliente HTTP/Socket"
+        return network_permission_prompt(str(label)), name, pending.get("skill_description")
     name = pending.get("skill_name") or "desconocida"
     description = pending.get("skill_description")
     return (

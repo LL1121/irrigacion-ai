@@ -137,6 +137,7 @@ def _run_job(db: Session, job: dict[str, Any]) -> None:
             skill_id=str(skill.get("id") or "") or None,
             skill_name=str(skill.get("name") or "") or None,
             source=str(skill.get("source") or "local") or None,
+            allow_network=bool(payload.get("allow_network")),
         )
         name = skill.get("name") or "la tarea"
         status = (result or {}).get("status") or "ok"
@@ -144,6 +145,22 @@ def _run_job(db: Session, job: dict[str, Any]) -> None:
             err = ((result or {}).get("execution") or {}).get("error") or "error"
             _post_chat(db, job, f"Falló la tarea programada ({name}): {err}")
             raise RuntimeError(str(err))
+        if status == "audit_unavailable":
+            _post_chat(
+                db,
+                job,
+                f"Quedó lista **{name}** pero la API de auditoría estaba saturada. "
+                "Decime cuando quieras reintentar la auditoría.",
+            )
+            raise RuntimeError("audit_unavailable")
+        if status in {"rejected", "needs_network"}:
+            reason = ((result or {}).get("audit") or {}).get("reason") or status
+            _post_chat(
+                db,
+                job,
+                f"No pude ejecutar la tarea programada ({name}): {reason}",
+            )
+            raise RuntimeError(str(reason))
         _post_chat(
             db,
             job,

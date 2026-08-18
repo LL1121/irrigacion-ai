@@ -14,7 +14,7 @@ import docker
 from docker.errors import ContainerError, DockerException, ImageNotFound
 
 from app.core.config import get_settings
-from app.services.sentinel import audit_skill_code
+from app.services.sentinel import audit_skill_code, scan_skill_capabilities
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +74,12 @@ def _write_workspace(code_str: str, input_data: dict) -> Path:
     return work
 
 
-def _run_container(work: Path) -> dict[str, Any]:
+def sandbox_network_mode(allow_network: bool) -> str:
+    """Salida a internet solo si el usuario autorizó el permiso de red."""
+    return "bridge" if allow_network else "none"
+
+
+def _run_container(work: Path, *, allow_network: bool = False) -> dict[str, Any]:
     settings = get_settings()
     client = docker.from_env()
     image = settings.skill_sandbox_image
@@ -98,7 +103,7 @@ def _run_container(work: Path) -> dict[str, Any]:
                     "mode": "ro",
                 },
             },
-            network_mode="none",
+            network_mode=sandbox_network_mode(allow_network),
             mem_limit="256m",
             nano_cpus=500_000_000,
             read_only=True,
@@ -229,6 +234,18 @@ def _run_inline(code_str: str, input_data: dict) -> dict[str, Any]:
         }
 
 
+def _run_async(factory):
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(factory())
+
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(lambda: asyncio.run(factory())).result()
+
+
 def execute_skill_sync(
     code_str: str,
     input_data: dict,
@@ -236,53 +253,66 @@ def execute_skill_sync(
     skill_id: str | None = None,
     skill_name: str | None = None,
     source: str | None = None,
+    allow_network: bool = False,
 ) -> dict[str, Any]:
     """Wrapper síncrono para nodos LangGraph (el endpoint de chat corre en threadpool)."""
 
-    def _run() -> dict[str, Any]:
-        return asyncio.run(
-            execute_skill(
-                code_str,
-                input_data,
-                skill_id=skill_id,
-                skill_name=skill_name,
-                source=source,
-            )
+    return _run_async(
+        lambda: execute_skill(
+            code_str,
+            input_data,
+            skill_id=skill_id,
+            skill_name=skill_name,
+            source=source,
+            allow_network=allow_network,
         )
+    )
 
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return _run()
 
-    import concurrent.futures
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(_run).result()
+def evaluate_skill_audit_sync(
+    code_str: str,
+    *,
+    skill_id: str | None = None,
+    skill_name: str | None = None,
+    source: str | None = None,
+    allow_network: bool = False,
+) -> dict[str, Any]:
+    return _run_async(
+        lambda: evaluate_skill_audit(
+            code_str,
+            skill_id=skill_id,
+            skill_name=skill_name,
+            source=source,
+            allow_network=allow_network,
+        )
+    )
 
 
 # Alias histórico
 execute_skill_in_sandbox_sync = execute_skill_sync
 
 
-async def execute_skill(
+async def evaluate_skill_audit(
     code_str: str,
-    input_data: dict,
     *,
     skill_id: str | None = None,
     skill_name: str | None = None,
     source: str | None = None,
+    allow_network: bool = False,
 ) -> dict[str, Any]:
     """
-    Audita con Gemini (o salta si está en whitelist) y ejecuta la skill.
-    Modo controlado por SKILL_EXECUTION_MODE: inline | sandbox.
+    Audita sin ejecutar.
+
+    status: ok | rejected | audit_unavailable | needs_network
     """
     from app.services.skill_whitelist import (
         add_to_whitelist,
         has_whitelisted_skill_id,
         is_whitelisted,
+        whitelist_allows_network,
     )
 
+    caps = scan_skill_capabilities(code_str or "")
     curated_ids = {"remote_telemetria_punto"}
     if skill_id and is_whitelisted(skill_id, code_str):
         audit: dict[str, Any] = {
@@ -290,14 +320,23 @@ async def execute_skill(
             "risk_score": 0,
             "reason": "Whitelist: skill previamente auditada por Gemini",
             "whitelisted": True,
+            "malicious": False,
+            "needs_network": bool(caps.get("needs_network")),
+            "network_capabilities": list(caps.get("network_capabilities") or []),
+            "audit_unavailable": False,
         }
+        if caps.get("needs_network") and whitelist_allows_network(skill_id, code_str):
+            allow_network = True
     elif skill_id and skill_id in curated_ids and has_whitelisted_skill_id(skill_id):
-        # Template curada ya conocida: reusar sin re-auditar aunque el hash cambie un poco.
         audit = {
             "is_safe": True,
             "risk_score": 0,
             "reason": "Whitelist: skill curada previamente auditada",
             "whitelisted": True,
+            "malicious": False,
+            "needs_network": bool(caps.get("needs_network")),
+            "network_capabilities": list(caps.get("network_capabilities") or []),
+            "audit_unavailable": False,
         }
         add_to_whitelist(
             skill_id=skill_id,
@@ -308,26 +347,94 @@ async def execute_skill(
         )
     else:
         audit = await audit_skill_code(code_str)
-        if not audit.get("is_safe"):
-            return {
-                "status": "rejected",
-                "audit": audit,
-                "execution": None,
-            }
-        if skill_id:
-            add_to_whitelist(
-                skill_id=skill_id,
-                code_str=code_str,
-                skill_name=skill_name,
-                source=source,
-                audit=audit,
-            )
 
+    if caps.get("malicious") or audit.get("malicious"):
+        return {"status": "rejected", "audit": audit, "allow_network": False}
+
+    if audit.get("audit_unavailable"):
+        return {
+            "status": "audit_unavailable",
+            "audit": audit,
+            "allow_network": False,
+        }
+
+    if not audit.get("is_safe"):
+        return {"status": "rejected", "audit": audit, "allow_network": False}
+
+    needs_net = bool(audit.get("needs_network") or caps.get("needs_network"))
+    if needs_net and not allow_network:
+        return {
+            "status": "needs_network",
+            "audit": {
+                **audit,
+                "needs_network": True,
+                "network_capabilities": list(
+                    audit.get("network_capabilities")
+                    or caps.get("network_capabilities")
+                    or ["Cliente HTTP/Socket"]
+                ),
+            },
+            "allow_network": False,
+        }
+
+    if skill_id and not audit.get("whitelisted"):
+        add_to_whitelist(
+            skill_id=skill_id,
+            code_str=code_str,
+            skill_name=skill_name,
+            source=source,
+            audit=audit,
+            network_granted=bool(allow_network and needs_net),
+        )
+    elif skill_id and allow_network and needs_net:
+        add_to_whitelist(
+            skill_id=skill_id,
+            code_str=code_str,
+            skill_name=skill_name,
+            source=source,
+            audit=audit,
+            network_granted=True,
+        )
+
+    return {"status": "ok", "audit": audit, "allow_network": bool(allow_network)}
+
+
+async def execute_skill(
+    code_str: str,
+    input_data: dict,
+    *,
+    skill_id: str | None = None,
+    skill_name: str | None = None,
+    source: str | None = None,
+    allow_network: bool = False,
+) -> dict[str, Any]:
+    """
+    Audita con Gemini (o salta si está en whitelist) y ejecuta la skill.
+    Modo controlado por SKILL_EXECUTION_MODE: inline | sandbox.
+    Con allow_network el contenedor usa --network bridge.
+    """
+    prepared = await evaluate_skill_audit(
+        code_str,
+        skill_id=skill_id,
+        skill_name=skill_name,
+        source=source,
+        allow_network=allow_network,
+    )
+    audit = prepared.get("audit") or {}
+    status = prepared.get("status") or "rejected"
+    if status != "ok":
+        return {
+            "status": status,
+            "audit": audit,
+            "execution": None,
+        }
+
+    allow_network = bool(prepared.get("allow_network") or allow_network)
     settings = get_settings()
     mode = (settings.skill_execution_mode or "inline").strip().lower()
     if mode not in {"inline", "sandbox"}:
         mode = "inline"
-    # fetch_url necesita red del host: forzar inline (el sandbox Docker va sin red).
+    # fetch_url solo existe inyectada en inline.
     if "fetch_url" in (code_str or ""):
         mode = "inline"
 
@@ -342,7 +449,9 @@ async def execute_skill(
     work: Path | None = None
     try:
         work = await asyncio.to_thread(_write_workspace, code_str, input_data or {})
-        execution = await asyncio.to_thread(_run_container, work)
+        execution = await asyncio.to_thread(
+            _run_container, work, allow_network=allow_network
+        )
         if isinstance(execution, dict):
             execution = {**execution, "mode": "sandbox"}
         return {

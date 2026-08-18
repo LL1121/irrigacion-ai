@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-RUN pip install --no-cache-dir python-docx==1.1.2 \
+RUN pip install --no-cache-dir python-docx==1.1.2 requests==2.32.3 \
     && useradd --create-home --uid 1000 --shell /usr/sbin/nologin sandboxuser
 
 WORKDIR /tmp

@@ -97,6 +97,38 @@ def can_auto_reuse_skill(skill: dict[str, Any], db: Session | None = None) -> bo
     return False
 
 
+def whitelist_allows_network(
+    skill_id: str | None,
+    code_str: str,
+    db: Session | None = None,
+) -> bool:
+    sid = (skill_id or "").strip()
+    if not sid or not (code_str or "").strip():
+        return False
+    digest = code_fingerprint(code_str)
+    own = db is None
+    session = db or SessionLocal()
+    try:
+        row = session.execute(
+            text(
+                """
+                SELECT network_granted
+                FROM skill_whitelist
+                WHERE skill_id = :skill_id AND code_sha256 = :digest
+                LIMIT 1
+                """
+            ),
+            {"skill_id": sid, "digest": digest},
+        ).first()
+        return bool(row and row[0])
+    except Exception:
+        logger.exception("No se pudo consultar network_granted de whitelist")
+        return False
+    finally:
+        if own:
+            session.close()
+
+
 def add_to_whitelist(
     *,
     skill_id: str,
@@ -104,6 +136,7 @@ def add_to_whitelist(
     skill_name: str | None = None,
     source: str | None = None,
     audit: dict[str, Any] | None = None,
+    network_granted: bool = False,
     db: Session | None = None,
 ) -> bool:
     """Registra una skill auditada como segura. Idempotente."""
@@ -119,16 +152,20 @@ def add_to_whitelist(
             text(
                 """
                 INSERT INTO skill_whitelist (
-                    skill_id, code_sha256, skill_name, source, risk_score, audit_reason
+                    skill_id, code_sha256, skill_name, source, risk_score,
+                    audit_reason, network_granted
                 )
                 VALUES (
-                    :skill_id, :digest, :skill_name, :source, :risk_score, :audit_reason
+                    :skill_id, :digest, :skill_name, :source, :risk_score,
+                    :audit_reason, :network_granted
                 )
                 ON CONFLICT (skill_id, code_sha256) DO UPDATE SET
                     skill_name = EXCLUDED.skill_name,
                     source = COALESCE(EXCLUDED.source, skill_whitelist.source),
                     risk_score = EXCLUDED.risk_score,
                     audit_reason = EXCLUDED.audit_reason,
+                    network_granted = skill_whitelist.network_granted
+                        OR EXCLUDED.network_granted,
                     whitelisted_at = CURRENT_TIMESTAMP
                 """
             ),
@@ -139,6 +176,7 @@ def add_to_whitelist(
                 "source": (source or "local")[:64],
                 "risk_score": int(audit.get("risk_score") or 0),
                 "audit_reason": str(audit.get("reason") or "Auditoría Gemini OK")[:2000],
+                "network_granted": bool(network_granted),
             },
         )
         session.commit()

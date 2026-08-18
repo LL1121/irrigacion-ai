@@ -65,7 +65,21 @@ from app.services.response_normalize import (
     normalize_assistant_reply,
     unwrap_result,
 )
-from app.services.sandbox import execute_skill_sync
+from app.services.sandbox import evaluate_skill_audit_sync, execute_skill_sync
+from app.services.skill_staging import (
+    APPROVAL_KIND_NETWORK,
+    AUDIT_RETRY_PROMPT,
+    STATUS_APPROVED,
+    STATUS_DOWNLOADED,
+    STATUS_FAILED,
+    STATUS_PENDING_AUDIT,
+    STATUS_REQUIRES_PERMISSION,
+    get_retryable_staging,
+    is_audit_retry,
+    network_permission_prompt,
+    skill_from_staging,
+    upsert_skill_staging,
+)
 from app.services.skill_marketplace import (
     APPROVAL_KIND_DOWNLOAD,
     APPROVAL_KIND_EXECUTE,
@@ -244,6 +258,8 @@ class AgentState(TypedDict):
     run_at: NotRequired[str | None]
     order_ack: NotRequired[str | None]
     thread_state: NotRequired[dict[str, Any]]
+    allow_network: NotRequired[bool]
+    retry_staged_audit: NotRequired[bool]
 
 
 @dataclass
@@ -427,6 +443,23 @@ def _pre_assist_node(state: AgentState, db: Session) -> dict:
     message = state["user_message"]
     session_id = state["session_id"]
     user_id = state.get("user_id")
+
+    if is_audit_retry(message):
+        staged = get_retryable_staging(session_id, db=db)
+        if staged:
+            skill = skill_from_staging(staged)
+            return {
+                "pending_skill": skill,
+                "skill_approved": True,
+                "allow_network": bool(staged.get("network_granted")),
+                "needs_approval": False,
+                "approval_kind": None,
+                "pre_assist_done": False,
+                "retry_staged_audit": True,
+                "reply": "",
+                "pending_google_tool": None,
+                "google_approved": None,
+            }
 
     pending_note = get_pending_note(session_id)
     if pending_note:
@@ -1243,13 +1276,19 @@ def _route_after_plan(
 
 def _route_after_pre_assist(
     state: AgentState,
-) -> Literal["human_gate_google", "plan", "end_ok"]:
+) -> Literal["human_gate_google", "plan", "run_skill", "end_ok"]:
     if (
         state.get("approval_kind") == APPROVAL_KIND_GOOGLE_TOOL
         and state.get("needs_approval")
         and state.get("pending_google_tool")
     ):
         return "human_gate_google"
+    if (
+        state.get("retry_staged_audit")
+        and state.get("skill_approved")
+        and state.get("pending_skill")
+    ):
+        return "run_skill"
     if state.get("pre_assist_done"):
         return "end_ok"
     return "plan"
@@ -1314,6 +1353,9 @@ def _interrupt_to_prompt(payload: dict[str, Any], values: dict[str, Any]) -> str
     if kind == APPROVAL_KIND_GOOGLE_TOOL:
         pending = values.get("pending_google_tool") or {}
         return _google_tool_prompt(pending)
+    if kind == APPROVAL_KIND_NETWORK:
+        label = payload.get("capability_label") or "Cliente HTTP/Socket"
+        return network_permission_prompt(str(label))
     skill = values.get("pending_skill") or {}
     return _approval_prompt(
         {
@@ -1386,6 +1428,12 @@ def _fetch_remote_skill_node(state: AgentState) -> dict:
         return _auto_execute_skill_state(skill)
     # El usuario ya autorizó "descargar y ejecutar" en human_gate_download.
     # No pedir un segundo HITL: auditar + sandbox en este mismo resume.
+    upsert_skill_staging(
+        session_id=str(state.get("session_id") or ""),
+        skill=skill,
+        status=STATUS_DOWNLOADED,
+        user_id=state.get("user_id"),
+    )
     return {
         "pending_skill": skill,
         "approval_kind": None,
@@ -1453,6 +1501,160 @@ def _human_gate_google_node(state: AgentState) -> dict:
     }
 
 
+def _stage_pending_skill(
+    state: AgentState,
+    skill: dict[str, Any],
+    status: str,
+    *,
+    needs_network: bool | None = None,
+    network_granted: bool | None = None,
+    last_error: str | None = None,
+    audit: dict[str, Any] | None = None,
+) -> None:
+    upsert_skill_staging(
+        session_id=str(state.get("session_id") or ""),
+        skill=skill,
+        status=status,
+        user_id=state.get("user_id"),
+        needs_network=needs_network,
+        network_granted=network_granted,
+        last_error=last_error,
+        audit=audit,
+    )
+
+
+def _audit_gate_from_result(
+    state: AgentState,
+    skill: dict[str, Any],
+    result: dict[str, Any],
+) -> dict[str, Any] | None:
+    status = result.get("status")
+    audit = result.get("audit") or {}
+    if status == "audit_unavailable":
+        _stage_pending_skill(
+            state,
+            skill,
+            STATUS_PENDING_AUDIT,
+            needs_network=bool(audit.get("needs_network")),
+            last_error=str(audit.get("reason") or ""),
+            audit=audit,
+        )
+        return {
+            "skill_result": result,
+            "reply": AUDIT_RETRY_PROMPT,
+            "pending_skill": skill,
+            "needs_approval": False,
+            "approval_kind": None,
+            "retry_staged_audit": False,
+        }
+    if status == "needs_network":
+        _stage_pending_skill(
+            state,
+            skill,
+            STATUS_REQUIRES_PERMISSION,
+            needs_network=True,
+            network_granted=False,
+            audit=audit,
+        )
+        return {
+            "skill_result": result,
+            "reply": "",
+            "pending_skill": skill,
+            "needs_approval": True,
+            "approval_kind": APPROVAL_KIND_NETWORK,
+            "allow_network": False,
+        }
+    if status == "rejected":
+        _stage_pending_skill(
+            state,
+            skill,
+            STATUS_FAILED,
+            last_error=str(audit.get("reason") or ""),
+            audit=audit,
+        )
+        return {
+            "skill_result": result,
+            "reply": "",
+            "pending_skill": skill,
+            "needs_approval": False,
+            "approval_kind": None,
+        }
+    return None
+
+
+def _human_gate_network_node(state: AgentState) -> dict:
+    skill = state.get("pending_skill") or {}
+    audit = (state.get("skill_result") or {}).get("audit") or {}
+    labels = audit.get("network_capabilities") or ["Cliente HTTP/Socket"]
+    label = labels[0] if isinstance(labels, list) and labels else "Cliente HTTP/Socket"
+    decision = interrupt(
+        {
+            "intent": APPROVAL_KIND_NETWORK,
+            "approval_kind": APPROVAL_KIND_NETWORK,
+            "skill_id": skill.get("id"),
+            "skill_name": skill.get("name"),
+            "skill_description": skill.get("description"),
+            "capability_label": label,
+        }
+    )
+    approved = (
+        bool(decision.get("approved"))
+        if isinstance(decision, dict)
+        else bool(decision)
+    )
+    if not approved:
+        _stage_pending_skill(
+            state,
+            skill if isinstance(skill, dict) else {},
+            STATUS_FAILED,
+            network_granted=False,
+            last_error="Permiso de red cancelado por el usuario",
+        )
+        return {
+            "skill_approved": False,
+            "allow_network": False,
+            "needs_approval": False,
+            "approval_kind": None,
+            "reply": (
+                "Entendido. No autorizaste el permiso de red; cancelé la skill."
+            ),
+        }
+    _stage_pending_skill(
+        state,
+        skill if isinstance(skill, dict) else {},
+        STATUS_REQUIRES_PERMISSION,
+        needs_network=True,
+        network_granted=True,
+    )
+    return {
+        "skill_approved": True,
+        "allow_network": True,
+        "needs_approval": False,
+        "approval_kind": None,
+        "reply": "",
+    }
+
+
+def _route_after_network_gate(
+    state: AgentState,
+) -> Literal["run_skill", "end_ok"]:
+    if state.get("allow_network") and state.get("skill_approved"):
+        return "run_skill"
+    return "end_ok"
+
+
+def _route_after_run_skill(
+    state: AgentState,
+) -> Literal["human_gate_network", "compose_skill_reply"]:
+    if (
+        state.get("needs_approval")
+        and state.get("approval_kind") == APPROVAL_KIND_NETWORK
+        and state.get("pending_skill")
+    ):
+        return "human_gate_network"
+    return "compose_skill_reply"
+
+
 def _run_google_tool_node(state: AgentState, db: Session) -> dict:
     if not state.get("google_approved"):
         return {
@@ -1516,6 +1718,25 @@ def _run_skill_node(state: AgentState, db: Session) -> dict:
             "needs_approval": False,
             "approval_kind": None,
         }
+    try:
+        validate_remote_skill(skill, ctx or state["user_message"])
+    except Exception as exc:
+        logger.exception("Skill pendiente inválida bloqueada antes de ejecutar")
+        return {
+            "skill_result": None,
+            "reply": (
+                f"Aborté la ejecución: la skill no es válida ({exc}). "
+                "Pedime de nuevo el dato + URL/punto y generamos una skill real."
+            ),
+            "pending_skill": None,
+            "needs_approval": False,
+            "approval_kind": None,
+        }
+    if not state.get("retry_staged_audit"):
+        _stage_pending_skill(state, skill, STATUS_DOWNLOADED)
+    code = skill.get("code") or ""
+    arguments = skill.get("arguments") or {}
+    allow_network = bool(state.get("allow_network"))
     parts = extract_order_parts(state.get("user_message") or "", ctx)
     when_iso = parts.when_iso or state.get("run_at")
     if when_iso:
@@ -1523,6 +1744,16 @@ def _run_skill_node(state: AgentState, db: Session) -> dict:
 
         from app.services.scheduled_jobs import enqueue_job
 
+        prepared = evaluate_skill_audit_sync(
+            code,
+            skill_id=str(skill.get("id") or "") or None,
+            skill_name=str(skill.get("name") or "") or None,
+            source=str(skill.get("source") or "local") or None,
+            allow_network=allow_network,
+        )
+        gated = _audit_gate_from_result(state, skill, prepared)
+        if gated:
+            return gated
         try:
             when = datetime.fromisoformat(str(when_iso))
             enqueue_job(
@@ -1540,11 +1771,20 @@ def _run_skill_node(state: AgentState, db: Session) -> dict:
                     },
                     "user_message": state.get("user_message"),
                     "context": ctx,
+                    "allow_network": allow_network
+                    or bool(prepared.get("allow_network")),
                 },
                 run_at=when,
             )
             recap = parts.recap()
             label = parts.when_label or "el horario pedido"
+            _stage_pending_skill(
+                state,
+                skill,
+                STATUS_APPROVED,
+                network_granted=allow_network
+                or bool(prepared.get("allow_network")),
+            )
             return {
                 "skill_result": None,
                 "reply": (
@@ -1556,28 +1796,13 @@ def _run_skill_node(state: AgentState, db: Session) -> dict:
         except Exception:
             logger.exception("No pude programar la skill; la ejecuto ahora")
     try:
-        validate_remote_skill(skill, ctx or state["user_message"])
-    except Exception as exc:
-        logger.exception("Skill pendiente inválida bloqueada antes de ejecutar")
-        return {
-            "skill_result": None,
-            "reply": (
-                f"Aborté la ejecución: la skill no es válida ({exc}). "
-                "Pedime de nuevo el dato + URL/punto y generamos una skill real."
-            ),
-            "pending_skill": None,
-            "needs_approval": False,
-            "approval_kind": None,
-        }
-    code = skill.get("code") or ""
-    arguments = skill.get("arguments") or {}
-    try:
         result = execute_skill_sync(
             code,
             arguments,
             skill_id=str(skill.get("id") or "") or None,
             skill_name=str(skill.get("name") or "") or None,
             source=str(skill.get("source") or "local") or None,
+            allow_network=allow_network,
         )
     except Exception as exc:
         logger.exception("Fallo al ejecutar skill")
@@ -1589,6 +1814,12 @@ def _run_skill_node(state: AgentState, db: Session) -> dict:
             if mode == "sandbox"
             else "Revisá el código de la skill o cambiá SKILL_EXECUTION_MODE."
         )
+        _stage_pending_skill(
+            state,
+            skill,
+            STATUS_FAILED,
+            last_error=str(exc),
+        )
         return {
             "skill_result": {
                 "status": "error",
@@ -1598,6 +1829,16 @@ def _run_skill_node(state: AgentState, db: Session) -> dict:
             "reply": f"No pude ejecutar la skill '{name}': {exc}. {hint}",
             "pending_skill": skill,
         }
+    gated = _audit_gate_from_result(state, skill, result)
+    if gated:
+        return gated
+    if result.get("status") == "executed":
+        _stage_pending_skill(
+            state,
+            skill,
+            STATUS_APPROVED,
+            network_granted=allow_network,
+        )
     return {"skill_result": result, "reply": "", "pending_skill": skill}
 
 
@@ -1663,6 +1904,8 @@ def _compose_skill_reply_node(state: AgentState) -> dict:
 
     if result.get("status") == "rejected":
         audit = result.get("audit") or {}
+        if audit.get("audit_unavailable"):
+            return {"reply": AUDIT_RETRY_PROMPT}
         reason = audit.get("reason") or "riesgo detectado"
         return {
             "reply": (
@@ -1670,6 +1913,15 @@ def _compose_skill_reply_node(state: AgentState) -> dict:
                 f"({reason})."
             )
         }
+
+    if result.get("status") == "audit_unavailable":
+        return {"reply": AUDIT_RETRY_PROMPT}
+
+    if result.get("status") == "needs_network":
+        audit = result.get("audit") or {}
+        labels = audit.get("network_capabilities") or ["Cliente HTTP/Socket"]
+        label = labels[0] if isinstance(labels, list) and labels else "Cliente HTTP/Socket"
+        return {"reply": network_permission_prompt(str(label))}
 
     if result.get("status") == "error":
         execution = result.get("execution") or {}
@@ -1903,6 +2155,7 @@ def build_agent_graph(db: Session):
     graph.add_node("fetch_remote_skill", _fetch_remote_skill_node)
     graph.add_node("human_gate_execute", _human_gate_execute_node)
     graph.add_node("human_gate_google", _human_gate_google_node)
+    graph.add_node("human_gate_network", _human_gate_network_node)
     graph.add_node("run_google", run_google)
     graph.add_node("run_skill", run_skill)
     graph.add_node("compose_skill_reply", _compose_skill_reply_node)
@@ -1916,6 +2169,7 @@ def build_agent_graph(db: Session):
         {
             "human_gate_google": "human_gate_google",
             "plan": "plan",
+            "run_skill": "run_skill",
             "end_ok": END,
         },
     )
@@ -1947,7 +2201,19 @@ def build_agent_graph(db: Session):
     graph.add_edge("human_gate_execute", "run_skill")
     graph.add_edge("human_gate_google", "run_google")
     graph.add_edge("run_google", END)
-    graph.add_edge("run_skill", "compose_skill_reply")
+    graph.add_conditional_edges(
+        "run_skill",
+        _route_after_run_skill,
+        {
+            "human_gate_network": "human_gate_network",
+            "compose_skill_reply": "compose_skill_reply",
+        },
+    )
+    graph.add_conditional_edges(
+        "human_gate_network",
+        _route_after_network_gate,
+        {"run_skill": "run_skill", "end_ok": END},
+    )
     graph.add_edge("compose_skill_reply", END)
 
     return graph.compile(checkpointer=get_checkpointer())
@@ -2012,6 +2278,8 @@ def run_agent(
                 "run_at": None,
                 "order_ack": None,
                 "thread_state": {},
+                "allow_network": False,
+                "retry_staged_audit": False,
             },
             config,
         )
@@ -2086,6 +2354,12 @@ def _approval_display_names(
             payload.get("skill_description") or pending.get("description"),
         )
     if kind == APPROVAL_KIND_EXECUTE:
+        skill = values.get("pending_skill") or {}
+        return (
+            payload.get("skill_name") or skill.get("name"),
+            payload.get("skill_description") or skill.get("description"),
+        )
+    if kind == APPROVAL_KIND_NETWORK:
         skill = values.get("pending_skill") or {}
         return (
             payload.get("skill_name") or skill.get("name"),

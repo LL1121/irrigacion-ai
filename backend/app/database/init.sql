@@ -98,12 +98,40 @@ CREATE TABLE IF NOT EXISTS skill_whitelist (
     source TEXT,
     risk_score INT,
     audit_reason TEXT,
+    network_granted BOOLEAN NOT NULL DEFAULT FALSE,
     whitelisted_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (skill_id, code_sha256)
 );
 
 CREATE INDEX IF NOT EXISTS idx_skill_whitelist_skill_id
     ON skill_whitelist (skill_id);
+
+ALTER TABLE skill_whitelist
+    ADD COLUMN IF NOT EXISTS network_granted BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Skills descargadas en staging (auditoría / permisos pendientes)
+CREATE TABLE IF NOT EXISTS skill_staging (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID NOT NULL,
+    user_id UUID,
+    skill_id TEXT NOT NULL,
+    skill_name TEXT,
+    source TEXT,
+    code TEXT NOT NULL,
+    code_sha256 TEXT NOT NULL,
+    arguments JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status TEXT NOT NULL,
+    needs_network BOOLEAN NOT NULL DEFAULT FALSE,
+    network_granted BOOLEAN NOT NULL DEFAULT FALSE,
+    last_error TEXT,
+    audit_json JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (session_id, skill_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_skill_staging_session
+    ON skill_staging (session_id, updated_at DESC);
 
 -- Whitelist de tools Google por usuario (escritura ya autorizada)
 CREATE TABLE IF NOT EXISTS tool_whitelist (
