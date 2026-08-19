@@ -2036,11 +2036,32 @@ def infer_arguments(skill_id: str, user_message: str) -> dict[str, Any]:
             args["url"] = urls[0]
         keys = [
             k
-            for k in ("normativa", "resolucion", "resolución", "ley", "institucional", "pdf")
+            for k in (
+                "normativa",
+                "resolucion",
+                "resolución",
+                "ley",
+                "institucional",
+                "pdf",
+            )
             if k in lowered
         ]
         if keys:
             args["keywords"] = keys
+        # Extraer max_links si el usuario lo menciona: "hasta 10", "10 links", etc.
+        max_m = re.search(
+            r"(?:hasta|max(?:imo)?|m[aá]ximo|top|primeros?)[\s:]*(\d+)"
+            r"|(\d+)\s*(?:links?|enlaces?|URLs?)",
+            text,
+            re.I,
+        )
+        if max_m:
+            num = int(max_m.group(1) or max_m.group(2))
+            if 1 <= num <= 200:
+                args["max_links"] = num
+        # Si el usuario dice "sin filtro" o "todos", limpiar keywords
+        if re.search(r"sin\s+filtro|sin\s+keywords?|todos\s+los\s+enlaces", text, re.I):
+            args["keywords"] = []
     return args
 
 
@@ -2229,7 +2250,11 @@ SKILL_ARG_SCHEMAS: dict[str, dict[str, Any]] = {
     "crawl_domain_links": {
         "fields": {
             "base_url": "URL del sitio a escanear (ej. https://www.irrigacion.gov.ar/web/)",
-            "keywords": "Filtros opcionales (normativa, resolucion, ley, institucional, pdf)",
+            "max_links": "Máximo de enlaces válidos a retornar (default 20)",
+            "keywords": (
+                "Filtros opcionales (normativa, resolucion, ley, institucional, pdf). "
+                "Si es vacío/None devuelve todos los enlaces válidos."
+            ),
         },
         "required": ["base_url"],
         "notes": "No es telemetría: no pidas código de estación. Solo la URL base.",

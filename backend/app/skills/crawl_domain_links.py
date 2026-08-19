@@ -6,10 +6,17 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
-
-DEFAULT_TIMEOUT = 8
-MAX_LINKS_TO_CHECK = 60
-USER_AGENT = "irrigacion-bot/1.0 (crawler institucional)"
+DEFAULT_TIMEOUT = 10
+_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+_HEADERS = {
+    "User-Agent": _UA,
+    "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
+    "Accept-Language": "es-AR,es;q=0.9,en;q=0.8",
+}
 
 
 class _HrefParser(HTMLParser):
@@ -20,7 +27,9 @@ class _HrefParser(HTMLParser):
         self._href = ""
         self._text: list[str] = []
 
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
         if tag.lower() != "a":
             return
         href = ""
@@ -52,21 +61,56 @@ def _normalize_url(url: str) -> str:
     if path != "/" and path.endswith("/"):
         path = path.rstrip("/")
     return urlunparse(
-        (parsed.scheme.lower(), parsed.netloc.lower(), path, "", parsed.query, "")
+        (
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            path,
+            "",
+            parsed.query,
+            "",
+        )
     )
 
 
-def _is_internal(href: str, base_netloc: str) -> bool:
-    parsed = urlparse(href)
-    if parsed.scheme and parsed.scheme not in {"http", "https"}:
+def _root_domain(netloc: str) -> str:
+    """Extrae el dominio raíz descartando subdominio (www, etc.)."""
+    parts = netloc.lower().split(".")
+    if len(parts) >= 2:
+        return ".".join(parts[-2:])
+    return netloc.lower()
+
+
+def _is_internal(absolute_url: str, base_root: str) -> bool:
+    parsed = urlparse(absolute_url)
+    if parsed.scheme not in {"http", "https"}:
         return False
-    if not parsed.netloc:
-        return True
-    return parsed.netloc.lower() == base_netloc.lower()
+    return _root_domain(parsed.netloc) == base_root
+
+
+def _http_get(
+    url: str, timeout: float = DEFAULT_TIMEOUT
+) -> tuple[int | None, str, str]:
+    """Retorna (status_code, html). html vacío si no es texto."""
+    req = Request(url, headers=_HEADERS, method="GET")
+    try:
+        with urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            status = int(getattr(resp, "status", 200) or 200)
+            ct = (resp.headers.get("content-type") or "").lower()
+            if "html" in ct:
+                html = resp.read().decode("utf-8", errors="replace")
+                final = resp.geturl() or url
+            else:
+                html = ""
+                final = resp.geturl() or url
+            return status, html, final
+    except HTTPError as exc:
+        return int(exc.code), "", url
+    except (URLError, TimeoutError, ValueError, OSError):
+        return None, "", url
 
 
 def _http_status(url: str, timeout: float = DEFAULT_TIMEOUT) -> int | None:
-    req = Request(url, headers={"User-Agent": USER_AGENT}, method="GET")
+    req = Request(url, headers=_HEADERS, method="HEAD")
     try:
         with urlopen(req, timeout=timeout) as resp:  # noqa: S310
             return int(getattr(resp, "status", 200) or 200)
@@ -83,21 +127,39 @@ def _matches_keywords(url: str, text: str, keywords: list[str]) -> bool:
     return any(k.lower() in haystack for k in keywords if k)
 
 
-def run(input_data):
-    base_url = str(
-        (input_data or {}).get("base_url")
-        or (input_data or {}).get("url")
-        or ""
-    ).strip()
+def run(input_data: dict) -> dict:
+    """Escanea subenlaces internos de un sitio y verifica cuáles responden 200.
+
+    Args:
+        input_data: Dict con claves:
+            base_url (str): URL a escanear.
+            max_links (int, opcional): Máx enlaces a verificar (default 20).
+            keywords (list|str, opcional): Filtro por palabras clave.
+                Si es None o vacío, devuelve todos los enlaces válidos.
+
+    Returns:
+        Dict con ok, base_url, valid (lista url+text+status), broken_sample.
+    """
+    data = input_data or {}
+    base_url = str(data.get("base_url") or data.get("url") or "").strip()
     if not base_url:
         return {"ok": False, "error": "Falta base_url"}
     if not re.match(r"^https?://", base_url, re.I):
         base_url = "https://" + base_url
 
-    raw_keywords = (input_data or {}).get("keywords")
+    try:
+        max_links = int(data.get("max_links") or 20)
+    except (TypeError, ValueError):
+        max_links = 20
+
+    raw_keywords = data.get("keywords") or data.get("filter_keywords")
     keywords: list[str] = []
     if isinstance(raw_keywords, str) and raw_keywords.strip():
-        keywords = [p.strip() for p in re.split(r"[,;|]", raw_keywords) if p.strip()]
+        keywords = [
+            p.strip()
+            for p in re.split(r"[,;|]", raw_keywords)
+            if p.strip()
+        ]
     elif isinstance(raw_keywords, list):
         keywords = [str(k).strip() for k in raw_keywords if str(k).strip()]
 
@@ -105,38 +167,44 @@ def run(input_data):
     if not parsed_base.netloc:
         return {"ok": False, "error": f"URL inválida: {base_url}"}
 
-    status = _http_status(base_url)
+    status, html, final_url = _http_get(base_url)
     if status != 200:
         return {
             "ok": False,
             "error": f"La URL base no respondió 200 (status={status})",
             "base_url": base_url,
         }
-
-    req = Request(base_url, headers={"User-Agent": USER_AGENT})
-    try:
-        with urlopen(req, timeout=DEFAULT_TIMEOUT) as resp:  # noqa: S310
-            html = resp.read().decode("utf-8", errors="replace")
-            final_url = resp.geturl() or base_url
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": f"No pude leer el HTML: {exc}", "base_url": base_url}
+    if not html:
+        return {
+            "ok": False,
+            "error": "La URL base no devolvió HTML",
+            "base_url": final_url,
+        }
 
     parser = _HrefParser()
     try:
         parser.feed(html)
-    except Exception:
+    except Exception:  # noqa: BLE001
         pass
 
-    base_netloc = urlparse(final_url).netloc
+    base_root = _root_domain(urlparse(final_url).netloc)
     seen: set[str] = set()
-    candidates: list[dict[str, str]] = []
+    candidates: list[dict] = []
+
     for href, text in parser.links:
-        if not href or href.startswith("#") or href.lower().startswith("javascript:"):
+        if not href:
             continue
-        if href.lower().startswith("mailto:"):
+        if href.startswith("#"):
+            continue
+        lower = href.lower()
+        if lower.startswith(("javascript:", "mailto:", "tel:")):
             continue
         absolute = urljoin(final_url, href)
-        if not _is_internal(absolute, base_netloc):
+        # Descartar fragment-only tras join
+        absolute = absolute.split("#")[0]
+        if not absolute:
+            continue
+        if not _is_internal(absolute, base_root):
             continue
         if not _matches_keywords(absolute, text, keywords):
             continue
@@ -148,7 +216,11 @@ def run(input_data):
 
     valid: list[dict] = []
     broken: list[dict] = []
-    for item in candidates[:MAX_LINKS_TO_CHECK]:
+    cap = max(1, max_links) * 3  # revisar hasta 3x para tener margen
+
+    for item in candidates[:cap]:
+        if len(valid) >= max_links:
+            break
         code = _http_status(item["url"])
         if code == 200:
             valid.append({**item, "status": 200})
@@ -159,10 +231,11 @@ def run(input_data):
         "ok": True,
         "base_url": final_url,
         "keywords": keywords,
-        "checked": min(len(candidates), MAX_LINKS_TO_CHECK),
+        "max_links": max_links,
+        "candidates_found": len(candidates),
         "valid_count": len(valid),
         "broken_count": len(broken),
         "valid_urls": [v["url"] for v in valid],
         "valid": valid,
-        "broken_sample": broken[:15],
+        "broken_sample": broken[:10],
     }
