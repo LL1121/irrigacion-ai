@@ -10,7 +10,6 @@ import logging
 import re
 from typing import Any
 
-from app.services.skill_http import extract_urls
 from app.services.skill_marketplace import (
     has_actionable_remote_task,
     is_telemetria_request,
@@ -199,15 +198,6 @@ def remote_skill_rejection_reason(
 
     if _STUB_SUCCESS_RE.search(code_str) and not has_fetch:
         return "stub_download_code"
-
-    needs_http = bool(extract_urls(task)) or bool(
-        re.search(
-            r"http|https|www\.|web|api|telemetr|url|consult|entrar|scrap|fetch",
-            task_l,
-        )
-    )
-    if needs_http and not has_fetch:
-        return "missing_fetch_url"
 
     if not has_fetch:
         if re.search(
