@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     code_model_api_key: str = ""
     code_model_base_url: str = ""
 
+    # Auditoría Gemini de skills: True = activa (default), False = solo análisis estático.
+    skill_audit_gemini_enabled: bool = True
+
     # Gemini (OCR, embeddings y centinela de skills)
     gemini_api_key: str = ""
     gemini_model: str = "gemini-flash-latest"

@@ -179,6 +179,22 @@ async def audit_skill_code(code_str: str) -> dict[str, Any]:
         return _local_malice_result(list(caps.get("malice_findings") or []))
 
     settings = get_settings()
+
+    # Auditoría Gemini desactivada: solo análisis estático, aprobación directa.
+    if not settings.skill_audit_gemini_enabled:
+        logger.info(
+            "Auditoría Gemini desactivada (SKILL_AUDIT_GEMINI_ENABLED=false)."
+        )
+        return _with_capabilities(
+            {
+                "is_safe": True,
+                "risk_score": 0,
+                "reason": "Auditoría Gemini desactivada; análisis estático OK.",
+                "malicious": False,
+            },
+            caps,
+        )
+
     if not settings.gemini_api_key or settings.gemini_api_key.strip() in {
         "",
         "tu_api_key_de_gemini",
