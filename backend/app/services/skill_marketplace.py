@@ -4,9 +4,16 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 from langchain_core.tools import tool
+
+_SKILLS_DIR = Path(__file__).resolve().parents[1] / "skills"
+
+
+def _load_skill_code(filename: str) -> str:
+    return (_SKILLS_DIR / filename).read_text(encoding="utf-8")
 
 SkillRecord = dict[str, Any]
 
@@ -371,6 +378,30 @@ CATALOG: list[SkillRecord] = [
         ],
         "code": _SKILL_DOCX.strip(),
     },
+    {
+        "id": "crawl_domain_links",
+        "name": "Crawler de subenlaces del sitio",
+        "description": (
+            "Escanea un sitio web y extrae todos los subenlaces válidos y páginas "
+            "internas (HTML y PDFs) descartando enlaces rotos 404."
+        ),
+        "tags": [
+            "crawler",
+            "crawl",
+            "escanear",
+            "escanea",
+            "subenlaces",
+            "enlaces",
+            "links",
+            "href",
+            "sitio",
+            "mapear",
+            "scraping",
+            "pdf",
+            "normativa",
+        ],
+        "code": _load_skill_code("crawl_domain_links.py"),
+    },
 ]
 
 
@@ -436,6 +467,20 @@ _SKILL_KEYWORDS: dict[str, tuple[str, ...]] = {
         "armá",
         "escribime",
         "escribí",
+    ),
+    "crawl_domain_links": (
+        "escanear",
+        "escanea",
+        "crawler",
+        "crawl",
+        "subenlaces",
+        "subenlace",
+        "mapear sitio",
+        "mapear el sitio",
+        "buscar subenlaces",
+        "enlaces válidos",
+        "enlaces validos",
+        "href",
     ),
 }
 
@@ -519,9 +564,57 @@ def looks_like_web_or_external_request(text: str) -> bool:
     # Réplicas al hilo ("en la página dice X") no son un pedido web nuevo.
     if is_result_challenge_or_correction(text):
         return False
+    if is_site_crawl_request(text):
+        return False
     if contains_url(lowered):
         return True
     return any(hint in lowered for hint in _WEB_OR_EXTERNAL_HINTS)
+
+
+_CRAWL_INTENT_RE = re.compile(
+    r"(?:"
+    r"escan(?:ear|[eé]a)\s+(?:todos\s+los\s+)?(?:sub)?enlaces"
+    r"|(?:sub)?enlaces\s+v[aá]lidos"
+    r"|crawler?"
+    r"|crawl(?:ear)?"
+    r"|mapear\s+(?:el\s+)?sitio"
+    r"|buscar\s+subenlaces"
+    r"|listar\s+(?:los\s+)?(?:links|enlaces|href)"
+    r")",
+    re.I,
+)
+
+_SKILL_SEARCH_INTENT_RE = re.compile(
+    r"(?:buscar|crear|generar|descargar|buscar/crear)\s+(?:una\s+)?skill"
+    r"|search_skill_marketplace",
+    re.I,
+)
+
+_TELEMETRY_INTENT_RE = re.compile(
+    r"\b(?:"
+    r"telemetr[ií]a"
+    r"|sensor(?:es)?"
+    r"|estaci[oó]n(?:es)?"
+    r"|nivel\s+de\s+r[ií]o"
+    r"|dato-medicions"
+    r"|fulldto"
+    r"|altura\s+(?:del|en\s+el)\s+punto"
+    r"|caudal\s+(?:del|en\s+el)\s+punto"
+    r")\b",
+    re.I,
+)
+
+
+def is_site_crawl_request(text: str) -> bool:
+    """Pedido de mapear/escanear un sitio; no es consulta de telemetría."""
+    blob = (text or "").strip()
+    if not blob:
+        return False
+    return bool(_CRAWL_INTENT_RE.search(blob))
+
+
+def wants_skill_marketplace(text: str) -> bool:
+    return bool(_SKILL_SEARCH_INTENT_RE.search(text or ""))
 
 
 def is_result_challenge_or_correction(text: str) -> bool:
@@ -581,6 +674,8 @@ def is_casual_chat(
     if detect_google_intent(blob) is not None:
         return False
     if should_try_skill_marketplace(blob):
+        return False
+    if is_site_crawl_request(blob) or wants_skill_marketplace(blob):
         return False
     if looks_like_web_or_external_request(blob) or contains_url(blob):
         return False
@@ -914,10 +1009,16 @@ def ask_inputs_for_open_task(
 def missing_web_clarify_fields(context_text: str) -> list[str]:
     """Qué falta preguntar para un pedido web, según el hilo completo."""
     probe = context_text or ""
+    if is_site_crawl_request(probe):
+        return [] if contains_url(probe) else ["url"]
     missing: list[str] = []
     args = extract_web_skill_args(probe)
     lowered = probe.lower()
     has_url = contains_url(probe) or is_telemetria_request(probe)
+    if not is_telemetria_request(probe):
+        if not has_url:
+            missing.append("url")
+        return missing
     has_target = bool(args.get("punto"))
     wants_metric = any(
         k in lowered
@@ -1004,6 +1105,8 @@ def should_try_skill_marketplace(text: str, assistant_reply: str | None = None) 
     lowered = (text or "").lower()
     if not lowered.strip():
         return False
+    if is_site_crawl_request(text) or wants_skill_marketplace(text):
+        return True
 
     if re.search(
         r"\b(?:skills?|habilidades?|herramientas?|scripts?)\b.{0,40}"
@@ -1067,6 +1170,8 @@ def is_action_request(text: str) -> bool:
     lowered = (text or "").lower().strip()
     if not lowered:
         return False
+    if is_site_crawl_request(text) or wants_skill_marketplace(text):
+        return True
     if looks_like_web_or_external_request(text):
         return True
     if should_try_skill_marketplace(text):
@@ -1188,7 +1293,7 @@ def find_local_skill(task: str, arguments: dict[str, Any] | None = None) -> dict
         {"id": s["id"], "name": s["name"], "description": s["description"]}
         for s in CATALOG
     ]
-    if looks_like_web_or_external_request(task):
+    if looks_like_web_or_external_request(task) and not is_site_crawl_request(task):
         return {"found": False, "query": task, "available": available, "reason": "web_request"}
 
     ranked = rank_catalog_skills(task)
@@ -1254,6 +1359,10 @@ def missing_fields_for_skill(skill_id: str, args: dict[str, Any]) -> list[str]:
             if not isinstance(partes, list) or not partes:
                 missing.append(key)
             continue
+        if key in {"base_url", "url"}:
+            if not str(args.get("base_url") or args.get("url") or "").strip():
+                missing.append("base_url")
+            continue
         if not _numeric_ready(args.get(key)):
             missing.append(key)
     if skill_id == "lamina_riego":
@@ -1284,6 +1393,17 @@ def skill_missing_required_inputs(
     skill_id = str(skill.get("id") or "")
     if skill_id == "generar_documento_word":
         return []
+    if skill_id == "crawl_domain_links":
+        probe = f"{context_text or ''}\n{user_message or ''}".strip()
+        if not str(args.get("base_url") or args.get("url") or "").strip() and contains_url(
+            probe
+        ):
+            from app.services.skill_http import extract_urls
+
+            urls = extract_urls(probe)
+            if urls:
+                args["base_url"] = urls[0]
+                args["url"] = urls[0]
     missing = missing_fields_for_skill(skill_id, args)
     if missing:
         return missing
@@ -1447,6 +1567,15 @@ def resolve_skill_decision(
         r"|busc(?:á|a|ar).{0,40}skill",
         lowered,
     ):
+        if is_site_crawl_request(context):
+            found_crawl = find_local_skill(context, arguments)
+            if found_crawl.get("found") and found_crawl.get("id") == "crawl_domain_links":
+                return {
+                    "action": "execute",
+                    "confidence": 0.9,
+                    "skill": found_crawl,
+                    "reason": "crawl_after_skill_confirm",
+                }
         effective = resolve_effective_remote_task(text, context)
         if has_actionable_remote_task(effective):
             return {
@@ -1466,10 +1595,41 @@ def resolve_skill_decision(
             "reason": "download_confirm_without_task",
         }
 
+    if is_site_crawl_request(text) or is_site_crawl_request(context):
+        found_crawl = find_local_skill(text if is_site_crawl_request(text) else context, arguments)
+        if not found_crawl.get("found"):
+            found_crawl = find_local_skill(
+                "escanear subenlaces crawler " + (text or context),
+                arguments,
+            )
+        if found_crawl.get("found"):
+            args = dict(found_crawl.get("arguments") or {})
+            missing = missing_fields_for_skill(str(found_crawl.get("id") or ""), args)
+            if missing:
+                return {
+                    "action": "clarify",
+                    "confidence": 0.7,
+                    "skill": found_crawl,
+                    "missing": missing,
+                    "reply": clarifying_question_for_skill(found_crawl, missing),
+                    "reason": "crawl_missing_url",
+                }
+            return {
+                "action": "execute",
+                "confidence": 0.92,
+                "skill": found_crawl,
+                "reason": "local_crawl_skill",
+            }
+        return {
+            "action": "download",
+            "confidence": 0.75,
+            "reason": "crawl_no_local_fallback",
+        }
+
     # Solo una URL (o URL + poco texto) después de pedir datos: usar contexto.
     if contains_url(text) and len(_tokenize(text)) <= 6:
         ctx_args = extract_web_skill_args(context)
-        if ctx_args.get("punto") or any(
+        if is_telemetria_request(context) or ctx_args.get("punto") or any(
             k in context.lower()
             for k in ("altura", "caudal", "telemetr", "nivel", "medición", "medicion")
         ):
@@ -1725,7 +1885,11 @@ def is_telemetria_request(text: str) -> bool:
     lowered = (text or "").lower()
     if not lowered.strip():
         return False
-    if "telemetr" in lowered or "dato-medicions" in lowered or "fulldto" in lowered:
+    if is_site_crawl_request(text):
+        return False
+    if _TELEMETRY_INTENT_RE.search(lowered):
+        return True
+    if "dato-medicions" in lowered or "fulldto" in lowered:
         return True
     return any("telemetr" in u.lower() for u in extract_urls(text))
 
@@ -1746,7 +1910,7 @@ def extract_web_skill_args(text: str) -> dict[str, Any]:
     )
     if punto:
         args["punto"] = punto.group(1)
-    elif re.search(r"\b\d{4,6}\b", text or ""):
+    elif is_telemetria_request(text) and re.search(r"\b\d{4,6}\b", text or ""):
         # Evitar tomar años tipo 2026 si hay contexto de telemetría/URL.
         candidates = re.findall(r"\b(\d{4,6})\b", text or "")
         for cand in candidates:
@@ -1863,6 +2027,20 @@ def infer_arguments(skill_id: str, user_message: str) -> dict[str, Any]:
         # No copiar el pedido del usuario como "contenido": eso se redacta en
         # prepare_docx_arguments() con el LLM.
         args["pedido"] = text
+    elif skill_id == "crawl_domain_links":
+        from app.services.skill_http import extract_urls
+
+        urls = extract_urls(text)
+        if urls:
+            args["base_url"] = urls[0]
+            args["url"] = urls[0]
+        keys = [
+            k
+            for k in ("normativa", "resolucion", "resolución", "ley", "institucional", "pdf")
+            if k in lowered
+        ]
+        if keys:
+            args["keywords"] = keys
     return args
 
 
@@ -1876,6 +2054,11 @@ def enrich_skill_arguments(skill: dict[str, Any], user_message: str) -> dict[str
         if not merged.get("titulo") and not merged.get("title"):
             merged["titulo"] = "Documento Irrigación"
         merged["pedido"] = user_message
+    if skill_id == "crawl_domain_links":
+        if not merged.get("base_url") and merged.get("url"):
+            merged["base_url"] = merged["url"]
+        if not merged.get("url") and merged.get("base_url"):
+            merged["url"] = merged["base_url"]
     return merged
 
 
@@ -2043,6 +2226,14 @@ SKILL_ARG_SCHEMAS: dict[str, dict[str, Any]] = {
         "required": ["volumen_m3"],
         "notes": "Debe haber caudal_ls o caudal_m3s.",
     },
+    "crawl_domain_links": {
+        "fields": {
+            "base_url": "URL del sitio a escanear (ej. https://www.irrigacion.gov.ar/web/)",
+            "keywords": "Filtros opcionales (normativa, resolucion, ley, institucional, pdf)",
+        },
+        "required": ["base_url"],
+        "notes": "No es telemetría: no pidas código de estación. Solo la URL base.",
+    },
 }
 
 
@@ -2066,6 +2257,10 @@ def _args_complete_for_skill(skill_id: str, args: dict[str, Any]) -> bool:
         if key == "partes":
             partes = args.get("partes") or args.get("derechos")
             if not isinstance(partes, list) or not partes:
+                return False
+            continue
+        if key in {"base_url", "url"}:
+            if not str(args.get("base_url") or args.get("url") or "").strip():
                 return False
             continue
         if not _numeric_ready(args.get(key)):

@@ -10,10 +10,12 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-import docker
-from docker.errors import ContainerError, DockerException, ImageNotFound
-
 from app.core.config import get_settings
+from app.services.codeact_observe import (
+    codeact_execution_failed,
+    codeact_retryable,
+    format_codeact_observation,
+)
 from app.services.sentinel import audit_skill_code, scan_skill_capabilities
 
 logger = logging.getLogger(__name__)
@@ -74,12 +76,27 @@ def _write_workspace(code_str: str, input_data: dict) -> Path:
     return work
 
 
+CODEACT_TEMPLATE = '''\
+import traceback
+import sys
+
+try:
+{indented_code}
+except Exception:
+    traceback.print_exc()
+    sys.exit(1)
+'''
+
+
 def sandbox_network_mode(allow_network: bool) -> str:
     """Salida a internet solo si el usuario autorizó el permiso de red."""
     return "bridge" if allow_network else "none"
 
 
 def _run_container(work: Path, *, allow_network: bool = False) -> dict[str, Any]:
+    import docker
+    from docker.errors import ContainerError, DockerException, ImageNotFound
+
     settings = get_settings()
     client = docker.from_env()
     image = settings.skill_sandbox_image
@@ -244,6 +261,144 @@ def _run_async(factory):
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         return pool.submit(lambda: asyncio.run(factory())).result()
+
+
+def _write_codeact_workspace(code_str: str) -> Path:
+    settings = get_settings()
+    base = Path(settings.skill_workspace_dir)
+    base.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix="irrigacion_codeact_", dir=str(base)))
+    work.chmod(0o755)
+    runner = CODEACT_TEMPLATE.replace("{indented_code}", _indent_skill(code_str))
+    runner_path = work / "runner.py"
+    runner_path.write_text(runner, encoding="utf-8")
+    runner_path.chmod(0o644)
+    return work
+
+
+def _run_inline_script(code_str: str) -> dict[str, Any]:
+    """Ejecuta un script Python en el proceso API (modo inline)."""
+    import contextlib
+    import io
+    import traceback
+
+    from app.services.skill_http import build_fetch_url
+
+    stdout_buf = io.StringIO()
+    stderr_buf = io.StringIO()
+    namespace: dict[str, Any] = {
+        "__name__": "__main__",
+        "fetch_url": build_fetch_url(extra_allowed_urls=[]),
+    }
+    try:
+        with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(stderr_buf):
+            exec(compile(code_str, "<codeact>", "exec"), namespace)  # noqa: S102
+        return {
+            "executed": True,
+            "exit_code": 0,
+            "stdout": stdout_buf.getvalue(),
+            "stderr": stderr_buf.getvalue(),
+            "error": None,
+            "mode": "inline",
+        }
+    except Exception as exc:
+        stderr_buf.write(traceback.format_exc())
+        return {
+            "executed": True,
+            "exit_code": 1,
+            "stdout": stdout_buf.getvalue(),
+            "stderr": stderr_buf.getvalue(),
+            "error": str(exc),
+            "mode": "inline",
+        }
+
+
+_CODEACT_SANDBOX_HINTS = (
+    "pandas",
+    "numpy",
+    "bs4",
+    "beautifulsoup",
+    "lxml",
+    "openpyxl",
+    "httpx",
+    "docx",
+    "requests",
+    "urllib",
+)
+
+
+def _codeact_prefer_sandbox(code_str: str, needs_network: bool) -> bool:
+    settings = get_settings()
+    mode = (settings.skill_execution_mode or "inline").strip().lower()
+    if mode == "sandbox":
+        return True
+    if needs_network:
+        return True
+    lowered = (code_str or "").lower()
+    return any(hint in lowered for hint in _CODEACT_SANDBOX_HINTS)
+
+
+async def execute_python_script(code_str: str) -> dict[str, Any]:
+    """Audita un snippet CodeAct y lo corre en sandbox (o inline si no hay imagen).
+
+    A diferencia de execute_skill: no hay HITL de red ni whitelist. Si Gemini
+    marca el código como seguro y usa red, el contenedor sale con --network bridge.
+    """
+    source = (code_str or "").strip()
+    caps = scan_skill_capabilities(source)
+    if caps.get("malicious"):
+        audit = {
+            "is_safe": False,
+            "risk_score": 10,
+            "reason": "Bloqueo local (centinela): "
+            + "; ".join(caps.get("malice_findings") or ["código inseguro"]),
+            "malicious": True,
+            "needs_network": False,
+            "network_capabilities": [],
+            "audit_unavailable": False,
+        }
+        return {"status": "rejected", "audit": audit, "execution": None}
+
+    audit = await audit_skill_code(source)
+    if audit.get("audit_unavailable"):
+        return {"status": "audit_unavailable", "audit": audit, "execution": None}
+    if audit.get("malicious") or not audit.get("is_safe"):
+        return {"status": "rejected", "audit": audit, "execution": None}
+
+    needs_net = bool(audit.get("needs_network") or caps.get("needs_network"))
+    allow_network = bool(needs_net)
+    use_sandbox = _codeact_prefer_sandbox(source, needs_net)
+
+    if use_sandbox:
+        work: Path | None = None
+        try:
+            work = await asyncio.to_thread(_write_codeact_workspace, source)
+            execution = await asyncio.to_thread(
+                _run_container, work, allow_network=allow_network
+            )
+            if isinstance(execution, dict):
+                execution = {**execution, "mode": "sandbox"}
+            return {
+                "status": "executed",
+                "audit": audit,
+                "execution": execution,
+            }
+        except RuntimeError as exc:
+            logger.warning("Sandbox CodeAct no disponible, caigo a inline: %s", exc)
+        finally:
+            if work is not None and work.exists():
+                shutil.rmtree(work, ignore_errors=True)
+
+    execution = await asyncio.to_thread(_run_inline_script, source)
+    return {
+        "status": "executed",
+        "audit": audit,
+        "execution": execution,
+    }
+
+
+def execute_python_script_sync(code_str: str) -> dict[str, Any]:
+    return _run_async(lambda: execute_python_script(code_str))
 
 
 def execute_skill_sync(

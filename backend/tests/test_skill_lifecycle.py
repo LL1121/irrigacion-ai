@@ -183,5 +183,69 @@ class SandboxNetworkFlagTests(unittest.TestCase):
         self.assertEqual(result["status"], "audit_unavailable")
 
 
+class CrawlDomainLinksTests(unittest.TestCase):
+    def test_crawler_pide_permiso_de_red(self):
+        from app.skills.crawl_domain_links import __doc__ as _doc
+        from pathlib import Path
+
+        code = (
+            Path(__file__).resolve().parents[1]
+            / "app"
+            / "skills"
+            / "crawl_domain_links.py"
+        ).read_text(encoding="utf-8")
+        caps = scan_skill_capabilities(code)
+        self.assertFalse(caps["malicious"])
+        self.assertTrue(caps["needs_network"])
+        self.assertIn("crawler", (_doc or "").lower())
+
+    def test_crawler_lista_internos_200_y_descarta_404(self):
+        from app.skills.crawl_domain_links import run
+        from io import BytesIO
+        from urllib.error import HTTPError
+
+        html = b"""
+        <html><body>
+          <a href="/normativa/ley.pdf">Ley</a>
+          <a href="/roto">Roto</a>
+          <a href="https://externo.example/x">Externo</a>
+        </body></html>
+        """
+
+        class _Resp:
+            def __init__(self, data, url, status=200):
+                self._data = data
+                self._url = url
+                self.status = status
+
+            def read(self):
+                return self._data
+
+            def geturl(self):
+                return self._url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def fake_urlopen(req, timeout=8):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            if url.rstrip("/") == "https://www.irrigacion.gov.ar/web" or url.endswith("/web/"):
+                return _Resp(html, "https://www.irrigacion.gov.ar/web/")
+            if "ley.pdf" in url:
+                return _Resp(b"%PDF", url, 200)
+            err = HTTPError(url, 404, "Not Found", hdrs=None, fp=BytesIO())
+            raise err
+
+        with patch("app.skills.crawl_domain_links.urlopen", side_effect=fake_urlopen):
+            result = run({"base_url": "https://www.irrigacion.gov.ar/web/"})
+        self.assertTrue(result["ok"])
+        urls = " ".join(result.get("valid_urls") or [])
+        self.assertIn("ley.pdf", urls)
+        self.assertNotIn("/roto", urls)
+
+
 if __name__ == "__main__":
     unittest.main()

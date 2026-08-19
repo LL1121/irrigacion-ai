@@ -9,6 +9,7 @@ from app.services.skill_marketplace import (
     has_actionable_remote_task,
     is_download_confirmation_only,
     is_result_challenge_or_correction,
+    is_telemetria_request,
     looks_like_web_or_external_request,
     resolve_effective_remote_task,
     resolve_skill_decision,
@@ -151,6 +152,57 @@ class RemoteSkillGuardTests(unittest.TestCase):
             context_text=ctx,
         )
         self.assertEqual(d["action"], "download")
+
+
+    def test_crawl_url_no_es_telemetria(self):
+        from app.services.skill_marketplace import (
+            is_site_crawl_request,
+            is_telemetria_request,
+            find_local_skill,
+            skill_missing_required_inputs,
+        )
+
+        msg = (
+            "escanear todos los subenlaces válidos del sitio "
+            "https://www.irrigacion.gov.ar/web/"
+        )
+        self.assertTrue(is_site_crawl_request(msg))
+        self.assertFalse(is_telemetria_request(msg))
+        self.assertFalse(looks_like_web_or_external_request(msg))
+        found = find_local_skill(msg)
+        self.assertTrue(found.get("found"), found)
+        self.assertEqual(found.get("id"), "crawl_domain_links")
+        d = resolve_skill_decision(msg)
+        self.assertEqual(d["action"], "execute")
+        self.assertEqual((d.get("skill") or {}).get("id"), "crawl_domain_links")
+        reply = (d.get("reply") or "").lower()
+        self.assertNotIn("estación", reply)
+        self.assertNotIn("estacion", reply)
+        self.assertNotIn("punto", reply)
+        self.assertEqual(
+            skill_missing_required_inputs(
+                d["skill"],
+                d["skill"].get("arguments") or {},
+                user_message=msg,
+            ),
+            [],
+        )
+
+    def test_irrigacion_gov_sin_telemetria_no_pide_punto(self):
+        from app.services.skill_marketplace import clarifying_question_for_unknown
+
+        msg = "mirá este comunicado https://www.irrigacion.gov.ar/web/"
+        self.assertFalse(is_telemetria_request(msg))
+        reply = clarifying_question_for_unknown(msg, context_text=msg)
+        self.assertNotIn("punto/estación", reply.lower())
+        self.assertNotIn("código de punto", reply.lower())
+
+    def test_telemetria_explicita_sigue_pidiendo_punto(self):
+        from app.services.skill_marketplace import clarifying_question_for_unknown
+
+        probe = "necesito la telemetría de la estación, altura del sensor"
+        reply = clarifying_question_for_unknown(probe, context_text=probe)
+        self.assertIn("punto", reply.lower())
 
 
 if __name__ == "__main__":

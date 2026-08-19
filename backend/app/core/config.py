@@ -25,6 +25,11 @@ class Settings(BaseSettings):
     groq_base_url: str = "https://api.groq.com/openai/v1"
     chat_model: str = "openai/gpt-oss-120b"
 
+    # Modelo especializado para generación de skills (CODE_MODEL_*)
+    # Si vacío → se usa groq_api_key/groq_base_url como fallback.
+    code_model_api_key: str = ""
+    code_model_base_url: str = ""
+
     # Gemini (OCR, embeddings y centinela de skills)
     gemini_api_key: str = ""
     gemini_model: str = "gemini-flash-latest"

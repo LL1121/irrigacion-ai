@@ -43,7 +43,6 @@ from app.services.command_router import (
 )
 from app.services.order_parse import (
     extract_order_parts,
-    looks_like_do_task,
     merge_args_with_order,
     OrderParts,
 )
@@ -67,7 +66,13 @@ from app.services.response_normalize import (
     normalize_assistant_reply,
     unwrap_result,
 )
-from app.services.sandbox import evaluate_skill_audit_sync, execute_skill_sync
+from app.services.sandbox import (
+    codeact_retryable,
+    evaluate_skill_audit_sync,
+    execute_python_script_sync,
+    execute_skill_sync,
+    format_codeact_observation,
+)
 from app.services.skill_staging import (
     APPROVAL_KIND_NETWORK,
     AUDIT_RETRY_PROMPT,
@@ -85,24 +90,15 @@ from app.services.skill_staging import (
 from app.services.skill_marketplace import (
     APPROVAL_KIND_DOWNLOAD,
     APPROVAL_KIND_EXECUTE,
-    ask_inputs_for_open_task,
     conversation_context_text,
     detect_response_style,
-    is_casual_chat,
     download_remote_prompt,
     extract_open_task,
-    find_local_skill,
-    is_action_request,
-    is_asking_for_needed_data,
     is_context_switch,
     is_result_challenge_or_correction,
-    looks_like_skill_intent,
-    looks_like_web_or_external_request,
     clarifying_question_for_skill,
     prepare_skill_arguments,
-    reply_is_capability_refusal,
     resolve_skill_decision,
-    search_catalog,
     skill_missing_required_inputs,
     thread_brief_for_prompt,
 )
@@ -116,7 +112,6 @@ from app.services.official_ingest import ingest_official_url_record
 from app.services.llm_roles import chat_llm
 from app.services.thread_memory import (
     load_thread_state,
-    open_task_from_state,
     recent_history_for_llm,
     schedule_refresh,
 )
@@ -161,6 +156,29 @@ def ingest_official_url(url: str, title: str) -> str:
         db.close()
 
 
+@tool
+def execute_python_code(code: str, reason: str) -> str:
+    """Ejecutá un script Python en el sandbox seguro (auditoría Gemini + Docker).
+
+    Usala para tareas técnicas ad-hoc: scraping, crawlers, cálculos, parseo de
+    datos, tests de red o generación de archivos, cuando no hay una skill de
+    catálogo específica. El grafo corre el código y te devuelve stdout/stderr.
+    """
+    return json.dumps(
+        {"code": code or "", "reason": reason or ""},
+        ensure_ascii=False,
+    )
+
+
+CODEACT_MAX_ATTEMPTS = 3
+
+CODEACT_NUDGE = (
+    "No hay skill de catálogo para esa tarea (y no vamos a pedir código de "
+    "estación ni descargar una skill remota). Escribí el script Python y llamá "
+    "execute_python_code(code, reason). No le pidas datos absurdos al usuario "
+    "ni digas que no podés."
+)
+
 SYSTEM_PROMPT_IRRIGACION = f"""
 {CORE_IRRIGATION_KNOWLEDGE}
 
@@ -197,8 +215,11 @@ Mismo registro que el usuario (rioplatense si habla así; más formal si viene f
 ### NIVELES DE HERRAMIENTAS Y PERMISOS:
 - Operás con permisos de nivel ADMINISTRATIVO ALTO.
 - Mail / Gmail / Calendar / Drive → tool `use_google` (nunca una skill para un mail).
-- Word, Excel, red, cálculos, scraping, automatizaciones → `search_skill_marketplace`
-  (scripts Python del sandbox / marketplace interno).
+- Skills de catálogo (caudal, prorrateo, lámina, Word institucional) →
+  `search_skill_marketplace` primero. Si hay match local → ejecuta; si no hay →
+  el sistema gestiona la descarga/generación automáticamente (HITL Nivel 2).
+- Tareas puntuales ad-hoc (análisis de datos, cálculos, crawling sin persistencia) →
+  `execute_python_code` directo (Nivel 3 / CodeAct).
 - Guardar nota tipada → solo si pidió explícito anotar/recordar (`save_user_context`).
 - Indexar resolución/comunicado oficial desde URL → `ingest_official_url`.
 
@@ -206,10 +227,16 @@ Mismo registro que el usuario (rioplatense si habla así; más formal si viene f
 1. **Concepto de Skill:** "skill", "herramienta" o "script" = extensiones Python del
    Sandbox Docker / marketplace interno. Prohibido mencionar Amazon Alexa, Google Assistant,
    Siri, Cortana u otros asistentes de voz.
-2. **Proactividad (prohibido rendirse):** Si pide una tarea técnica o automatización
-   (Word/Excel, test de red, conversiones, scraping, cálculos) y no tenés tool nativa:
-   - NUNCA digas "como modelo de lenguaje no puedo…".
-   - Invocá ya `search_skill_marketplace` con las palabras clave de la tarea.
+2. **Pipeline de resolución (3 niveles):**
+   - Nivel 1 — catálogo local: `search_skill_marketplace`. Si hay skill → HITL ejecución.
+   - Nivel 2 — generación remota: si no hay skill local el sistema genera una nueva
+     con aprobación del usuario (HITL descarga). No necesitás hacer nada extra.
+   - Nivel 3 — CodeAct: `execute_python_code` para tareas puntuales de análisis/cálculo
+     sin necesidad de persistir la skill. Usalo directamente para tareas ad-hoc.
+3. **Proactividad (prohibido rendirse):** NUNCA digas "como modelo de lenguaje no puedo…".
+   Si el script falla, analizá el error, corregí el código y volvé a llamar
+   `execute_python_code` (máximo 3 intentos). No le pases el traceback al usuario:
+   entregá el resultado o una explicación humana.
 """.strip()
 
 VOICE_HINT = (
@@ -218,32 +245,25 @@ VOICE_HINT = (
     "ni personaje (finde, anécdotas, chistes que no pegan)."
 )
 
-CASUAL_SYSTEM = """
-Este turno es charla, no una orden. Hablá como un asistente de chat
-cálido (ChatGPT, Gemini): natural, breve, mismo registro que el usuario.
-
-- Respondé al último mensaje (1-3 líneas). Sin receta fija.
-- Si te saludan o preguntan cómo estás, devolvé el saludo con calidez
-  (ej. “todo bien, ¿qué se ofrece?”). Nada de “¿en qué puedo ayudarte?”.
-- Si te piden que expliques algo que dijiste, explicalo. No improvises otra bit.
-- No inventes biografía ni humor que no viene a cuento.
-- No expliques que no hay tarea, que estás funcionando, ni listes capacidades.
-""".strip()
-
 NATIVE_TOOLS_HINT = (
     "Si el mensaje es charla, NO uses tools: contestá como persona. "
     "Si hay orden: cumplí TODA (qué, a quién, cuándo, cómo). "
     "Horario ('en 5 minutos') → confirmalo, no lo hagas ahora. "
     "Mail/Gmail/Calendar/Drive → use_google. NUNCA una skill para un mail. "
     "save_user_context SOLO si pidió explícito guardar/anotar/recordar. "
-    "ingest_official_url SOLO si pidió indexar/cargar documentación oficial desde URL."
+    "ingest_official_url SOLO si pidió indexar/cargar documentación oficial desde URL. "
+    "Tarea puntual ad-hoc (análisis, cálculo, crawling, parseo sin persistencia) → "
+    "execute_python_code. No pidas datos de estación si no es telemetría."
 )
 
 SKILL_TOOLING_HINT = (
-    "Orden operativa (el system prompt ya define skills): "
-    "tarea técnica/automatizar → search_skill_marketplace YA; "
-    "si no hay local, descarga/generá (HITL). Nunca 'no puedo'. "
-    "Delay pedido → confirmalo. open_task vacío/'Ninguna' = sin trámite viejo."
+    "Jerarquía de resolución: "
+    "1) skill en catálogo local (caudal, prorrateo, lámina, Word) → search_skill_marketplace; "
+    "si no hay skill local, el sistema inicia HITL descarga automáticamente (no hagas nada más). "
+    "2) tarea puntual sin persistencia → execute_python_code. "
+    "Si el sandbox devolvió error, corregí el código y reintentá (máx 3 veces). "
+    "Nunca 'no puedo'. Delay pedido → confirmalo. "
+    "open_task vacío/'Ninguna' = sin trámite viejo. El historial manda, no plantillas."
 )
 
 # Alias retrocompatible: el resto del módulo referenciaba SYSTEM_PROMPT.
@@ -264,7 +284,9 @@ CATALOG_HINT = (
     "Catálogo de skills (buscar con search_skill_marketplace): "
     "Cálculo de caudal (Q = A·v); Conversión de unidades de caudal; "
     "Prorrateo de turno de riego; Lámina de riego; Tiempo de riego; "
-    "Generación de documento Word (.docx) con formato (títulos, listas, tablas)."
+    "Generación de documento Word (.docx); "
+    "Crawler de subenlaces (escanear un sitio y listar HTML/PDF válidos, sin 404). "
+    "Una URL institucional NO es telemetría salvo que pidan estación/sensor/nivel de río."
 )
 
 
@@ -292,6 +314,10 @@ class AgentState(TypedDict):
     thread_state: NotRequired[dict[str, Any]]
     allow_network: NotRequired[bool]
     retry_staged_audit: NotRequired[bool]
+    pending_codeact: NotRequired[dict[str, Any] | None]
+    codeact_observation: NotRequired[str | None]
+    codeact_attempts: NotRequired[int]
+    codeact_result: NotRequired[dict[str, Any] | None]
 
 
 @dataclass
@@ -606,7 +632,10 @@ def _annotate_plan_result(
         # HITL estricto: un solo mensaje = la tarjeta de autorización.
         # No mezclar prosa del LLM ni recaps largos en este turno.
         out["reply"] = ""
+        out.setdefault("pending_codeact", None)
         return out
+    if "pending_codeact" not in out:
+        out["pending_codeact"] = None
     chunks: list[str] = []
     if ack and ack.lower() not in reply.lower():
         chunks.append(ack)
@@ -673,22 +702,57 @@ def _apply_context_switch(
     return switched
 
 
+def _local_catalog_plan(
+    user_message: str,
+    *,
+    arguments: dict[str, Any] | None = None,
+    context_text: str | None = None,
+    thread_state: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Solo skills locales de catálogo. Nunca HITL de descarga ni telemetría forzada."""
+    decision = resolve_skill_decision(
+        user_message,
+        arguments,
+        context_text=context_text or user_message,
+        thread_state=thread_state,
+    )
+    action = decision.get("action")
+    skill = decision.get("skill") if isinstance(decision.get("skill"), dict) else {}
+    if action == "execute" and skill.get("found"):
+        return _plan_from_decision(
+            decision,
+            user_message=user_message,
+            context_text=context_text,
+        )
+    if action == "clarify" and skill.get("found"):
+        return _plan_from_decision(
+            decision,
+            user_message=user_message,
+            context_text=context_text,
+        )
+    return None
+
+
 def _force_skill_or_download(
     user_message: str,
     *,
     context_text: str | None = None,
     thread_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Resuelve skill con criterio estricto; si duda, pregunta."""
-    return _plan_from_decision(
-        resolve_skill_decision(
-            user_message,
-            context_text=context_text,
-            thread_state=thread_state,
-        ),
-        user_message=user_message,
+    """Compat: catálogo local o vacío (CodeAct lo resuelve el LLM)."""
+    local = _local_catalog_plan(
+        user_message,
         context_text=context_text,
+        thread_state=thread_state,
     )
+    if local:
+        return local
+    return {
+        "pending_skill": None,
+        "needs_approval": False,
+        "approval_kind": None,
+        "reply": "",
+    }
 
 
 def _plan_from_decision(
@@ -961,54 +1025,22 @@ def _plan_native_google(state: AgentState, db: Session, args: dict[str, Any]) ->
     return _plan_google_action(state, db, merged)
 
 
-def _plan_casual_chat(state: AgentState, parts: OrderParts) -> dict:
-    """Charla sin tools ni catálogo: un compañero, no un ticket."""
-    llm = _llm(tools=False, temperature=0.5)
-    thread_state = _thread_state(state)
-    history = state.get("history") or []
-    last_assistant = ""
-    for item in reversed(history):
-        if (item.get("role") or "").lower() in {"assistant", "ai"}:
-            last_assistant = (item.get("message") or "").strip()
-            if last_assistant:
-                break
-    focus = [
-        CASUAL_SYSTEM,
-        VOICE_HINT,
-        "Último mensaje del usuario (respondé a ESTO): "
-        + (state.get("user_message") or "").strip()[:400],
-    ]
-    if last_assistant:
-        focus.append(
-            "Tu mensaje anterior (si te lo cuestionan, explicalo; no improvises): "
-            + last_assistant[:280]
-        )
-    system = fit_system_prompt("\n".join(focus))
-    user_text = fit_user_message(state["user_message"])
-    history_msgs = _history_messages(history, thread_state)
-    try:
-        response = llm.invoke(
-            [
-                SystemMessage(content=system),
-                *history_msgs,
-                HumanMessage(content=user_text),
-            ]
-        )
-        reply = (getattr(response, "content", None) or "").strip()
-    except Exception:
-        logger.exception("Fallo el chat casual")
-        reply = ""
-    if not reply:
-        reply = "¡Hola! Todo bien, ¿y vos?"
-    return _annotate_plan_result(
-        {
-            "pending_skill": None,
-            "needs_approval": False,
-            "approval_kind": None,
-            "reply": reply,
+def _codeact_plan_from_call(call: Any) -> dict[str, Any] | None:
+    args = _tool_call_args(call)
+    code = str(args.get("code") or "").strip()
+    if not code:
+        return None
+    return {
+        "pending_codeact": {
+            "code": code,
+            "reason": str(args.get("reason") or "").strip(),
         },
-        parts,
-    )
+        "pending_skill": None,
+        "pending_google_tool": None,
+        "needs_approval": False,
+        "approval_kind": None,
+        "reply": "",
+    }
 
 
 def _plan_node(state: AgentState, db: Session) -> dict:
@@ -1027,32 +1059,9 @@ def _plan_node(state: AgentState, db: Session) -> dict:
         thread_state=_thread_state(state),
     )
     parts = extract_order_parts(state["user_message"], ctx)
-    if is_casual_chat(
-        state["user_message"],
-        history=state.get("history") or [],
-        context_text=ctx,
-        thread_state=thread_state,
-    ):
-        return _plan_casual_chat(state, parts)
     llm = _llm(tools=True)
-    if (
-        not switched
-        and is_asking_for_needed_data(state["user_message"])
-        and open_task_from_state(thread_state)
-    ):
-        return _annotate_plan_result(
-            {
-                "pending_skill": None,
-                "needs_approval": False,
-                "approval_kind": None,
-                "reply": ask_inputs_for_open_task(
-                    ctx,
-                    history=history,
-                    thread_state=thread_state,
-                ),
-            },
-            parts,
-        )
+    attempts = int(state.get("codeact_attempts") or 0)
+    observation = str(state.get("codeact_observation") or "").strip()
     system = fit_system_prompt(SYSTEM_PROMPT_IRRIGACION)
     native = fit_system_prompt(VOICE_HINT + "\n" + NATIVE_TOOLS_HINT)
     open_task = extract_open_task(
@@ -1067,14 +1076,14 @@ def _plan_node(state: AgentState, db: Session) -> dict:
             + "\nCAMBIO DE TAREA (obligatorio): "
             + open_task[:400]
             + "\nAbandoná lo anterior. No pidas datos de la tarea vieja. "
-            "Si no hay skill local, search_skill_marketplace / descarga."
+            "Si no hay skill de catálogo, execute_python_code."
         )
     elif open_task:
         tooling = fit_system_prompt(
             SKILL_TOOLING_HINT
-            + "\nTAREA ABIERTA (obligatorio continuar, no cambies de tema): "
+            + "\nTAREA ABIERTA (continuar si el usuario sigue en eso; "
+            "si plantea algo nuevo, cambiate): "
             + open_task[:400]
-            + "\nNo ofrezcas el catálogo de riego ni otra skill salvo que ESA sea la tarea."
         )
     else:
         tooling = fit_system_prompt(SKILL_TOOLING_HINT + "\n" + CATALOG_HINT)
@@ -1136,6 +1145,26 @@ def _plan_node(state: AgentState, db: Session) -> dict:
         *history_msgs,
         HumanMessage(content=user_text),
     ]
+    if observation:
+        messages.append(
+            SystemMessage(
+                content=(
+                    "Resultado interno de execute_python_code (no lo copies crudo "
+                    "al usuario; usalo para responder o para corregir el script):\n"
+                    + observation[:8000]
+                )
+            )
+        )
+    if attempts >= CODEACT_MAX_ATTEMPTS:
+        messages.append(
+            SystemMessage(
+                content=(
+                    f"Ya usaste {attempts} intentos de execute_python_code. "
+                    "NO vuelvas a llamar esa tool. Respondé al usuario en lenguaje "
+                    "claro, sin traceback."
+                )
+            )
+        )
     try:
         response = llm.invoke(messages)
     except Exception as exc:
@@ -1145,26 +1174,17 @@ def _plan_node(state: AgentState, db: Session) -> dict:
                 _plan_native_google(state, db, {"query": state["user_message"]}),
                 parts,
             )
-        resolved = _resolve_skill_plan(
+        local = _local_catalog_plan(
             state["user_message"],
-            {"query": state["user_message"]},
-            state["user_message"],
+            arguments={"query": state["user_message"]},
             context_text=ctx,
             thread_state=thread_state,
         )
-        if resolved:
-            return _annotate_plan_result(resolved, parts)
-        if looks_like_do_task(state["user_message"]):
-            return _annotate_plan_result(
-                _force_skill_or_download(
-                    state["user_message"],
-                    context_text=ctx,
-                    thread_state=thread_state,
-                ),
-                parts,
-            )
+        if local:
+            return _annotate_plan_result(local, parts)
         return {
             "pending_skill": None,
+            "pending_codeact": None,
             "needs_approval": False,
             "reply": (
                 "No pude consultar al modelo ahora (límite de tokens o error de API). "
@@ -1223,52 +1243,56 @@ def _plan_node(state: AgentState, db: Session) -> dict:
             parts,
         )
 
-    for call in tool_calls:
-        if _tool_call_name(call) != "search_skill_marketplace":
-            continue
-        raw_args = _tool_call_args(call)
+    codeact_call = next(
+        (call for call in tool_calls if _tool_call_name(call) == "execute_python_code"),
+        None,
+    )
+    if codeact_call and attempts < CODEACT_MAX_ATTEMPTS:
+        planned = _codeact_plan_from_call(codeact_call)
+        if planned:
+            return _annotate_plan_result(planned, parts)
+
+    marketplace_call = next(
+        (call for call in tool_calls if _tool_call_name(call) == "search_skill_marketplace"),
+        None,
+    )
+    if marketplace_call:
+        raw_args = _tool_call_args(marketplace_call)
         task, arguments = _parse_tool_arguments(raw_args or {}, state["user_message"])
-        # Pedido nuevo: no mezclar con el hilo viejo. Si no, enriquecer task pobre.
         if switched:
             task = state["user_message"]
             arguments = {**arguments, "query": state["user_message"]}
         elif ctx and (not task or len(task) < 40 or task == state["user_message"]):
             task = ctx
             arguments = {**arguments, "query": ctx}
-        resolved = _resolve_skill_plan(
-            task,
-            arguments,
+        local = _local_catalog_plan(
             state["user_message"],
+            arguments=arguments,
             context_text=ctx,
             thread_state=thread_state,
         )
+        if not local:
+            local = _local_catalog_plan(
+                task,
+                arguments=arguments,
+                context_text=ctx,
+                thread_state=thread_state,
+            )
         llm_bits = (getattr(response, "content", None) or "").strip()
-        if resolved:
-            return _annotate_plan_result(resolved, parts, llm_reply=llm_bits)
-        # Re-evaluar con el mensaje completo (el task del tool a veces es pobre).
-        forced = _force_skill_or_download(
-            state["user_message"],
-            context_text=ctx,
-            thread_state=thread_state,
-        )
-        if (
-            forced.get("reply")
-            or forced.get("needs_approval")
-            or forced.get("pending_skill")
-        ):
-            return _annotate_plan_result(forced, parts, llm_reply=llm_bits)
-        available = ", ".join(
-            s["name"] for s in search_catalog(task, arguments).get("available") or []
-        )
+        if local:
+            return _annotate_plan_result(local, parts, llm_reply=llm_bits)
+        # Nivel 1 sin resultado → Nivel 2: buscar skill remota reutilizable o pedir HITL descarga.
+        reused = resolve_reusable_remote_skill(task, conversation_context=ctx)
+        if reused:
+            return _annotate_plan_result(
+                _auto_execute_skill_state(reused), parts, llm_reply=llm_bits
+            )
         return _annotate_plan_result(
             {
                 "pending_skill": None,
-                "needs_approval": False,
-                "reply": (
-                    "No encontré una skill en el catálogo para esa tarea. "
-                    f"Disponibles: {available or '(ninguna)'}. "
-                    "¿Me aclarás qué resultado querés y con qué datos?"
-                ),
+                "approval_kind": APPROVAL_KIND_DOWNLOAD,
+                "needs_approval": True,
+                "reply": "",
             },
             parts,
             llm_reply=llm_bits,
@@ -1276,13 +1300,11 @@ def _plan_node(state: AgentState, db: Session) -> dict:
 
     reply = (getattr(response, "content", None) or "").strip()
 
-    # Réplica al hilo (corrección/cuestionamiento): no forzar marketplace ni re-preguntar.
     if is_result_challenge_or_correction(state["user_message"]):
         if not reply:
             reply = (
-                "Tenés razón en cuestionarlo: si el valor no calza con lo que ves en la "
-                "página/API, decime y lo reconsultamos con la skill de telemetría "
-                "(API fullDto) usando el mismo punto/URL del hilo."
+                "Tenés razón en cuestionarlo. Si el valor no calza, decime "
+                "y lo reconsultamos."
             )
         return _annotate_plan_result(
             {
@@ -1291,23 +1313,6 @@ def _plan_node(state: AgentState, db: Session) -> dict:
                 "reply": reply,
             },
             parts,
-        )
-
-    # Hacer algo en el mundo / web / skill / "no puedo" → marketplace o descarga.
-    if (
-        looks_like_do_task(state["user_message"])
-        or looks_like_skill_intent(state["user_message"])
-        or looks_like_web_or_external_request(state["user_message"])
-        or reply_is_capability_refusal(reply)
-    ):
-        return _annotate_plan_result(
-            _force_skill_or_download(
-                state["user_message"],
-                context_text=ctx,
-                thread_state=thread_state,
-            ),
-            parts,
-            llm_reply=reply,
         )
 
     if not reply:
@@ -1328,12 +1333,16 @@ def _plan_node(state: AgentState, db: Session) -> dict:
 def _route_after_plan(
     state: AgentState,
 ) -> Literal[
+    "run_codeact",
     "run_skill",
     "human_gate_download",
     "human_gate_execute",
     "human_gate_google",
     "end_ok",
 ]:
+    pending_codeact = state.get("pending_codeact") or {}
+    if isinstance(pending_codeact, dict) and str(pending_codeact.get("code") or "").strip():
+        return "run_codeact"
     if (
         state.get("approval_kind") == APPROVAL_KIND_GOOGLE_TOOL
         and state.get("needs_approval")
@@ -1352,6 +1361,33 @@ def _route_after_plan(
     if kind == APPROVAL_KIND_EXECUTE and state.get("pending_skill"):
         return "human_gate_execute"
     return "end_ok"
+
+
+def _run_codeact_node(state: AgentState) -> dict:
+    pending = state.get("pending_codeact") or {}
+    code = str(pending.get("code") or "")
+    attempts = int(state.get("codeact_attempts") or 0) + 1
+    result = execute_python_script_sync(code)
+    observation = format_codeact_observation(result)
+    if attempts >= CODEACT_MAX_ATTEMPTS and codeact_retryable(result):
+        observation = (
+            "EL SCRIPT FALLÓ y se agotaron los 3 intentos. "
+            "NO llames execute_python_code. Explicá al usuario en criollo qué no se "
+            "pudo hacer, sin traceback.\n"
+            + observation
+        )
+    return {
+        "codeact_result": result,
+        "codeact_observation": observation,
+        "codeact_attempts": attempts,
+        "pending_codeact": None,
+        "reply": "",
+    }
+
+
+def _route_after_codeact(_: AgentState) -> Literal["plan"]:
+    """Siempre vuelve al plan: el LLM narra el resultado o corrige el script."""
+    return "plan"
 
 
 def _route_after_pre_assist(
@@ -2224,6 +2260,9 @@ def build_agent_graph(db: Session):
     def plan(state: AgentState) -> dict:
         return _plan_node(state, db)
 
+    def run_codeact(state: AgentState) -> dict:
+        return _run_codeact_node(state)
+
     def run_skill(state: AgentState) -> dict:
         return _run_skill_node(state, db)
 
@@ -2231,6 +2270,7 @@ def build_agent_graph(db: Session):
     graph.add_node("fetch_history", fetch_history)
     graph.add_node("pre_assist", pre_assist)
     graph.add_node("plan", plan)
+    graph.add_node("run_codeact", run_codeact)
     graph.add_node("human_gate_download", _human_gate_download_node)
     graph.add_node("fetch_remote_skill", _fetch_remote_skill_node)
     graph.add_node("human_gate_execute", _human_gate_execute_node)
@@ -2257,12 +2297,18 @@ def build_agent_graph(db: Session):
         "plan",
         _route_after_plan,
         {
+            "run_codeact": "run_codeact",
             "run_skill": "run_skill",
             "human_gate_download": "human_gate_download",
             "human_gate_execute": "human_gate_execute",
             "human_gate_google": "human_gate_google",
             "end_ok": END,
         },
+    )
+    graph.add_conditional_edges(
+        "run_codeact",
+        _route_after_codeact,
+        {"plan": "plan"},
     )
     graph.add_conditional_edges(
         "human_gate_download",
@@ -2360,6 +2406,10 @@ def run_agent(
                 "thread_state": {},
                 "allow_network": False,
                 "retry_staged_audit": False,
+                "pending_codeact": None,
+                "codeact_observation": None,
+                "codeact_attempts": 0,
+                "codeact_result": None,
             },
             config,
         )
