@@ -39,7 +39,6 @@ from app.services.command_router import (
     GOOGLE_ACTIONS,
     infer_google_action,
     missing_google_slots,
-    should_use_native_google,
 )
 from app.services.order_parse import (
     extract_order_parts,
@@ -93,14 +92,10 @@ from app.services.skill_marketplace import (
     conversation_context_text,
     detect_response_style,
     download_remote_prompt,
-    extract_open_task,
-    is_context_switch,
-    is_result_challenge_or_correction,
     clarifying_question_for_skill,
     prepare_skill_arguments,
     resolve_skill_decision,
     skill_missing_required_inputs,
-    thread_brief_for_prompt,
 )
 from app.services.skill_remote import (
     generate_remote_skill,
@@ -239,13 +234,10 @@ Mismo registro que el usuario (rioplatense si habla así; más formal si viene f
    entregá el resultado o una explicación humana.
 """.strip()
 
-VOICE_HINT = (
+NATIVE_TOOLS_HINT = (
     "Hablá como un asistente de chat cálido: natural, cercano, en el hilo. "
     "Ni sistema ('estoy funcionando', 'no hay una acción', '¿en qué puedo ayudarte?') "
-    "ni personaje (finde, anécdotas, chistes que no pegan)."
-)
-
-NATIVE_TOOLS_HINT = (
+    "ni personaje (finde, anécdotas, chistes que no pegan). "
     "Si el mensaje es charla, NO uses tools: contestá como persona. "
     "Si hay orden: cumplí TODA (qué, a quién, cuándo, cómo). "
     "Horario ('en 5 minutos') → confirmalo, no lo hagas ahora. "
@@ -666,42 +658,6 @@ def _conversation_text(state: AgentState) -> str:
     )
 
 
-def _apply_context_switch(
-    thread_state: dict[str, Any],
-    user_message: str,
-    *,
-    history: list[dict[str, Any]] | None = None,
-    context_text: str | None = None,
-) -> dict[str, Any]:
-    """Si el mensaje es una solicitud nueva, reemplaza open_task y no arrastra la vieja."""
-    if not is_context_switch(
-        user_message,
-        context_text=context_text,
-        history=history,
-        thread_state=thread_state,
-    ):
-        return thread_state
-    new_task = (
-        extract_open_task(user_message, history, user_message, thread_state=None)
-        or (user_message or "").strip()[:300]
-    )
-    switched = dict(thread_state or {})
-    switched["open_task"] = new_task
-    summary = (
-        dict(switched["summary_json"])
-        if isinstance(switched.get("summary_json"), dict)
-        else {}
-    )
-    summary["open_task"] = new_task
-    summary["status"] = "in_progress"
-    switched["summary_json"] = summary
-    switched["summary_text"] = (
-        "CAMBIO DE TAREA: el usuario dejó lo anterior. "
-        f"Tarea actual: {new_task}"
-    )
-    return switched
-
-
 def _local_catalog_plan(
     user_message: str,
     *,
@@ -1044,92 +1000,45 @@ def _codeact_plan_from_call(call: Any) -> dict[str, Any] | None:
 
 
 def _plan_node(state: AgentState, db: Session) -> dict:
+    """LLM como único orquestador: sin clasificadores pre-LLM ni overrides post-LLM."""
     ctx = _conversation_text(state)
-    history = state.get("history") or []
-    thread_state = _apply_context_switch(
-        _thread_state(state),
-        state["user_message"],
-        history=history,
-        context_text=ctx,
-    )
-    switched = is_context_switch(
-        state["user_message"],
-        context_text=ctx,
-        history=history,
-        thread_state=_thread_state(state),
-    )
+    thread_state = _thread_state(state)
+    # Solo para scheduling (run_at / order_ack); no se inyecta al prompt.
     parts = extract_order_parts(state["user_message"], ctx)
     llm = _llm(tools=True)
     attempts = int(state.get("codeact_attempts") or 0)
     observation = str(state.get("codeact_observation") or "").strip()
+
     system = fit_system_prompt(SYSTEM_PROMPT_IRRIGACION)
-    native = fit_system_prompt(VOICE_HINT + "\n" + NATIVE_TOOLS_HINT)
-    open_task = extract_open_task(
-        state["user_message"],
-        history,
-        ctx,
-        thread_state=thread_state,
-    )
-    if switched and open_task:
-        tooling = fit_system_prompt(
-            SKILL_TOOLING_HINT
-            + "\nCAMBIO DE TAREA (obligatorio): "
-            + open_task[:400]
-            + "\nAbandoná lo anterior. No pidas datos de la tarea vieja. "
-            "Si no hay skill de catálogo, execute_python_code."
-        )
-    elif open_task:
-        tooling = fit_system_prompt(
-            SKILL_TOOLING_HINT
-            + "\nTAREA ABIERTA (continuar si el usuario sigue en eso; "
-            "si plantea algo nuevo, cambiate): "
-            + open_task[:400]
-        )
-    else:
-        tooling = fit_system_prompt(SKILL_TOOLING_HINT + "\n" + CATALOG_HINT)
+    native = fit_system_prompt(NATIVE_TOOLS_HINT)
+    tooling = fit_system_prompt(SKILL_TOOLING_HINT + "\n" + CATALOG_HINT)
+    memory_hint = fit_system_prompt(str(thread_state.get("summary_text") or "").strip())
     rag = "Contexto documental recuperado (RAG):\n\n" + _context_block(
         state.get("retrieved_docs") or []
     )
-    user_text = fit_user_message(state["user_message"])
-    history_msgs = _history_messages(state.get("history") or [], thread_state)
     style_hint = fit_system_prompt(
         "Preferencia de formato para esta respuesta: "
         + detect_response_style(state["user_message"])
     )
-    order_hint = fit_system_prompt(
-        "Orden parseada (cumplí TODAS las partes; no tires ninguna): "
-        + (parts.recap() or state["user_message"])
-        + (f" Horario: {parts.when_label}." if parts.when_label else "")
-    )
-    thread_hint = fit_system_prompt(
-        thread_brief_for_prompt(
-            state["user_message"],
-            state.get("history") or [],
-            thread_state=thread_state,
-        )
-    )
-    memory_hint = fit_system_prompt(str(thread_state.get("summary_text") or "").strip())
+    user_text = fit_user_message(state["user_message"])
+    history_msgs = _history_messages(state.get("history") or [], thread_state)
 
     packed = [
         ("system", system),
         ("native", native),
         ("tooling", tooling),
-        ("order", order_hint),
         ("memory", memory_hint),
         ("rag", rag),
         ("style", style_hint),
-        ("thread", thread_hint),
         ("user", user_text),
     ]
     (
         system,
         native,
         tooling,
-        order_hint,
         memory_hint,
         rag,
         style_hint,
-        thread_hint,
         user_text,
     ) = enforce_request_budget(packed)
 
@@ -1137,8 +1046,6 @@ def _plan_node(state: AgentState, db: Session) -> dict:
         SystemMessage(content=system),
         SystemMessage(content=native),
         SystemMessage(content=tooling),
-        SystemMessage(content=order_hint),
-        SystemMessage(content=thread_hint),
         SystemMessage(content=memory_hint),
         SystemMessage(content=rag),
         SystemMessage(content=style_hint),
@@ -1169,11 +1076,6 @@ def _plan_node(state: AgentState, db: Session) -> dict:
         response = llm.invoke(messages)
     except Exception as exc:
         logger.exception("Fallo el plan LLM (posible límite de tokens)")
-        if should_use_native_google(state["user_message"], ctx):
-            return _annotate_plan_result(
-                _plan_native_google(state, db, {"query": state["user_message"]}),
-                parts,
-            )
         local = _local_catalog_plan(
             state["user_message"],
             arguments={"query": state["user_message"]},
@@ -1191,6 +1093,7 @@ def _plan_node(state: AgentState, db: Session) -> dict:
                 f"Detalle: {exc}. Probá una consulta más corta o modo Rápido."
             ),
         }
+
     tool_calls = getattr(response, "tool_calls", None) or []
     google_call = next(
         (call for call in tool_calls if _tool_call_name(call) == "use_google"),
@@ -1204,35 +1107,14 @@ def _plan_node(state: AgentState, db: Session) -> dict:
         (call for call in tool_calls if _tool_call_name(call) == "ingest_official_url"),
         None,
     )
-    if is_result_challenge_or_correction(state["user_message"]) and (
-        google_call
-        or should_use_native_google(state["user_message"], ctx, tool_called=False)
-    ):
-        reply = (getattr(response, "content", None) or "").strip() or (
-            "Tenés razón. Si el mail ya salió, no lo deshago. "
-            "Si pedís un horario, lo programo y no lo mando al toque."
-        )
+
+    # Solo despachar lo que el LLM pidió explícitamente (sin overrides).
+    if google_call:
         return _annotate_plan_result(
-            {
-                "pending_skill": None,
-                "pending_google_tool": None,
-                "needs_approval": False,
-                "approval_kind": None,
-                "reply": reply,
-            },
+            _plan_native_google(state, db, _tool_call_args(google_call)),
             parts,
         )
-    if should_use_native_google(
-        state["user_message"],
-        ctx,
-        tool_called=bool(google_call),
-    ):
-        args = _tool_call_args(google_call) if google_call else {}
-        return _annotate_plan_result(
-            _plan_native_google(state, db, args),
-            parts,
-        )
-    if save_call and looks_like_save_context_intent(state["user_message"]):
+    if save_call:
         return _annotate_plan_result(
             _plan_save_context(state, db, _tool_call_args(save_call)),
             parts,
@@ -1253,25 +1135,23 @@ def _plan_node(state: AgentState, db: Session) -> dict:
             return _annotate_plan_result(planned, parts)
 
     marketplace_call = next(
-        (call for call in tool_calls if _tool_call_name(call) == "search_skill_marketplace"),
+        (
+            call
+            for call in tool_calls
+            if _tool_call_name(call) == "search_skill_marketplace"
+        ),
         None,
     )
     if marketplace_call:
         raw_args = _tool_call_args(marketplace_call)
         task, arguments = _parse_tool_arguments(raw_args or {}, state["user_message"])
-        if switched:
-            task = state["user_message"]
-            arguments = {**arguments, "query": state["user_message"]}
-        elif ctx and (not task or len(task) < 40 or task == state["user_message"]):
-            task = ctx
-            arguments = {**arguments, "query": ctx}
         local = _local_catalog_plan(
             state["user_message"],
             arguments=arguments,
             context_text=ctx,
             thread_state=thread_state,
         )
-        if not local:
+        if not local and task != state["user_message"]:
             local = _local_catalog_plan(
                 task,
                 arguments=arguments,
@@ -1281,7 +1161,7 @@ def _plan_node(state: AgentState, db: Session) -> dict:
         llm_bits = (getattr(response, "content", None) or "").strip()
         if local:
             return _annotate_plan_result(local, parts, llm_reply=llm_bits)
-        # Nivel 1 sin resultado → Nivel 2: buscar skill remota reutilizable o pedir HITL descarga.
+        # Nivel 1 sin resultado → Nivel 2: skill remota reutilizable o HITL descarga.
         reused = resolve_reusable_remote_skill(task, conversation_context=ctx)
         if reused:
             return _annotate_plan_result(
@@ -1299,22 +1179,6 @@ def _plan_node(state: AgentState, db: Session) -> dict:
         )
 
     reply = (getattr(response, "content", None) or "").strip()
-
-    if is_result_challenge_or_correction(state["user_message"]):
-        if not reply:
-            reply = (
-                "Tenés razón en cuestionarlo. Si el valor no calza, decime "
-                "y lo reconsultamos."
-            )
-        return _annotate_plan_result(
-            {
-                "pending_skill": None,
-                "needs_approval": False,
-                "reply": reply,
-            },
-            parts,
-        )
-
     if not reply:
         reply = (
             "No pude generar una respuesta a partir del contexto disponible. "
