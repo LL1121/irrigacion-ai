@@ -2479,18 +2479,18 @@ def _parse_arguments(raw: Any) -> dict[str, Any]:
 
 @tool
 def search_skill_marketplace(task: str, arguments_json: str = "{}") -> str:
-    """Busca en el marketplace local/catálogo de skills una herramienta o script Python
-    ejecutable para realizar tareas técnicas solicitadas por el usuario.
+    """Busca en el catálogo local scripts de Python ejecutables (skills) para
+    resolver tareas técnicas. NO usar para buscar páginas web, links, PDFs ni
+    contenido scrapeado: eso no es una skill.
 
-    Usala cuando el usuario pide un cálculo, conversión, prorrateo, lámina o tiempo de riego,
-    generación de documentos Word (con formato), test de red/velocidad, o cualquier
-    automatización / "buscar una skill". NUNCA interpretes "skill" como Alexa, Google
-    Assistant, Siri o Cortana. No inventes números: primero buscá la skill.
+    Usala cuando el usuario pide buscar/usar una skill, un cálculo (caudal,
+    prorrateo, lámina), Word institucional, crawler del catálogo, o cualquier
+    automatización con script Python del marketplace. NUNCA interpretes "skill"
+    como Alexa/Siri/Google Assistant.
 
     Args:
-        task: descripción breve de la tarea (ej. 'calcular caudal con área y velocidad').
-        arguments_json: JSON con números/datos/unidades extraídos del mensaje
-            (ej. area_m2, velocidad_ms, valor, unidad, partes, volumen_m3, superficie_ha).
+        task: descripción de la tarea técnica (ej. 'calcular caudal', 'crawler de enlaces').
+        arguments_json: JSON opcional con datos extraídos (área, velocidad, url, etc.).
     """
     result = search_catalog(task, _parse_arguments(arguments_json))
     public = {k: v for k, v in result.items() if k != "code"}

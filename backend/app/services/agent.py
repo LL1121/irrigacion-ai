@@ -165,6 +165,31 @@ def execute_python_code(code: str, reason: str) -> str:
     )
 
 
+@tool
+def create_new_skill(name: str, description: str, task_prompt: str) -> str:
+    """Invoca al generador de código para programar un nuevo script de Python
+    cuando una skill existente no funcione o no exista en el catálogo.
+
+    Las skills son scripts Python del Sandbox, NO enlaces web ni documentos.
+    Usala si el usuario pide crear/arreglar una skill, o si search_skill_marketplace
+    no encontró nada útil. Dispara HITL de generación (el usuario confirma y
+    code_generator arma el script).
+
+    Args:
+        name: nombre corto de la skill (ej. 'Crawler de normativa').
+        description: qué hace la skill en una oración.
+        task_prompt: pedido técnico completo a programar (URL, filtros, etc.).
+    """
+    return json.dumps(
+        {
+            "name": name or "",
+            "description": description or "",
+            "task_prompt": task_prompt or "",
+        },
+        ensure_ascii=False,
+    )
+
+
 CODEACT_MAX_ATTEMPTS = 3
 
 CODEACT_NUDGE = (
@@ -210,25 +235,30 @@ Mismo registro que el usuario (rioplatense si habla así; más formal si viene f
 ### NIVELES DE HERRAMIENTAS Y PERMISOS:
 - Operás con permisos de nivel ADMINISTRATIVO ALTO.
 - Mail / Gmail / Calendar / Drive → tool `use_google` (nunca una skill para un mail).
-- Skills de catálogo (caudal, prorrateo, lámina, Word institucional) →
-  `search_skill_marketplace` primero. Si hay match local → ejecuta; si no hay →
-  el sistema gestiona la descarga/generación automáticamente (HITL Nivel 2).
+- Skills de catálogo (scripts Python) → `search_skill_marketplace` primero.
+  Si no hay match o la skill está rota → `create_new_skill` (HITL generación).
 - Tareas puntuales ad-hoc (análisis de datos, cálculos, crawling sin persistencia) →
   `execute_python_code` directo (Nivel 3 / CodeAct).
 - Guardar nota tipada → solo si pidió explícito anotar/recordar (`save_user_context`).
 - Indexar resolución/comunicado oficial desde URL → `ingest_official_url`.
 
 ### CAPACIDADES EXTENDIDAS, SKILLS Y SANDBOX:
-1. **Concepto de Skill:** "skill", "herramienta" o "script" = extensiones Python del
-   Sandbox Docker / marketplace interno. Prohibido mencionar Amazon Alexa, Google Assistant,
-   Siri, Cortana u otros asistentes de voz.
-2. **Pipeline de resolución (3 niveles):**
+1. **Concepto de Skill:** "skill", "herramienta" o "script" = scripts de Python
+   ejecutables en el Sandbox Docker / marketplace interno. Las SKILLS NO son
+   enlaces web, páginas scrapeadas, PDFs ni documentos. Prohibido mencionar
+   Amazon Alexa, Google Assistant, Siri, Cortana u otros asistentes de voz.
+2. **Tool-calling obligatorio para skills:** Si el usuario pide buscar, crear,
+   arreglar o reemplazar una skill (o dice que una skill está rota/incompleta),
+   es OBLIGATORIO invocar `search_skill_marketplace` o `create_new_skill` con
+   un Tool Call real. Prohibido responder con texto simulando haber buscado
+   en el marketplace sin haber ejecutado la tool.
+3. **Pipeline de resolución (3 niveles):**
    - Nivel 1 — catálogo local: `search_skill_marketplace`. Si hay skill → HITL ejecución.
-   - Nivel 2 — generación remota: si no hay skill local el sistema genera una nueva
-     con aprobación del usuario (HITL descarga). No necesitás hacer nada extra.
+   - Nivel 2 — generación: `create_new_skill` (o marketplace sin match) → HITL
+     descarga/generación con code_generator.
    - Nivel 3 — CodeAct: `execute_python_code` para tareas puntuales de análisis/cálculo
      sin necesidad de persistir la skill. Usalo directamente para tareas ad-hoc.
-3. **Proactividad (prohibido rendirse):** NUNCA digas "como modelo de lenguaje no puedo…".
+4. **Proactividad (prohibido rendirse):** NUNCA digas "como modelo de lenguaje no puedo…".
    Si el script falla, analizá el error, corregí el código y volvé a llamar
    `execute_python_code` (máximo 3 intentos). No le pases el traceback al usuario:
    entregá el resultado o una explicación humana.
@@ -249,13 +279,14 @@ NATIVE_TOOLS_HINT = (
 )
 
 SKILL_TOOLING_HINT = (
-    "Jerarquía de resolución: "
-    "1) skill en catálogo local (caudal, prorrateo, lámina, Word) → search_skill_marketplace; "
-    "si no hay skill local, el sistema inicia HITL descarga automáticamente (no hagas nada más). "
-    "2) tarea puntual sin persistencia → execute_python_code. "
+    "Skills = scripts Python del Sandbox, NO links web ni páginas scrapeadas. "
+    "Jerarquía: "
+    "1) buscar skill → search_skill_marketplace (tool call real, nunca simules la búsqueda); "
+    "2) crear/arreglar skill → create_new_skill (HITL generación); "
+    "3) tarea puntual sin persistir → execute_python_code. "
     "Si el sandbox devolvió error, corregí el código y reintentá (máx 3 veces). "
     "Nunca 'no puedo'. Delay pedido → confirmalo. "
-    "open_task vacío/'Ninguna' = sin trámite viejo. El historial manda, no plantillas."
+    "El historial manda, no plantillas."
 )
 
 # Alias retrocompatible: el resto del módulo referenciaba SYSTEM_PROMPT.
@@ -579,7 +610,12 @@ def _fetch_history_node(state: AgentState, db: Session) -> dict:
 
 
 def _parse_tool_arguments(raw_args: dict[str, Any], user_message: str) -> tuple[str, dict]:
-    task = str(raw_args.get("task") or user_message)
+    task = str(
+        raw_args.get("task")
+        or raw_args.get("query")
+        or raw_args.get("task_prompt")
+        or user_message
+    )
     arguments = raw_args.get("arguments") or raw_args.get("arguments_json") or {}
     if isinstance(arguments, str):
         try:
@@ -1142,6 +1178,40 @@ def _plan_node(state: AgentState, db: Session) -> dict:
         ),
         None,
     )
+    create_skill_call = next(
+        (
+            call
+            for call in tool_calls
+            if _tool_call_name(call) == "create_new_skill"
+        ),
+        None,
+    )
+    # create_new_skill → HITL generación (Nivel 2), sin buscar catálogo primero.
+    if create_skill_call:
+        raw_args = _tool_call_args(create_skill_call)
+        task_prompt = str(
+            raw_args.get("task_prompt")
+            or raw_args.get("description")
+            or state["user_message"]
+        ).strip()
+        llm_bits = (getattr(response, "content", None) or "").strip()
+        reused = resolve_reusable_remote_skill(
+            task_prompt, conversation_context=ctx
+        )
+        if reused:
+            return _annotate_plan_result(
+                _auto_execute_skill_state(reused), parts, llm_reply=llm_bits
+            )
+        return _annotate_plan_result(
+            {
+                "pending_skill": None,
+                "approval_kind": APPROVAL_KIND_DOWNLOAD,
+                "needs_approval": True,
+                "reply": "",
+            },
+            parts,
+            llm_reply=llm_bits,
+        )
     if marketplace_call:
         raw_args = _tool_call_args(marketplace_call)
         task, arguments = _parse_tool_arguments(raw_args or {}, state["user_message"])

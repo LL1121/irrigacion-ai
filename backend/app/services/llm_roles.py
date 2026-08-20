@@ -117,13 +117,18 @@ def chat_llm(*, tools: bool = False, temperature: float = 0.2) -> ChatOpenAI:
         temperature=temperature,
     )
     if tools:
-        from app.services.agent import execute_python_code, ingest_official_url
+        from app.services.agent import (
+            create_new_skill,
+            execute_python_code,
+            ingest_official_url,
+        )
 
         return llm.bind_tools(
             [
                 use_google,
                 save_user_context,
                 search_skill_marketplace,
+                create_new_skill,
                 ingest_official_url,
                 execute_python_code,
             ]
